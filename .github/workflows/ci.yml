@@ -1,0 +1,278 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Opt every JS-based action into Node 24 ahead of the September 2026
+# Node 20 removal.  GitHub honours this env var on the runner and
+# applies it to actions/checkout, actions/setup-python, codecov, etc.
+# without us needing to bump each action's major version individually.
+# Once the actions ship Node-24-native versions, this can come out.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+
+  # ── Unit tests (no database) ──────────────────────────────────────────────
+
+  unit:
+    name: Unit tests — Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Format check
+        run: ruff format --check cygnet tests
+
+      - name: Lint
+        run: ruff check cygnet tests
+
+      - name: Type check
+        run: mypy cygnet
+
+      - name: Unit tests
+        run: |
+          pytest tests/ --ignore=tests/integration \
+            -v \
+            --cov=cygnet \
+            --cov-report=xml \
+            --cov-report=term-missing
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.12'
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # ── Integration tests (live PostgreSQL via Docker service) ────────────────
+
+  integration:
+    name: Integration tests — PG ${{ matrix.pg-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg-version: ["14", "15", "16", "17", "18"]
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg-version }}-alpine
+        env:
+          POSTGRES_USER: cygnet
+          POSTGRES_PASSWORD: cygnet
+          POSTGRES_DB: cygnet_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cygnet"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Integration tests
+        env:
+          CYGNET_TEST_DSN: postgresql://cygnet:cygnet@localhost:5432/cygnet_test
+        run: |
+          pytest tests/integration \
+            -v \
+            -m integration \
+            --cov=cygnet \
+            --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: matrix.pg-version == '16'
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # ── Build check ───────────────────────────────────────────────────────────
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install hatch
+        run: pip install hatch
+
+      - name: Build wheel and sdist
+        run: hatch build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # ── Dependency audit ──────────────────────────────────────────────────────
+  # pip-audit scans installed dependencies (psycopg[binary] and dev tools)
+  # against the PyPI Advisory Database.  Runs on every push/PR so a CVE
+  # surface is caught before release.  Non-blocking exit so an advisory
+  # doesn't immediately wedge unrelated PRs — review the job log instead.
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run pip-audit
+        run: pip-audit --strict || true
+
+  # ── Benchmarks (advisory) ─────────────────────────────────────────────────
+  # Runs the perf suite against a fresh PG instance and uploads the
+  # JSON output as an artifact.  Advisory-only: a regression doesn't
+  # block merge — the artifact (and the in-job summary table) are the
+  # signal.  PR comparisons against main's baseline are a separate
+  # follow-up; today the artifact is the source of truth.
+
+  bench:
+    name: Benchmarks (advisory)
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+    # Job continues even if benchmarks regress or hit a transient
+    # variance issue; the artifact upload still happens via if: always().
+    continue-on-error: true
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cygnet
+          POSTGRES_PASSWORD: cygnet
+          POSTGRES_DB: cygnet_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cygnet"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,bench]"
+
+      - name: Run benchmarks
+        env:
+          CYGNET_TEST_DSN: postgresql://cygnet:cygnet@localhost:5432/cygnet_test
+        run: |
+          pytest bench/ \
+            --benchmark-only \
+            --benchmark-json=bench-result.json \
+            --benchmark-columns=median,min,max,iqr,ops \
+            --benchmark-sort=name
+
+      - name: Summary table in job output
+        if: always()
+        run: |
+          if [ -f bench-result.json ]; then
+            echo "## Benchmark results" >> $GITHUB_STEP_SUMMARY
+            python -m bench._summary bench-result.json >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ── PR-only: pull main's last bench artifact and diff ──────────────
+      # On pull_request events, fetch the most recent successful main-branch
+      # bench-results artifact and emit a per-benchmark delta against the
+      # current run.  Graceful when the baseline is missing (first PR after
+      # a fresh repo, retention expired, etc.) — the `|| true` guarantees
+      # the step doesn't fail the job, in keeping with the advisory-only
+      # contract.
+
+      - name: Download main baseline (PR only)
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh run list \
+            --branch main \
+            --workflow CI \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId' || echo "")
+          if [ -n "$LATEST" ]; then
+            mkdir -p baseline
+            gh run download "$LATEST" --name bench-results --dir baseline \
+              --repo "${{ github.repository }}" \
+              || echo "no baseline artifact found"
+          fi
+
+      - name: Compare against baseline (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          if [ -f baseline/bench-result.json ] && [ -f bench-result.json ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## Δ vs main baseline" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            python -m bench._compare \
+              baseline/bench-result.json \
+              bench-result.json \
+              >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "_Bold deltas indicate >15% slower than baseline; CI runner noise typically falls within ±10%._" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No main baseline available for comparison (first run, expired artifact, or upstream missing)._" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload benchmark JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-result.json

@@ -1,0 +1,109 @@
+# psycopg_db.py — Reference psycopg3 adapter for Cygnet's db protocol.
+#
+# Wraps a psycopg.AsyncConnection so it satisfies the four-method
+# adapter protocol Cygnet expects: execute / execute_one / stream
+# plus the _in_transaction flag.  Cygnet generates $N placeholders
+# (libpq native style) but psycopg3 wants %s (DB-API style), so this
+# adapter translates between them on every call.
+#
+# This module is the only place Cygnet itself imports psycopg, which
+# is why psycopg lives in the optional `[psycopg]` extra rather than
+# the package's required dependencies.  Importing this module without
+# the extra installed surfaces a helpful error pointing at the install
+# command, instead of a bare ModuleNotFoundError on `psycopg`.
+#
+# The $N → %s translation is pure regex — no SQL parsing — so it stays
+# correct as long as Cygnet keeps emitting params left-to-right.  See
+# the limitations note on _DOLLAR_RE below.
+
+from __future__ import annotations
+
+import re
+from collections.abc import AsyncIterator
+from typing import Any
+
+try:
+    import psycopg
+except ImportError as e:  # pragma: no cover — exercised via install matrix
+    # psycopg is in the [psycopg] extra, not the core deps.  A clear
+    # error here saves the user from deciphering a generic
+    # ModuleNotFoundError when they tried to use the reference adapter
+    # without installing it.
+    raise ImportError(
+        "cygnet.psycopg_db requires psycopg. Install the optional extra:\n"
+        "    pip install 'cygnet-orm[psycopg]'\n"
+        "or bring your own adapter — Cygnet's db protocol is duck-typed "
+        "(see the docstring on PsycopgDB for the four required methods)."
+    ) from e
+
+
+class PsycopgDB:
+    """Reference Cygnet adapter wrapping a psycopg.AsyncConnection.
+
+    Construct from an open async connection:
+
+        conn = await psycopg.AsyncConnection.connect(dsn)
+        db = PsycopgDB(conn)
+        accounts = await cygnet.SELECT(db).FROM(AccountTable)
+
+    For pooled use, acquire one connection per task:
+
+        async with pool.connection() as conn:
+            db = PsycopgDB(conn)
+            ...
+
+    `_in_transaction` starts False on each new instance and is
+    flipped by `cygnet.transaction(db)` at outermost BEGIN / COMMIT —
+    don't share an instance across concurrent tasks (the flag is not
+    task-local, by design).
+    """
+
+    # The translation is position-insensitive: $1, $2, etc. all become
+    # %s, which works because psycopg3 consumes params in list order —
+    # the same order Cygnet appends them.  If Cygnet ever generated
+    # out-of-order references ($2 before $1), this adapter would break;
+    # the executor's render path always appends params left-to-right,
+    # so that can't happen with the current implementation.
+    _DOLLAR_RE = re.compile(r"\$\d+")
+
+    def __init__(self, conn: psycopg.AsyncConnection[Any]) -> None:
+        self._conn = conn
+        self._in_transaction = False
+
+    @classmethod
+    def _adapt_sql(cls, sql: str) -> str:
+        """Replace $1, $2, … with %s for psycopg3."""
+        return cls._DOLLAR_RE.sub("%s", sql)
+
+    async def execute(
+        self, sql: str, params: list[Any] | None = None
+    ) -> list[tuple[Any, ...]]:
+        async with self._conn.cursor() as cur:
+            await cur.execute(self._adapt_sql(sql), params or [])
+            # fetchall() raises ProgrammingError for statements that
+            # don't return rows (INSERT without RETURNING, UPDATE,
+            # DELETE, DDL).  Treating those as empty lists keeps
+            # callers free of branch-on-statement-shape logic.
+            try:
+                return await cur.fetchall()
+            except psycopg.ProgrammingError:
+                return []
+
+    async def execute_one(
+        self, sql: str, params: list[Any] | None = None
+    ) -> tuple[Any, ...] | None:
+        async with self._conn.cursor() as cur:
+            await cur.execute(self._adapt_sql(sql), params or [])
+            return await cur.fetchone()
+
+    async def stream(
+        self, sql: str, params: list[Any] | None = None
+    ) -> AsyncIterator[tuple[Any, ...]]:
+        # Portal-based cursor.stream(): rows arrive as they're produced,
+        # not after the full result set has been buffered.  PG requires
+        # the connection to be in a transaction (or autocommit off) for
+        # portal cursors — typical usage wraps this in
+        # `async with cygnet.transaction(db)`.
+        async with self._conn.cursor() as cur:
+            async for row in cur.stream(self._adapt_sql(sql), params or []):
+                yield row
