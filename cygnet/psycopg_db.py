@@ -107,3 +107,45 @@ class PsycopgDB:
         async with self._conn.cursor() as cur:
             async for row in cur.stream(self._adapt_sql(sql), params or []):
                 yield row
+
+    async def column_defaults(self, table_name: str) -> set[str]:
+        """Return the set of columns on ``table_name`` that carry a non-NULL
+        DEFAULT clause (NOW(), nextval, literal, expression — any DEFAULT
+        whose ``column_default`` in ``information_schema.columns`` is not
+        NULL).
+
+        Used by Executor.run_insert to decide which None-valued dataclass
+        fields should be omitted from the INSERT column list, so the
+        schema's DEFAULT fires instead of being clobbered by an explicit
+        NULL parameter.  See executor.py:run_insert and
+        executor._extract_insert_fields for the consumer side.
+
+        The result is the caller's responsibility to cache (Executor does);
+        this method always re-queries.  This protocol method is *optional*
+        on a db adapter — when present, Cygnet enables DEFAULT-aware INSERT
+        codegen; when absent (e.g., FakeDB), Cygnet falls back to the
+        historical "emit every field, NULL included" behaviour.  That
+        opt-in keeps test fakes simple and protects custom adapters that
+        don't have a notion of schema introspection.
+
+        Looks up the unqualified table name in the connection's current
+        schema search_path (no explicit ``table_schema`` filter).  A
+        consumer using qualified table names (``"public.foo"``) would
+        need to pre-split or extend this method; Cygnet doesn't emit
+        schema-qualified names from @cygnet.table() today, so the
+        single-schema lookup matches what the rest of the library does.
+        """
+        # `pg_get_expr(adbin, adrelid)` returns the rendered DEFAULT
+        # expression; information_schema.columns.column_default is the
+        # convenient view-level wrapper.  IS NOT NULL filters out
+        # columns that have no DEFAULT at all (and also DEFAULT NULL,
+        # which is equivalent to no DEFAULT for our purposes — both
+        # produce NULL when the column is omitted from INSERT).
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = %s AND column_default IS NOT NULL",
+                [table_name],
+            )
+            rows = await cur.fetchall()
+        return {row[0] for row in rows}

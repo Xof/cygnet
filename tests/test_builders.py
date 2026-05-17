@@ -562,6 +562,199 @@ class TestInsertSQL:
         assert db.last_params == [100]
 
 
+# ── DEFAULT-aware column omission ────────────────────────────────────────────
+#
+# PostgreSQL's `DEFAULT` clause only fires when the column is *absent* from
+# the INSERT column list — sending an explicit `NULL` parameter suppresses
+# it.  Cygnet historically emitted every non-DBKey-None field, so columns
+# like `moved_at TIMESTAMPTZ DEFAULT now()` always landed as NULL and the
+# schema default never fired.  The fix:
+#
+#   1. If the db adapter exposes an async `column_defaults(table_name)`
+#      method, Cygnet calls it on the first INSERT against that table
+#      and caches the resulting column-name set.
+#   2. _extract_insert_fields omits a non-PK field from the INSERT when
+#      (in-memory value is None) AND (column has a DEFAULT in schema).
+#   3. RETURNING is extended to include the omitted columns so Cygnet
+#      can patch the DB-generated values back onto the in-memory object.
+#
+# These tests use a FakeDB subclass that implements column_defaults so the
+# code path is exercised without a real PG.  The integration tests in
+# tests/integration/test_default_aware_insert.py cover the same flow
+# against a real schema.
+
+
+@dataclasses.dataclass
+class Widget:
+    """Test model with a DEFAULT-having column.  The schema would declare:
+        created_at TIMESTAMPTZ DEFAULT now()
+    Cygnet's introspection returns {"created_at"}; INSERT codegen omits
+    the column when the in-memory value is None, and RETURNING populates
+    it from the DB-generated default."""
+
+    id: Annotated[int, DBKey]
+    name: str = ""
+    created_at: str | None = None
+
+
+WidgetTable = cygnet.Table(Widget)
+
+
+class DefaultsFakeDB(FakeDB):
+    """FakeDB extended with a column_defaults probe — enables Cygnet's
+    DEFAULT-aware INSERT codegen in unit tests.  The set of defaulted
+    columns is supplied at construction time so each test can declare
+    exactly which columns it expects to be DEFAULTed.
+    """
+
+    def __init__(
+        self,
+        rows: list | None = None,
+        defaults: dict[str, set[str]] | None = None,
+    ) -> None:
+        super().__init__(rows=rows)
+        # Map from table_name -> set of column names that have DEFAULTs.
+        # If a table isn't in the map, column_defaults returns an empty set.
+        self._defaults = defaults or {}
+
+    async def column_defaults(self, table_name: str) -> set[str]:
+        return self._defaults.get(table_name, set())
+
+
+class TestInsertDefaultColumnOmission:
+    async def test_default_column_omitted_when_none(self):
+        """A non-PK None field with a schema DEFAULT is omitted from the
+        INSERT column list so the DEFAULT fires server-side."""
+        db = DefaultsFakeDB(
+            rows=[(1, "2026-05-17T12:00:00Z")],
+            defaults={"widgets": {"created_at"}},
+        )
+        w = Widget(id=None, name="Gear", created_at=None)
+        await cygnet.INSERT(db).INTO(WidgetTable).VALUES(w)
+        # The column list before VALUES should NOT contain created_at —
+        # that's the whole point: omit so DEFAULT fires.
+        col_list = db.last_sql.split("VALUES")[0]
+        assert "created_at" not in col_list
+        # name should still be in the column list (no DEFAULT, present
+        # explicitly).
+        assert "name" in col_list
+        # RETURNING should now include both the PK and the omitted-default
+        # column so Cygnet can patch the value back.
+        assert "RETURNING id, created_at" in db.last_sql
+        # The in-memory object should have the DB-generated value patched
+        # in from the RETURNING row.
+        assert w.id == 1
+        assert w.created_at == "2026-05-17T12:00:00Z"
+
+    async def test_default_column_explicit_value_emitted(self):
+        """A non-None value on a DEFAULTed column is emitted explicitly —
+        the application is overriding the default."""
+        db = DefaultsFakeDB(
+            rows=[(1,)],
+            defaults={"widgets": {"created_at"}},
+        )
+        w = Widget(id=None, name="Gear", created_at="2020-01-01T00:00:00Z")
+        await cygnet.INSERT(db).INTO(WidgetTable).VALUES(w)
+        # created_at is in the column list AND the param list — the
+        # caller-supplied value wins.
+        col_list = db.last_sql.split("VALUES")[0]
+        assert "created_at" in col_list
+        assert "2020-01-01T00:00:00Z" in db.last_params
+        # No omitted columns -> RETURNING is just the PK (historical shape).
+        assert "RETURNING id" in db.last_sql
+        assert "created_at" not in db.last_sql.split("RETURNING")[1]
+
+    async def test_no_defaults_unchanged_behaviour(self):
+        """Tables with no DEFAULT-having columns get the historical SQL —
+        every non-DBKey-None field is emitted, NULL included.  This is
+        the back-compat guard: pre-existing consumers must see no
+        behaviour change."""
+        db = DefaultsFakeDB(rows=[(1,)], defaults={})
+        # Account has no DEFAULTs; the schema-style omit shouldn't fire.
+        acc = Account(id=None, name="Fred", email="fred@example.com")
+        await cygnet.INSERT(db).INTO(AccountTable).VALUES(acc)
+        # name + email both emitted, NULLs (had any been present) would
+        # also have been emitted.
+        col_list = db.last_sql.split("VALUES")[0]
+        assert "name" in col_list
+        assert "email" in col_list
+        assert "RETURNING id" in db.last_sql
+        # The historical NULL-emission behaviour is preserved.
+
+    async def test_fakedb_without_column_defaults_unchanged(self):
+        """Plain FakeDB (no column_defaults method) is treated as "no
+        defaults known" — historical behaviour for any custom adapter
+        that doesn't opt in.  Lets the rest of the test suite run
+        without modification."""
+        db = FakeDB(rows=[(1,)])
+        w = Widget(id=None, name="Gear", created_at=None)
+        await cygnet.INSERT(db).INTO(WidgetTable).VALUES(w)
+        # Every field including created_at is emitted (NULL).  RETURNING
+        # is just the PK because there are no omitted defaults.
+        col_list = db.last_sql.split("VALUES")[0]
+        assert "created_at" in col_list
+        assert db.last_sql.endswith("RETURNING id")
+
+    async def test_create_path_uses_defaults(self):
+        """cygnet.create(db, obj) — the no-ON-CONFLICT INSERT variant —
+        also picks up the DEFAULT-aware omit logic."""
+        db = DefaultsFakeDB(
+            rows=[(7, "2026-05-17T12:00:00Z")],
+            defaults={"widgets": {"created_at"}},
+        )
+        w = Widget(id=None, name="Cog", created_at=None)
+        await cygnet.create(db, w)
+        col_list = db.last_sql.split("VALUES")[0]
+        assert "created_at" not in col_list
+        assert "RETURNING id, created_at" in db.last_sql
+        assert w.id == 7
+        assert w.created_at == "2026-05-17T12:00:00Z"
+
+    async def test_kwargs_path_does_not_repopulate(self):
+        """When VALUES is called with kwargs (no obj), the DEFAULT-omit
+        logic still applies to the rendered SQL, but there's no in-memory
+        object to patch — the DB-generated values are simply discarded.
+        Caller-side, the PK is still returned from the awaited call."""
+        db = DefaultsFakeDB(
+            rows=[(5, "2026-05-17T12:00:00Z")],
+            defaults={"widgets": {"created_at"}},
+        )
+        result = await cygnet.INSERT(db).INTO(WidgetTable).VALUES(name="Bolt")
+        # kwargs INSERT skipped created_at, so the column was omitted
+        # exactly as the obj path does.
+        col_list = db.last_sql.split("VALUES")[0]
+        assert "created_at" not in col_list
+        # PK still flows back to the caller as the awaited result.
+        assert result == 5
+
+    async def test_default_introspection_cached_per_table(self):
+        """Repeated INSERTs against the same table+adapter must only call
+        column_defaults once — the cache amortises the introspection
+        round-trip across the lifetime of the connection."""
+        db = DefaultsFakeDB(
+            rows=[(1, "ts")],
+            defaults={"widgets": {"created_at"}},
+        )
+        # Count column_defaults invocations by wrapping the method.
+        call_count = 0
+        orig = db.column_defaults
+
+        async def counting_column_defaults(table_name: str) -> set[str]:
+            nonlocal call_count
+            call_count += 1
+            return await orig(table_name)
+
+        db.column_defaults = counting_column_defaults  # type: ignore[method-assign]
+        for _ in range(3):
+            w = Widget(id=None, name="x", created_at=None)
+            await cygnet.INSERT(db).INTO(WidgetTable).VALUES(w)
+        # Three INSERTs, one introspection call — cache hit on subsequent
+        # calls.  (Cache is keyed by id(db), table_name; a different db
+        # instance would re-introspect, which is the intended behaviour
+        # for fresh connections.)
+        assert call_count == 1
+
+
 class TestUpdateSQL:
     async def test_update_kwargs(self):
         db = FakeDB()

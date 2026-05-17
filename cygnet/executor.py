@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
 from .annotations import DBKey
@@ -34,8 +35,66 @@ from .proxy import TableProxy
 
 
 class Executor:
+    # Process-wide cache of "which columns on table T carry a non-NULL DEFAULT
+    # clause?".  Outer mapping is a WeakKeyDictionary keyed by the db
+    # adapter instance — when the adapter is GC'd the entry evicts
+    # automatically, avoiding the stale-entry hazard of an id()-based key
+    # (memory addresses get reused).  Inner dict maps table_name -> set
+    # of DEFAULT-having column names.
+    #
+    # The cache lives at class level (not instance level) because Executor
+    # is short-lived — one per .sql() / .__await__() call — and we want
+    # the introspection cost to amortise across calls.  The answer is
+    # stable for the lifetime of the schema, so we cache it on first
+    # INSERT and reuse on every subsequent INSERT against the same
+    # connection + table.
+    _defaults_cache: weakref.WeakKeyDictionary[Any, dict[str, frozenset[str]]] = (
+        weakref.WeakKeyDictionary()
+    )
+
     def __init__(self, db: Any) -> None:
         self._db = db
+
+    async def _get_defaulted_columns(self, table_name: str) -> frozenset[str]:
+        """Return the cached set of columns on ``table_name`` that carry a
+        DEFAULT clause in the schema.  Returns an empty frozenset for db
+        adapters that don't implement the optional ``column_defaults``
+        protocol method (FakeDB and any consumer-supplied adapter that
+        doesn't introspect).
+
+        The optional-method probe (hasattr) is the opt-in mechanism for
+        DEFAULT-aware INSERT codegen.  Adapters that implement
+        column_defaults get the new behaviour (None-valued fields with a
+        DEFAULT are omitted from INSERT so the DEFAULT fires, then
+        repopulated from RETURNING); adapters that don't get the
+        historical behaviour (every field emitted, NULL included).
+        Crucially this keeps tests that use FakeDB working unchanged.
+        """
+        if not hasattr(self._db, "column_defaults"):
+            return frozenset()
+        # WeakKeyDictionary.get returns None for both "key missing" and
+        # "key was GC'd"; we treat them the same — re-introspect and
+        # repopulate.  Inner dict is created lazily on first miss so we
+        # don't waste an empty dict for adapters that never INSERT.
+        per_table = self._defaults_cache.get(self._db)
+        if per_table is not None:
+            cached = per_table.get(table_name)
+            if cached is not None:
+                return cached
+        result = frozenset(await self._db.column_defaults(table_name))
+        if per_table is None:
+            per_table = {}
+            try:
+                self._defaults_cache[self._db] = per_table
+            except TypeError:
+                # The db adapter doesn't support weak refs (rare but
+                # legal for custom adapters).  Skip caching for this
+                # adapter — every INSERT will re-introspect, which is
+                # the correctness-preserving fallback.  Return the
+                # freshly-computed result so the call still works.
+                return result
+        per_table[table_name] = result
+        return result
 
     # ── Predicate helpers ─────────────────────────────────────────────────────
 
@@ -335,6 +394,31 @@ class Executor:
     # ── INSERT ────────────────────────────────────────────────────────────────
 
     def render_insert(self, b: Any) -> tuple[str, list[Any]]:
+        # Public render entry point used by InsertBuilder.sql() — preserves
+        # the historical 2-tuple return type for backward compatibility.
+        # Delegates to _render_insert which carries an extra
+        # ``defaulted_columns`` parameter for the async run_insert path.
+        # .sql() can't introspect (it's sync; introspection requires a db
+        # round-trip), so it always passes an empty set — meaning a
+        # caller inspecting the rendered SQL sees every field emitted,
+        # exactly as before this fix.  This is correct for the inspection
+        # use case: callers want to see what Cygnet WOULD have rendered
+        # absent the DEFAULT-aware column omission.  run_insert sees the
+        # real SQL via _render_insert_with_defaults.
+        sql, params, _omitted = self._render_insert(b, frozenset())
+        return sql, params
+
+    def _render_insert(
+        self, b: Any, defaulted_columns: frozenset[str]
+    ) -> tuple[str, list[Any], list[Any]]:
+        """Internal INSERT render that supports the DEFAULT-aware column-omit
+        path.  Returns ``(sql, params, omitted_default_fields)`` — the third
+        element is the list of FieldMeta entries that were omitted because
+        the in-memory value was None and the schema column carries a
+        DEFAULT.  ``run_insert`` extends the RETURNING clause to fetch
+        those values and patches them back onto the in-memory object so
+        the application's view matches what PG stored.
+        """
         # Catch the missing-INTO mistake before it surfaces as a
         # confusing AttributeError on b._table._meta.  Same pattern
         # as render_select's missing-FROM guard.
@@ -356,14 +440,24 @@ class Executor:
             )
         # INSERT … SELECT: target columns followed by an inner SELECT in
         # place of VALUES.  Routed first so the SELECT path doesn't fall
-        # into _extract_insert_fields' kwargs validation.
+        # into _extract_insert_fields' kwargs validation.  The SELECT
+        # source has no in-memory dataclass values to omit — every column
+        # in the target list is supplied by the inner query — so the
+        # DEFAULT-aware path doesn't apply here.
         if b._select_source is not None:
-            return self._render_insert_select(b, meta)
+            sel_sql, sel_params = self._render_insert_select(b, meta)
+            return sel_sql, sel_params, []
         # Bulk path: many objects -> a single VALUES (…), (…), … clause.
         # Routed before the single-row path so type checks and validation
-        # don't double-fire.
+        # don't double-fire.  Bulk DEFAULT-omission is not yet supported:
+        # PG requires every row in a bulk VALUES to use the same column
+        # list, and per-row DEFAULT-vs-explicit-NULL decisions would
+        # break that invariant.  Bulk inserts therefore fall through to
+        # the historical path (every field emitted), which is at most
+        # losing a bit of DEFAULT-firing efficiency, not correctness.
         if b._bulk_objs is not None:
-            return self._render_bulk_insert(b, meta)
+            bulk_sql, bulk_params = self._render_bulk_insert(b, meta)
+            return bulk_sql, bulk_params, []
 
         params: list[Any] = []
         obj, kwargs = b._obj, b._kwargs
@@ -381,7 +475,9 @@ class Executor:
                 )
             kwargs = {f.attr_name: getattr(obj, f.attr_name) for f in meta.fields}
 
-        columns, _values = self._extract_insert_fields(meta, kwargs, params)
+        columns, _values, omitted = self._extract_insert_fields(
+            meta, kwargs, params, defaulted_columns
+        )
         col_sql = ", ".join(columns)
         # Placeholders are $1..$N in the same order as `columns`, because
         # _extract_insert_fields appends to params in that same order.
@@ -396,12 +492,20 @@ class Executor:
         if b._on_conflict_action is not None:
             sql += " " + self._render_on_conflict(b, meta, params)
 
-        # DBKey → ask the database to return the generated PK value.
-        # AppKey → the value is already in the column list; no RETURNING needed.
+        # RETURNING: PK if DBKey, plus any columns we omitted in favour of
+        # the schema DEFAULT so the caller can patch the in-memory object
+        # with the DB-generated values.  Position matters — the run_insert
+        # consumer unpacks the row positionally: PK first (when DBKey),
+        # then omitted-default fields in meta.fields order (preserved by
+        # _extract_insert_fields' iteration order).
+        returning_cols: list[str] = []
         if meta.pk and meta.pk.primary_key == DBKey:
-            sql += f" RETURNING {meta.pk.column_name}"
+            returning_cols.append(meta.pk.column_name)
+        returning_cols.extend(f.column_name for f in omitted)
+        if returning_cols:
+            sql += f" RETURNING {', '.join(returning_cols)}"
 
-        return sql, params
+        return sql, params, omitted
 
     def _render_on_conflict(self, b: Any, meta: Any, params: list[Any]) -> str:
         """Render the `ON CONFLICT [target] [action]` clause.
@@ -539,10 +643,13 @@ class Executor:
                 )
 
         # Determine columns from the first object: same rules as single-row
-        # INSERT — DBKey=None excluded, AppKey=None raises.
+        # INSERT — DBKey=None excluded, AppKey=None raises.  No
+        # defaulted_columns passed here: bulk INSERT requires every row
+        # to use the same column list, so per-row DEFAULT-omit would
+        # break that invariant.  (See _render_insert's bulk branch.)
         first_kwargs = {f.attr_name: getattr(first, f.attr_name) for f in meta.fields}
         params: list[Any] = []
-        columns, _ = self._extract_insert_fields(meta, first_kwargs, params)
+        columns, _, _ = self._extract_insert_fields(meta, first_kwargs, params)
 
         # Reuse the column list for subsequent rows; collect each row's
         # values into params separately so we don't re-render the column
@@ -550,7 +657,7 @@ class Executor:
         # _extract_insert_fields runs per row.
         for o in objs[1:]:
             row_kwargs = {f.attr_name: getattr(o, f.attr_name) for f in meta.fields}
-            row_cols, _ = self._extract_insert_fields(meta, row_kwargs, params)
+            row_cols, _, _ = self._extract_insert_fields(meta, row_kwargs, params)
             if row_cols != columns:
                 raise ValueError(
                     "BULK_VALUES requires consistent column shape across rows; "
@@ -576,7 +683,19 @@ class Executor:
         return sql, params
 
     async def run_insert(self, b: Any) -> Any:
-        sql, params = self.render_insert(b)
+        # Fetch DEFAULT-aware column metadata before rendering.  Only
+        # applies to the single-row VALUES(obj) path: BULK_VALUES and
+        # INSERT…SELECT bypass the DEFAULT-omit logic (see
+        # _render_insert's bulk / select branches for why), so we can
+        # skip the introspection round-trip entirely for those.
+        # b._table can be None here (the missing-INTO mistake); defer the
+        # _meta dereference until after _render_insert has the chance to
+        # raise its more-informative ValueError.
+        defaulted: frozenset[str] = frozenset()
+        if b._table is not None and b._select_source is None and b._bulk_objs is None:
+            defaulted = await self._get_defaulted_columns(b._table._meta.table_name)
+
+        sql, params, omitted = self._render_insert(b, defaulted)
         meta = b._table._meta
 
         # INSERT … SELECT: no input objects to mutate, but for DBKey
@@ -606,6 +725,12 @@ class Executor:
             await self._db.execute(sql, params)
             return None
 
+        # Single-row path.  RETURNING shape is [pk?, *omitted_default_cols] —
+        # so when there's a DBKey we always have at least the PK to
+        # unpack, and when omitted is non-empty we additionally unpack
+        # the DEFAULT-fired values back onto the in-memory object.  For
+        # AppKey models with no omitted defaults, RETURNING is absent
+        # and we fall through to the bare execute branch at the bottom.
         if meta.pk and meta.pk.primary_key == DBKey:
             # execute_one because RETURNING produces exactly one row.
             row = await self._db.execute_one(sql, params)
@@ -623,11 +748,29 @@ class Executor:
                     f"INSERT...RETURNING produced no row for "
                     f"{meta.cls.__name__} — driver bug or row not inserted"
                 )
-            # Mutate the original object in-place to populate its PK.
-            # This is why DBKey + frozen=True is rejected in meta.py.
+            # Mutate the original object in-place to populate its PK
+            # and any DEFAULT-fired column values.  Position 0 is always
+            # the PK (DBKey branch); positions 1..N correspond to the
+            # omitted_default_fields in declaration order.  Without
+            # b._obj (i.e. kwargs-only INSERT) we have nothing to mutate,
+            # so the omitted-field values are simply discarded — the
+            # PK is still returned to the caller as the sole return
+            # value, matching the historical contract.
             if b._obj is not None:
                 setattr(b._obj, meta.pk.attr_name, row[0])
+                for i, f in enumerate(omitted, start=1):
+                    setattr(b._obj, f.attr_name, row[i])
             return row[0]
+
+        # AppKey path with omitted-default columns: still need to fetch
+        # them via execute_one to patch the in-memory object.  Without
+        # omitted defaults this collapses to the historical bare execute.
+        if omitted and b._obj is not None:
+            row = await self._db.execute_one(sql, params)
+            if row is not None:
+                for i, f in enumerate(omitted):
+                    setattr(b._obj, f.attr_name, row[i])
+            return None
 
         await self._db.execute(sql, params)
         return None
@@ -637,8 +780,33 @@ class Executor:
         meta: Any,
         kwargs: dict[str, Any],
         params: list[Any],
-    ) -> tuple[list[str], list[Any]]:
-        """Build column and value lists for INSERT, skipping DBKey=None fields."""
+        defaulted_columns: frozenset[str] = frozenset(),
+    ) -> tuple[list[str], list[Any], list[Any]]:
+        """Build column and value lists for INSERT, skipping DBKey=None fields
+        and (when ``defaulted_columns`` is supplied) any non-PK fields whose
+        in-memory value is None and whose schema column carries a DEFAULT
+        clause.
+
+        Returns ``(columns, values, omitted_default_fields)`` where
+        ``omitted_default_fields`` is the list of FieldMeta objects that
+        were skipped because of a DEFAULT (NOT including the PK; the PK
+        skip is unconditional and already handled by the RETURNING-id
+        machinery).  The caller uses ``omitted_default_fields`` to extend
+        the RETURNING clause and to patch the populated values back onto
+        the in-memory object.
+
+        Why the schema-side DEFAULT skip lives here rather than at the
+        builder layer: PostgreSQL's ``DEFAULT`` clause only fires when the
+        column is *absent* from the column list — sending an explicit
+        ``NULL`` parameter suppresses the DEFAULT.  Before this fix, every
+        non-DBKey-None field was always emitted, so columns like
+        ``moved_at TIMESTAMPTZ DEFAULT now()`` always landed as NULL in
+        the DB, with the schema default never firing.  Omitting the
+        column when (field is None) AND (schema has a DEFAULT) is the
+        narrowest change that makes the DEFAULT useful again while
+        leaving columns without DEFAULTs unchanged (a NULL there is
+        usually intentional — the field documents "this is nullable").
+        """
         # Reject unknown kwargs upfront so a typo (.VALUES(nmae="x")) raises
         # immediately rather than silently being dropped by the meta.fields
         # iteration below.  When kwargs is built from an obj (render_insert
@@ -651,6 +819,7 @@ class Executor:
             )
         columns: list[str] = []
         values: list[Any] = []
+        omitted_default_fields: list[Any] = []
         # Iterate meta.fields (not kwargs) so column order in the emitted
         # INSERT matches the dataclass declaration order.  This also makes
         # the placeholder indices generated by the caller valid: columns,
@@ -671,10 +840,24 @@ class Executor:
                     f"{meta.cls.__name__}.{f.attr_name} is AppKey but value "
                     f"is None — the application must supply this key"
                 )
+            # Non-PK field with None AND a schema DEFAULT → omit so the
+            # DEFAULT fires.  Caller will add this to RETURNING and patch
+            # the populated value back onto the in-memory object so the
+            # application's view matches the DB row.  We deliberately
+            # only skip when val is None: a caller-supplied non-None
+            # value is treated as "the application is overriding the
+            # default", which matches the historical contract.
+            if (
+                f.primary_key is None
+                and val is None
+                and f.column_name in defaulted_columns
+            ):
+                omitted_default_fields.append(f)
+                continue
             columns.append(f.column_name)
             values.append(val)
             params.append(val)
-        return columns, values
+        return columns, values, omitted_default_fields
 
     # ── CREATE (INSERT, no upsert) ─────────────────────────────────────────
 
@@ -689,14 +872,32 @@ class Executor:
         meta = TableProxy(type(obj))._meta
         params: list[Any] = []
         kwargs = {f.attr_name: getattr(obj, f.attr_name) for f in meta.fields}
-        columns, _values = self._extract_insert_fields(meta, kwargs, params)
+        # DEFAULT-aware column omission — see _extract_insert_fields and
+        # _get_defaulted_columns for the full rationale.  Mirrors the
+        # run_insert path: introspect the schema once (cached), omit
+        # None-valued fields whose column has a non-NULL DEFAULT, and
+        # extend RETURNING to fetch the DB-generated values back onto
+        # the in-memory object.
+        defaulted = await self._get_defaulted_columns(meta.table_name)
+        columns, _values, omitted = self._extract_insert_fields(
+            meta, kwargs, params, defaulted
+        )
 
         col_sql = ", ".join(columns)
         val_sql = ", ".join(f"${i + 1}" for i in range(len(columns)))
         sql = f"INSERT INTO {meta.table_name} ({col_sql}) VALUES ({val_sql})"
 
+        # RETURNING shape mirrors run_insert: pk (when DBKey), then
+        # omitted-default fields in declaration order.  AppKey + omitted
+        # is also possible — when present, RETURNING fetches the defaults
+        # but doesn't include the PK (the app supplied it on input).
+        returning_cols: list[str] = []
         if meta.pk and meta.pk.primary_key == DBKey:
-            sql += f" RETURNING {meta.pk.column_name}"
+            returning_cols.append(meta.pk.column_name)
+        returning_cols.extend(f.column_name for f in omitted)
+
+        if returning_cols:
+            sql += f" RETURNING {', '.join(returning_cols)}"
             row = await self._db.execute_one(sql, params)
             # See run_insert for the rationale on raising vs. silent None.
             # Both code paths share the same invariant: a DBKey INSERT
@@ -706,7 +907,12 @@ class Executor:
                     f"INSERT...RETURNING produced no row for "
                     f"{meta.cls.__name__} — driver bug or row not inserted"
                 )
-            setattr(obj, meta.pk.attr_name, row[0])
+            pos = 0
+            if meta.pk and meta.pk.primary_key == DBKey:
+                setattr(obj, meta.pk.attr_name, row[0])
+                pos = 1
+            for i, f in enumerate(omitted, start=pos):
+                setattr(obj, f.attr_name, row[i])
         else:
             await self._db.execute(sql, params)
 

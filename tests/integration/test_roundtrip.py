@@ -529,3 +529,98 @@ class TestSelfJoinRoundtrip:
             .JOIN(BB, ON=PairingTable.b_book_id == BB.id)
         )
         assert results == [("The Fifth Season", "The Obelisk Gate")]
+
+
+# DEFAULT-aware INSERT: when a column has a schema-side DEFAULT and the
+# dataclass field is None, Cygnet must omit the column from the INSERT
+# (so the DEFAULT fires) and patch the DB-generated value back onto the
+# in-memory object via RETURNING.  Before the fix, every non-DBKey-None
+# field was emitted as an explicit NULL parameter, which suppressed
+# DEFAULT firing (PG only fires DEFAULT when the column is *absent* from
+# the column list, not when it's NULL).
+@dataclasses.dataclass
+class TimestampedThing:
+    """Two DEFAULT-having columns to exercise the multi-column RETURNING
+    path: ``created_at TIMESTAMPTZ DEFAULT now()`` and
+    ``status TEXT DEFAULT 'pending'``.  When both are None on input, both
+    should land with their DEFAULT values in the DB and on the in-memory
+    object after INSERT."""
+
+    id: Annotated[int, DBKey]
+    name: str
+    created_at: object | None = None  # TIMESTAMPTZ; opaque to keep import surface small
+    status: str | None = None
+
+
+TimestampedThingTable = cygnet.Table(TimestampedThing)
+
+
+class TestDefaultAwareInsertRoundtrip:
+    """Regression coverage for the DEFAULT-aware INSERT fix.  Validates
+    end-to-end against real PG: omitted columns get DEFAULT'd server-side,
+    RETURNING populates the object, the DB row matches what the object
+    sees post-INSERT.  See executor._extract_insert_fields for the fix."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_table(self, conn):
+        await conn.execute("""
+            CREATE TEMP TABLE timestampedthings (
+                id          SERIAL PRIMARY KEY,
+                name        TEXT NOT NULL,
+                created_at  TIMESTAMPTZ DEFAULT now(),
+                status      TEXT DEFAULT 'pending'
+            )
+        """)
+        yield PsycopgDB(conn)
+        await conn.execute("DROP TABLE IF EXISTS timestampedthings")
+
+    async def test_default_columns_fire_server_side(self, setup_table):
+        """The schema's DEFAULTs fire when the dataclass fields are None,
+        and the in-memory object is populated with the server-generated
+        values via RETURNING — so application code sees what PG stored."""
+        db = setup_table
+        t = TimestampedThing(id=None, name="alpha")
+        # Pre-condition: both DEFAULT-having fields are None.
+        assert t.created_at is None
+        assert t.status is None
+
+        await cygnet.INSERT(db).INTO(TimestampedThingTable).VALUES(t)
+
+        # Post-INSERT: PK populated as always, and the two DEFAULT-having
+        # fields are populated from RETURNING with the DB-generated values.
+        assert t.id is not None
+        assert t.created_at is not None  # DEFAULT now() fired
+        assert t.status == "pending"  # DEFAULT 'pending' fired
+
+        # The DB row matches what's on the in-memory object — no drift.
+        loaded = await cygnet.get(db, TimestampedThingTable, id=t.id)
+        assert loaded is not None
+        assert loaded.created_at == t.created_at
+        assert loaded.status == t.status
+
+    async def test_explicit_value_overrides_default(self, setup_table):
+        """A non-None value on a DEFAULTed field is emitted explicitly:
+        the application is overriding the DEFAULT, which is the
+        historical behaviour we must preserve."""
+        db = setup_table
+        t = TimestampedThing(id=None, name="beta", status="custom")
+        await cygnet.INSERT(db).INTO(TimestampedThingTable).VALUES(t)
+
+        # status kept the caller-supplied value, NOT 'pending'.
+        loaded = await cygnet.get(db, TimestampedThingTable, id=t.id)
+        assert loaded is not None
+        assert loaded.status == "custom"
+        # created_at was None -> DEFAULT now() still fired.
+        assert loaded.created_at is not None
+        assert t.created_at == loaded.created_at
+
+    async def test_create_path_picks_up_defaults(self, setup_table):
+        """cygnet.create(db, obj) — the no-ON-CONFLICT path used directly
+        by callers like Magenta's bootstrap — also benefits from the
+        DEFAULT-aware codegen."""
+        db = setup_table
+        t = TimestampedThing(id=None, name="gamma")
+        await cygnet.create(db, t)
+        assert t.id is not None
+        assert t.created_at is not None
+        assert t.status == "pending"
