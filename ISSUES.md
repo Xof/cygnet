@@ -254,17 +254,28 @@ support X? does it support Y?" matrix.
 capabilities via `adapter_capabilities() -> set[str]` to keep
 detection in one place. See **OQ2**.
 
-### S5. `InsertBuilder` ON CONFLICT cluster — 6 methods, 5 state fields  *[2026-04-29 #3]*
+### ~~S5. `InsertBuilder` ON CONFLICT cluster — 6 methods, 5 state fields~~  *[2026-04-29 #3] — CLOSED 2026-05-22*
 
-`cygnet/builders.py:586-720`. Six methods sharing five `_on_conflict_*`
-state fields with cross-validation duplicated across method bodies.
-Works and is well-tested. Adding any sixth axis (e.g., `ON CONFLICT …
-DO UPDATE … WHERE …`, which PG supports) forces another bit-flag dance
-across method bodies.
+Closed by introducing a ``_OnConflictSpec`` frozen dataclass (in
+``cygnet/builders.py``, just above ``InsertBuilder``).  Five sibling
+state attributes (``_on_conflict_target / _constraint / _action /
+_set / _excluded``) collapsed into one ``_on_conflict:
+_OnConflictSpec | None`` slot.  Structural invariants migrated to
+``__post_init__``: target/constraint mutex, action="update" requires
+target+exactly-one-of-set/excluded, action="nothing" valid with any
+target shape (including none — preserves the ``ON_CONFLICT_DO_NOTHING``
+shorthand).
 
-**Direction of fix**: A single `_OnConflictSpec` frozen dataclass with
-`target / action / set_kwargs / excluded_cols`, validated in
-`__post_init__`. One state object, one place to validate.
+Builder methods use ``dataclasses.replace`` to update the spec
+atomically — multi-field updates (``action`` + ``set_kwargs`` in one
+call) run ``__post_init__`` once with the final shape.  Only one
+chain-time guard stayed at method level: ``DO_NOTHING`` requires a
+preceding target because the spec legitimately allows
+``action="nothing"`` with no target (the shorthand path is valid).
+The executor's ``_render_on_conflict`` reads a single ``spec``
+variable instead of five sibling attributes.  All 21 tests in
+``tests/test_on_conflict.py`` pass unchanged (the same error-message
+substrings remain).
 
 ### ~~S6. Executor function-local imports of `cte`/`proxy`~~  *[2026-04-29 #4] — CLOSED 2026-05-22*
 
@@ -275,17 +286,17 @@ docstring annotated to explain that the ``from .builders import
 InsertBuilder`` inside ``run_save`` stays function-local — that one
 IS a real module-level cycle.
 
-### S7. Broad `Any` in builder state  *[2026-04-29 typing]*
+### ~~S7. Broad `Any` in builder state~~  *[2026-04-29 typing] — CLOSED 2026-05-22*
 
-`cygnet/builders.py` has 53 `Any` occurrences. Several are necessary
-(`db: Any` for duck typing). Speculative ones include
-`_on_conflict_target: tuple[Any, ...] | None` and `_on_conflict_excluded:
-tuple[Any, ...] | None` — both could be
-`tuple[ColumnProxy[Any], ...] | None` since the executor immediately
-isinstance-checks for `ColumnProxy`.
-
-**Direction of fix**: Tighten the on_conflict tuple types. Defer the
-broader `_obj: Any` story until a `DataclassWithTable` Protocol exists.
+Closed by **S5**'s refactor.  The two tuple slots that ISSUES.md
+called out (``_on_conflict_target`` and ``_on_conflict_excluded``)
+moved into ``_OnConflictSpec.target`` and
+``_OnConflictSpec.excluded_cols``, both typed as
+``tuple[ColumnProxy[Any], ...] | None`` — the static type now matches
+the executor's runtime ``isinstance(c, ColumnProxy)`` check, which
+stays as belt-and-suspenders against direct (non-builder) spec
+construction.  The broader ``_obj: Any`` story is still deferred
+until/unless a ``DataclassWithTable`` Protocol exists.
 
 ### S8. `_PseudoField` and CTE's TableMeta-shaped surface need a Protocol  *[2026-04-29 typing]*
 

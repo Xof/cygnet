@@ -565,8 +565,10 @@ class Executor:
         # BULK_VALUES + ON_CONFLICT and INSERT…SELECT + ON_CONFLICT
         # would need extra row-counting / PK-population care to handle
         # skipped rows; raise upfront rather than emit broken SQL.
-        if b._on_conflict_action is not None and (
-            b._select_source is not None or b._bulk_objs is not None
+        if (
+            b._on_conflict is not None
+            and b._on_conflict.action is not None
+            and (b._select_source is not None or b._bulk_objs is not None)
         ):
             raise ValueError(
                 "ON_CONFLICT is not yet supported with BULK_VALUES or "
@@ -626,7 +628,7 @@ class Executor:
         # ON CONFLICT clause emits between VALUES and RETURNING.  The
         # action's own params (DO UPDATE SET kwarg values) are appended
         # after VALUES's params, keeping $N numbering monotonic.
-        if b._on_conflict_action is not None:
+        if b._on_conflict is not None and b._on_conflict.action is not None:
             sql += " " + self._render_on_conflict(b, meta, params)
 
         # RETURNING: PK if DBKey, plus any columns we omitted in favour of
@@ -652,16 +654,20 @@ class Executor:
         nothing at all.
 
         Action: `DO NOTHING` (always valid), or `DO UPDATE SET …`.  PG
-        requires a target for DO UPDATE; the builder validates that
-        invariant when DO_UPDATE/DO_UPDATE_FROM_EXCLUDED is called, but
-        the no-target shorthand path (ON_CONFLICT_DO_NOTHING) skips
-        target setup entirely so we don't need to re-check here.
+        requires a target for DO UPDATE; the spec's __post_init__
+        validates that invariant when the InsertBuilder methods build
+        the spec, so by the time we get here every action="update"
+        spec has a target.  Reads from a single ``_on_conflict`` spec
+        (S5/S7); the isinstance(ColumnProxy) checks are belt-and-
+        suspenders against direct spec construction that bypassed the
+        builder's typed surface.
         """
+        spec = b._on_conflict
         parts = ["ON CONFLICT"]
         # Target.
-        if b._on_conflict_target is not None:
+        if spec.target is not None:
             target_cols: list[str] = []
-            for c in b._on_conflict_target:
+            for c in spec.target:
                 if isinstance(c, ColumnProxy):
                     target_cols.append(c._field.column_name)
                 else:
@@ -670,17 +676,17 @@ class Executor:
                         f"got {type(c).__name__}"
                     )
             parts.append(f"({', '.join(target_cols)})")
-        elif b._on_conflict_constraint is not None:
-            parts.append(f"ON CONSTRAINT {b._on_conflict_constraint}")
+        elif spec.constraint is not None:
+            parts.append(f"ON CONSTRAINT {spec.constraint}")
 
         # Action.
-        if b._on_conflict_action == "nothing":
+        if spec.action == "nothing":
             parts.append("DO NOTHING")
-        elif b._on_conflict_action == "update":
-            if b._on_conflict_excluded is not None:
+        elif spec.action == "update":
+            if spec.excluded_cols is not None:
                 # SET col = EXCLUDED.col for each column
                 set_parts = []
-                for c in b._on_conflict_excluded:
+                for c in spec.excluded_cols:
                     if not isinstance(c, ColumnProxy):
                         raise TypeError(
                             f"DO_UPDATE_FROM_EXCLUDED target must be "
@@ -692,7 +698,7 @@ class Executor:
             else:
                 # DO_UPDATE(**kwargs): SET col = $N, with field-name
                 # validation against the target table.
-                fields = b._on_conflict_set or {}
+                fields = spec.set_kwargs or {}
                 known = {f.attr_name for f in meta.fields}
                 unknown = set(fields) - known
                 if unknown:
@@ -875,7 +881,7 @@ class Executor:
                 # ON CONFLICT DO NOTHING, an empty RETURNING is the
                 # *normal* outcome of a skipped conflict, so we let
                 # None bubble up rather than raising.
-                if b._on_conflict_action is not None:
+                if b._on_conflict is not None and b._on_conflict.action is not None:
                     return None
                 raise RuntimeError(
                     f"INSERT...RETURNING produced no row for "
@@ -908,7 +914,7 @@ class Executor:
                 # case the obj's defaulted fields remain None, matching
                 # what the DB would have done).  Anything else is a
                 # driver bug.
-                if b._on_conflict_action is not None:
+                if b._on_conflict is not None and b._on_conflict.action is not None:
                     return None
                 raise RuntimeError(
                     f"INSERT...RETURNING produced no row for "

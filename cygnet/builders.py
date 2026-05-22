@@ -26,8 +26,14 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+
+# typing.Literal is needed for the _OnConflictSpec.action annotation; aliased
+# because cygnet.predicate.Literal (the SQL-literal renderable) shadows the
+# name otherwise.  Both genuinely belong in this file, so the alias is the
+# clean separation.
 from typing import Any
+from typing import Literal as TypeLiteral
 
 from .cte import CTE, Lateral, RecursiveCTE
 from .executor import Executor
@@ -611,6 +617,74 @@ class SelectBuilder(_Builder):
         return Executor(self._db).stream_select(self)
 
 
+# ── ON CONFLICT spec ─────────────────────────────────────────────────────
+# Collapses the five state fields the InsertBuilder used to carry
+# individually (target, constraint, action, set_kwargs, excluded_cols)
+# into one validated value object.  Centralising the structural
+# invariants in __post_init__ removes the cross-method validation
+# duplication and gives the executor a single struct to read rather
+# than five sibling attributes.  Closes S5 and the S7 typing
+# tightening (tuple[ColumnProxy[Any], ...] vs. tuple[Any, ...]) in
+# one refactor.
+
+
+@dataclass(frozen=True)
+class _OnConflictSpec:
+    """Validated PG ``ON CONFLICT`` specification.
+
+    Five orthogonal axes — only certain combinations are legal:
+      ``target`` / ``constraint``   conflict target (mutually exclusive)
+      ``action``                    "nothing" or "update"
+      ``set_kwargs``                ``DO UPDATE SET col = literal``
+      ``excluded_cols``             ``DO UPDATE SET col = EXCLUDED.col``
+
+    Invariants enforced in ``__post_init__``:
+      - ``target`` and ``constraint`` are mutually exclusive
+      - ``action="update"`` requires a target (column or constraint) AND
+        exactly one of ``set_kwargs`` / ``excluded_cols``
+      - ``action="nothing"`` is legal with any target shape, including
+        none (that's the ``ON_CONFLICT_DO_NOTHING()`` shorthand path)
+
+    Builder methods on ``InsertBuilder`` construct/update specs via
+    ``dataclasses.replace`` — atomic from the spec's point of view, so
+    multi-field updates (e.g. action+set_kwargs in one call) run
+    ``__post_init__`` once with the final shape.
+    """
+
+    target: tuple[ColumnProxy[Any], ...] | None = None
+    constraint: str | None = None
+    action: TypeLiteral["nothing", "update"] | None = None
+    set_kwargs: dict[str, Any] | None = None
+    excluded_cols: tuple[ColumnProxy[Any], ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.target is not None and self.constraint is not None:
+            raise ValueError(
+                "ON_CONFLICT and ON_CONFLICT_CONSTRAINT are mutually exclusive"
+            )
+        if self.action == "update":
+            if self.target is None and self.constraint is None:
+                # Same wording the old method-level guard used so the
+                # existing tests' match= substrings still hit.
+                raise ValueError(
+                    "DO_UPDATE requires a preceding ON_CONFLICT (column "
+                    "target) or ON_CONFLICT_CONSTRAINT — PG can't perform "
+                    "DO UPDATE without knowing which constraint to look at"
+                )
+            if self.set_kwargs is None and self.excluded_cols is None:
+                # Reachable only if a programmer constructs a spec
+                # directly; the builder methods always supply one or
+                # the other.  Surface it anyway so the spec is honest
+                # standalone.
+                raise ValueError(
+                    "DO_UPDATE / DO_UPDATE_FROM_EXCLUDED requires SET values"
+                )
+            if self.set_kwargs is not None and self.excluded_cols is not None:
+                raise ValueError(
+                    "DO_UPDATE and DO_UPDATE_FROM_EXCLUDED are mutually exclusive"
+                )
+
+
 class InsertBuilder(_Builder):
     # Four mutually-exclusive value sources are tracked by separate
     # attributes; the methods that set them (VALUES, BULK_VALUES, SELECT)
@@ -636,15 +710,11 @@ class InsertBuilder(_Builder):
         # paths; only one of the four can populate at a time.
         self._select_source: SelectBuilder | None = None
         self._select_columns: list[str] | None = None
-        # ON CONFLICT clause state.  Target is either columns or a named
-        # constraint (mutually exclusive); action is "nothing" or
-        # "update".  For DO UPDATE, exactly one of _set / _excluded
-        # populates: kwargs SET literal values, *cols SET from EXCLUDED.col.
-        self._on_conflict_target: tuple[Any, ...] | None = None
-        self._on_conflict_constraint: str | None = None
-        self._on_conflict_action: str | None = None
-        self._on_conflict_set: dict[str, Any] | None = None
-        self._on_conflict_excluded: tuple[Any, ...] | None = None
+        # ON CONFLICT clause state.  Replaced five sibling attributes with
+        # one validated spec (S5): structural invariants live in
+        # _OnConflictSpec.__post_init__ and the executor reads a single
+        # struct.  None means "no ON CONFLICT clause".
+        self._on_conflict: _OnConflictSpec | None = None
 
     def INTO(self, table: TableProxy[Any]) -> InsertBuilder:
         """Set the INSERT target table.
@@ -723,47 +793,48 @@ class InsertBuilder(_Builder):
         For the any-conflict skip case (no target), use the shorthand
         .ON_CONFLICT_DO_NOTHING() instead.
         """
+        # The "not empty" check is method-specific input validation; the
+        # mutual-exclusion-with-constraint and all action invariants are
+        # enforced by the spec's __post_init__ via replace().
         if not cols:
             raise ValueError(
                 "ON_CONFLICT requires at least one column; "
                 "use ON_CONFLICT_DO_NOTHING() for the any-conflict shorthand"
             )
-        if self._on_conflict_constraint is not None:
-            raise ValueError(
-                "ON_CONFLICT and ON_CONFLICT_CONSTRAINT are mutually exclusive"
-            )
-        self._on_conflict_target = cols
+        current = self._on_conflict or _OnConflictSpec()
+        self._on_conflict = replace(current, target=cols)
         return self
 
     def ON_CONFLICT_CONSTRAINT(self, name: str) -> InsertBuilder:  # noqa: N802
         """Set the conflict target by named constraint."""
-        if self._on_conflict_target is not None:
-            raise ValueError(
-                "ON_CONFLICT_CONSTRAINT and ON_CONFLICT are mutually exclusive"
-            )
-        self._on_conflict_constraint = name
+        current = self._on_conflict or _OnConflictSpec()
+        self._on_conflict = replace(current, constraint=name)
         return self
 
     def ON_CONFLICT_DO_NOTHING(self) -> InsertBuilder:  # noqa: N802
         """`ON CONFLICT DO NOTHING` with no target — silently skip any
         conflict on any unique index or exclusion constraint."""
-        self._on_conflict_action = "nothing"
+        current = self._on_conflict or _OnConflictSpec()
+        self._on_conflict = replace(current, action="nothing")
         return self
 
     def DO_NOTHING(self) -> InsertBuilder:  # noqa: N802
         """Pair with a preceding ON_CONFLICT(*cols) or ON_CONFLICT_CONSTRAINT."""
-        # Ordering invariant: target must be set first.  We surface this
-        # at the call site rather than at render time so the traceback
-        # points at the bad chain rather than deep in the executor.
-        # ON_CONFLICT_DO_NOTHING() is the dedicated shorthand for the
-        # no-target form; DO_NOTHING() alone is the post-target action.
-        if self._on_conflict_target is None and self._on_conflict_constraint is None:
+        # Chain-time invariant: this is the post-target form, so a
+        # preceding ON_CONFLICT or ON_CONFLICT_CONSTRAINT must already be
+        # in the spec.  The spec's __post_init__ legitimately allows
+        # action="nothing" with no target (that's the shorthand path),
+        # so the check has to live here — only the call-site knows
+        # which spelling the user wrote.
+        if self._on_conflict is None or (
+            self._on_conflict.target is None and self._on_conflict.constraint is None
+        ):
             raise ValueError(
                 "DO_NOTHING requires a preceding ON_CONFLICT or "
                 "ON_CONFLICT_CONSTRAINT; use ON_CONFLICT_DO_NOTHING() for the "
                 "any-conflict shorthand"
             )
-        self._on_conflict_action = "nothing"
+        self._on_conflict = replace(self._on_conflict, action="nothing")
         return self
 
     def DO_UPDATE(self, **fields: Any) -> InsertBuilder:  # noqa: N802
@@ -772,20 +843,12 @@ class InsertBuilder(_Builder):
         For "use the value the new row tried to insert" semantics
         (i.e. SET col = EXCLUDED.col), use DO_UPDATE_FROM_EXCLUDED.
         """
-        # _set and _excluded are sibling slots, but only one populates per
-        # call: DO_UPDATE goes through _set (literal kwargs), and
-        # DO_UPDATE_FROM_EXCLUDED goes through _excluded (column refs that
-        # render as EXCLUDED.col).  The executor reads exactly one.
-        if self._on_conflict_target is None and self._on_conflict_constraint is None:
-            raise ValueError(
-                "DO_UPDATE requires a preceding ON_CONFLICT (column target) "
-                "or ON_CONFLICT_CONSTRAINT — PG can't perform DO UPDATE "
-                "without knowing which constraint to look at"
-            )
+        # "Not empty" is method-specific input validation; the
+        # action+target coherence checks live in _OnConflictSpec.
         if not fields:
             raise ValueError("DO_UPDATE requires at least one field to set")
-        self._on_conflict_action = "update"
-        self._on_conflict_set = fields
+        current = self._on_conflict or _OnConflictSpec()
+        self._on_conflict = replace(current, action="update", set_kwargs=fields)
         return self
 
     def DO_UPDATE_FROM_EXCLUDED(self, *cols: Any) -> InsertBuilder:  # noqa: N802
@@ -795,12 +858,10 @@ class InsertBuilder(_Builder):
         attempted to add; this mirrors save()'s upsert semantics where
         every non-PK field gets clobbered with the new value.
         """
-        if self._on_conflict_target is None and self._on_conflict_constraint is None:
-            raise ValueError("DO_UPDATE_FROM_EXCLUDED requires a preceding ON_CONFLICT")
         if not cols:
             raise ValueError("DO_UPDATE_FROM_EXCLUDED requires at least one column")
-        self._on_conflict_action = "update"
-        self._on_conflict_excluded = cols
+        current = self._on_conflict or _OnConflictSpec()
+        self._on_conflict = replace(current, action="update", excluded_cols=cols)
         return self
 
     def SELECT(  # noqa: N802
