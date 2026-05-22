@@ -156,24 +156,33 @@ adapter is a silent no-op. The class-level cache-clear utility was
 preferred over an adapter-protocol method to keep the duck-typed
 contract small.
 
-### B3. `run_save` ignores schema DEFAULTs and never refreshes  *[2026-04-29 #5 unresolved half; 2026-05-22-deepdive #2; comment-run #2]*
+### ~~B3. `run_save` ignores schema DEFAULTs and never refreshes~~  *[2026-04-29 #5 unresolved half; 2026-05-22-deepdive #2; comment-run #2] — CLOSED 2026-05-22*
 
-`cygnet/executor.py:1186-1263`. The May 17 commit (`a2156bf`) added
-DEFAULT-aware omission and RETURNING to `run_insert` and `run_create`,
-but the upsert branch of `run_save` was deliberately excluded. The
-in-source comment at lines 1199-1207 acknowledges the divergence; the
-README's "save() always sends the full object" (line 345) does not.
+Closed by routing the upsert path through `_extract_insert_fields`
+with the same `defaulted_columns` set `run_insert` uses (OQ1 resolved
+in favour of "fix it" rather than "document the divergence").
+DEFAULT-omitted columns are excluded from BOTH the INSERT column list
+AND the `DO UPDATE SET` clauses; on the new-row branch the schema
+DEFAULT fires; on the conflict branch the existing value is preserved;
+in both cases RETURNING refreshes the in-memory object so the caller's
+view matches the DB row.
 
-**Failure mode**: `save()` on an object with `created_at=None` against
-`created_at DEFAULT now()` writes NULL on initial save (covered by
-Apr 29 #5) AND, on conflict, the EXCLUDED.created_at update clobbers
-the existing row's value to NULL.
+Adapters that don't implement `column_defaults` (FakeDB, custom
+duck-typed adapters that opt out) see no behaviour change — when
+nothing is DEFAULT-omitted, the upsert emits the historical
+"no RETURNING, execute-not-execute_one" shape. Empty-SET edge case
+(every non-PK field DEFAULT-omitted, or pure-PK model) falls back to
+`SET pk = EXCLUDED.pk`, a syntactically valid no-op.
 
-**Direction of fix**: Either route the upsert through
-`_extract_insert_fields(defaulted=…)` like `run_insert` does (and emit
-RETURNING for the same shape), or document the user-visible semantics
-on `save()`'s docstring and in README. The former is correct behavior;
-the latter is at least honest. See **OQ1** for the design question.
+Coverage: 5 new unit tests in `tests/test_builders.py::TestSaveDefaultAwareness`
+pin the SQL shape; 2 new integration tests in
+`tests/integration/test_roundtrip.py::TestDefaultAwareInsertRoundtrip`
+(`test_save_existing_row_preserves_default_column` and
+`test_save_existing_row_with_explicit_override_writes_it`) exercise
+the end-to-end behaviour against real PG.
+
+Closes **S14** (README updated to describe the new save() semantics
+explicitly) and resolves **OQ1**.
 
 ### ~~B4. `stubs._format_type` loses generic parameters~~  *[2026-05-22-deepdive #4; comment-run #1] — CLOSED 2026-05-22*
 
@@ -360,18 +369,13 @@ Closed by the B1 fix. The new comment describes the actual SQL —
 notes the system-column / dropped-column filters explicitly. The
 `pg_get_expr` reference is gone (it was never in the query path).
 
-### S14. README save() doc doesn't mention DEFAULT suppression  *[2026-05-22-deepdive docs]*
+### ~~S14. README save() doc doesn't mention DEFAULT suppression~~  *[2026-05-22-deepdive docs] — CLOSED 2026-05-22*
 
-`README.md:345` ("save() always sends the full object"). True at the
-request level; misleads on response semantics. Doesn't tell users
-that save() suppresses DB DEFAULTs and doesn't refresh from
-RETURNING. Tied to **B3**.
-
-**Direction of fix**: Add a sentence to save()'s README block:
-"Columns with schema DEFAULTs are written as NULL on save() —
-DEFAULTs only fire when save() routes through the initial INSERT path
-(DBKey with None). Use INSERT or create() if you need DEFAULTs to fire
-for an existing PK."
+Closed alongside **B3**. The README's save() section now describes the
+DEFAULT-aware behaviour directly: None-valued fields with a schema
+DEFAULT are omitted from both INSERT cols and SET, then refreshed via
+RETURNING, with the practical consequences spelled out
+("created_at = None now means leave the DB's value alone").
 
 ### ~~S15. `tests/test_stubs.py` lacks parameterised-generic coverage~~  *[2026-05-22-deepdive tests] — CLOSED 2026-05-22*
 
@@ -599,16 +603,11 @@ block), worth a comment noting which TypeError is expected
 
 ## Open questions
 
-### OQ1. Is the `run_save` DEFAULT divergence intentional and permanent?
+### ~~OQ1. Is the `run_save` DEFAULT divergence intentional and permanent?~~  *— RESOLVED 2026-05-22*
 
-**Source**: 2026-04-29-deepdive OQ1; 2026-05-22-deepdive OQ1.
-
-The code comment at `cygnet/executor.py:1199-1207` reads as a deliberate
-choice ("consistent with save() semantics"). The README doesn't
-surface it. The divergence between sibling methods (`run_save` vs
-`run_insert`/`run_create`) is the kind of thing that bites users in
-production. Worth deciding: formalize the divergence (document
-loudly), or close the gap.
+Resolved in favour of "close the gap". `run_save`'s upsert path now
+mirrors `run_insert` / `run_create` on DEFAULT handling. Closed via
+**B3**.
 
 ### OQ2. Should the duck-typed adapter contract become a formal `Protocol`?
 

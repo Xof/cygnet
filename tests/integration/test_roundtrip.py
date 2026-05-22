@@ -624,3 +624,75 @@ class TestDefaultAwareInsertRoundtrip:
         assert t.id is not None
         assert t.created_at is not None
         assert t.status == "pending"
+
+    async def test_save_path_picks_up_defaults_on_new_row(self, setup_table):
+        """cygnet.save(db, obj) on a DBKey=None object delegates to
+        run_insert internally, so DEFAULTs fire and the obj is populated.
+        This branch hasn't changed in B3 but anchors the contract."""
+        db = setup_table
+        t = TimestampedThing(id=None, name="delta")
+        await cygnet.save(db, t)
+        assert t.id is not None
+        assert t.created_at is not None
+        assert t.status == "pending"
+
+    async def test_save_existing_row_preserves_default_column(self, setup_table):
+        """B3 fix end-to-end.  An upsert where a None field has a schema
+        DEFAULT must NOT clobber the existing row's value to NULL — the
+        column is omitted from both the INSERT list and the SET clause,
+        and RETURNING refreshes the in-memory object to match the
+        preserved DB value.
+        """
+        db = setup_table
+
+        # First persist the row so created_at gets a real timestamp.
+        t = TimestampedThing(id=None, name="epsilon", status="active")
+        await cygnet.save(db, t)
+        original_created_at = t.created_at
+        original_id = t.id
+        assert original_created_at is not None
+
+        # Re-save with created_at=None and status=None.  Under the bug
+        # (pre-fix), both would be clobbered to NULL.  Post-fix, both
+        # are omitted from INSERT and SET; RETURNING refreshes the obj
+        # with the DB's preserved values.
+        t.created_at = None
+        t.status = None
+        t.name = "epsilon-updated"
+        await cygnet.save(db, t)
+
+        # In-memory: created_at refreshed from RETURNING with the
+        # preserved value; status likewise; name reflects the new value.
+        assert t.id == original_id
+        assert t.created_at == original_created_at, (
+            "B3: existing DEFAULT value was clobbered to NULL"
+        )
+        assert t.status == "active", "B3: existing 'active' was overwritten"
+        assert t.name == "epsilon-updated"
+
+        # DB row matches: a fresh SELECT sees the same values.
+        loaded = await cygnet.get(db, TimestampedThingTable, id=original_id)
+        assert loaded is not None
+        assert loaded.created_at == original_created_at
+        assert loaded.status == "active"
+        assert loaded.name == "epsilon-updated"
+
+    async def test_save_existing_row_with_explicit_override_writes_it(
+        self, setup_table
+    ):
+        """The negative companion: a non-None value on a DEFAULTed column
+        IS written through the upsert (the app is overriding the
+        default).  Preserves the historical contract for explicit values."""
+        db = setup_table
+        t = TimestampedThing(id=None, name="zeta", status="active")
+        await cygnet.save(db, t)
+        original_id = t.id
+
+        # Explicitly override status (DEFAULT-eligible but caller wants
+        # a value): it must be written.
+        t.status = "archived"
+        await cygnet.save(db, t)
+
+        loaded = await cygnet.get(db, TimestampedThingTable, id=original_id)
+        assert loaded is not None
+        assert loaded.status == "archived"

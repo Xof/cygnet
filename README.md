@@ -342,7 +342,26 @@ acc.name = "Frederick"
 await cygnet.save(db, acc)
 ```
 
-`save()` always sends the full object. For surgical updates, use `UPDATE`.
+`save()` is DEFAULT-aware (matches `INSERT` and `create()` since 2026-05-22):
+a field whose in-memory value is `None` and whose column has a schema
+`DEFAULT` is omitted from both the `INSERT` column list and the `DO UPDATE
+SET` clause, then refreshed via `RETURNING`.  Consequences:
+
+- New row (no conflict): the schema `DEFAULT` fires (e.g. `now()` for
+  `created_at`), and `obj.created_at` is patched with the populated value.
+- Existing row (conflict): the `DEFAULT`ed column is *not* touched by the
+  `UPDATE` — the existing value is preserved — and `RETURNING` still
+  refreshes `obj` to match the DB row.
+- Explicit override: a non-`None` value is always written through, so the
+  app can override the `DEFAULT` when it wants to.
+
+In other words, `obj.created_at = None` is now a signal to "leave the DB's
+value alone"; use `UPDATE` if you need to write a literal NULL to a
+`DEFAULT`ed column.  Adapters that don't implement the optional
+`column_defaults` protocol method (e.g. `FakeDB`) see the historical
+shape: every field emitted, no `RETURNING`.
+
+For surgical updates of individual columns, use `UPDATE`.
 
 ### get() — fetch by primary key
 

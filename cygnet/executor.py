@@ -1206,24 +1206,28 @@ class Executor:
         """Upsert: INSERT ... ON CONFLICT (pk) DO UPDATE SET ...
 
         Behaviour depends on PK type and value:
-          - DBKey + None   → plain INSERT with RETURNING (new row)
-          - DBKey + value  → INSERT ... ON CONFLICT DO UPDATE (upsert)
-          - AppKey + None  → ValueError (app must supply the key)
-          - AppKey + value → INSERT ... ON CONFLICT DO UPDATE (upsert)
+          - DBKey + None   → plain INSERT with RETURNING (new row);
+            delegates to run_insert.
+          - DBKey + value  → INSERT ... ON CONFLICT DO UPDATE (upsert).
+          - AppKey + None  → ValueError (app must supply the key).
+          - AppKey + value → INSERT ... ON CONFLICT DO UPDATE (upsert).
 
-        The DBKey + None case delegates to run_insert rather than
-        duplicating INSERT logic, because the object needs its PK
-        populated via RETURNING.
+        The upsert path is DEFAULT-aware in the same way run_insert and
+        run_create are: a None-valued column whose schema entry carries
+        a DEFAULT is omitted from BOTH the INSERT column list AND the
+        DO UPDATE SET clauses, then refreshed via RETURNING.
+        Consequences:
+          - New row (no conflict): the schema DEFAULT fires; the obj's
+            field is patched with the populated value.
+          - Existing row (conflict): the DEFAULTed column is not touched
+            by the UPDATE (preserving the existing value), and RETURNING
+            still refreshes the obj to match the DB row.
+        RETURNING is omitted entirely when nothing is DEFAULT-omitted —
+        the SQL shape then matches the historical contract (no
+        execute_one, no obj mutation), so adapters that don't implement
+        ``column_defaults`` (FakeDB and any custom adapter that opts
+        out) see no behaviour change.
         """
-        # Note: the explicit-upsert path below does NOT participate in
-        # the DEFAULT-aware column-omission machinery — every column is
-        # emitted with its current in-memory value, including None for
-        # columns with a DEFAULT.  An upsert where a None-valued column
-        # has a DEFAULT will INSERT NULL and on conflict will UPDATE to
-        # NULL, regardless of the schema default.  This is consistent
-        # with save() semantics ("persist the object's current state")
-        # but means save() and create() differ in their DEFAULT
-        # handling — see run_create for the contrast.
         meta = TableProxy(type(obj))._meta
 
         if meta.pk is None:
@@ -1235,7 +1239,9 @@ class Executor:
         pk_val = getattr(obj, meta.pk.attr_name)
 
         # DBKey with no value → first insert, delegate to the INSERT path
-        # which handles RETURNING and in-place PK mutation.
+        # which handles RETURNING and in-place PK mutation.  run_insert
+        # is already DEFAULT-aware (commit a2156bf), so this branch
+        # naturally fires schema DEFAULTs.
         if meta.pk.primary_key == DBKey and pk_val is None:
             from .builders import InsertBuilder
 
@@ -1250,26 +1256,34 @@ class Executor:
                 f"{type(obj).__name__}.{meta.pk.attr_name} is AppKey but value is None"
             )
 
-        # Build the upsert.  All fields (including PK) appear in the INSERT
-        # portion; only non-PK fields appear in the ON CONFLICT UPDATE SET.
-        # Unlike render_insert, this path does NOT call _extract_insert_fields:
-        # we're in a known-PK-present state, so the DBKey=None skip and
-        # AppKey=None check don't apply, and we want the PK column emitted
-        # explicitly for the ON CONFLICT target.
+        # Upsert path with DEFAULT-aware column omission.  Reuses
+        # _extract_insert_fields with the same defaulted-columns set an
+        # ordinary INSERT would use.  The DBKey-None / AppKey-None
+        # branches inside that helper are unreachable here because the
+        # PK is known to be non-None at this point (we just checked).
         params: list[Any] = []
-        all_fields = meta.fields
-        non_pk = [f for f in all_fields if f.primary_key is None]
+        kwargs = {f.attr_name: getattr(obj, f.attr_name) for f in meta.fields}
+        defaulted = await self._get_defaulted_columns(meta.table_name)
+        columns, _values, omitted = self._extract_insert_fields(
+            meta, kwargs, params, defaulted
+        )
 
-        columns = [f.column_name for f in all_fields]
-        placeholders: list[str] = []
-        for f in all_fields:
-            params.append(getattr(obj, f.attr_name))
-            placeholders.append(f"${len(params)}")
+        placeholders = [f"${i + 1}" for i in range(len(columns))]
 
-        # EXCLUDED is PostgreSQL's name for the row that would have been
-        # inserted.  This ensures the UPDATE uses the new values, not the
-        # existing ones.
-        set_clauses = [f"{f.column_name} = EXCLUDED.{f.column_name}" for f in non_pk]
+        # EXCLUDED.col is PG's name for "the row that would have been
+        # inserted".  SET clauses cover only non-PK columns that ALSO
+        # made it into the INSERT column list — DEFAULT-omitted columns
+        # must NOT be touched on conflict (otherwise the existing row's
+        # DEFAULT value would be clobbered to whatever EXCLUDED reads
+        # for the omitted slot, which defeats the omission).
+        set_clauses = [
+            f"{cn} = EXCLUDED.{cn}" for cn in columns if cn != meta.pk.column_name
+        ]
+        if not set_clauses:
+            # Pure-PK model or every non-PK field was DEFAULT-omitted.
+            # PG requires at least one SET clause; assigning the PK to
+            # its EXCLUDED value is a syntactically valid no-op.
+            set_clauses = [f"{meta.pk.column_name} = EXCLUDED.{meta.pk.column_name}"]
 
         sql = (
             f"INSERT INTO {meta.table_name} "
@@ -1279,7 +1293,29 @@ class Executor:
             f"{', '.join(set_clauses)}"
         )
 
-        await self._db.execute(sql, params)
+        if omitted:
+            # RETURNING includes the PK (always known, idempotent to re-set)
+            # plus each DEFAULT-omitted column.  execute_one because
+            # PG always produces exactly one row from
+            # ON CONFLICT DO UPDATE … RETURNING — whether the row was
+            # newly inserted or updated.  None would indicate a driver
+            # bug.
+            returning_cols = [meta.pk.column_name] + [f.column_name for f in omitted]
+            sql += f" RETURNING {', '.join(returning_cols)}"
+            row = await self._db.execute_one(sql, params)
+            if row is None:
+                raise RuntimeError(
+                    f"UPSERT…RETURNING produced no row for "
+                    f"{meta.cls.__name__} — driver bug?"
+                )
+            setattr(obj, meta.pk.attr_name, row[0])
+            for i, f in enumerate(omitted, start=1):
+                setattr(obj, f.attr_name, row[i])
+        else:
+            # Nothing DEFAULT-omitted → historical execute-without-RETURNING
+            # contract.  Lets FakeDB (and any adapter that doesn't
+            # implement column_defaults) see no behaviour change.
+            await self._db.execute(sql, params)
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 

@@ -1029,6 +1029,95 @@ class TestSaveSQL:
         assert "ON CONFLICT" in db.last_sql
 
 
+# ── B3: save() honours schema DEFAULTs (matches run_insert/run_create) ────
+#
+# The 2026-05-17 commit `a2156bf` taught run_insert and run_create to omit
+# None-valued fields whose column carries a DEFAULT, then refresh via
+# RETURNING.  run_save (the upsert path) was deliberately excluded — see
+# the in-source comment that the comment-run pass flagged.  OQ1 resolved
+# in favour of "match run_insert" so save() is now consistent with its
+# siblings.  These tests pin the new behaviour.
+
+
+class TestSaveDefaultAwareness:
+    async def test_save_omits_defaulted_none_from_insert_columns(self):
+        """Existing-PK save() with a DEFAULTed column = None: the column
+        must be omitted from the INSERT column list so PG's DEFAULT
+        clause fires on the new-row branch of the upsert.  The bug being
+        regressed is that save() previously sent NULL explicitly,
+        suppressing the DEFAULT."""
+        db = DefaultsFakeDB(
+            rows=[(5, "2026-01-01T00:00:00Z")],
+            defaults={"widgets": {"created_at"}},
+        )
+        obj = Widget(id=5, name="Bolt", created_at=None)
+        await cygnet.save(db, obj)
+        col_list = db.last_sql.split("VALUES")[0]
+        assert "created_at" not in col_list, (
+            "created_at must be omitted from INSERT columns so DEFAULT fires"
+        )
+
+    async def test_save_omits_defaulted_none_from_set_clause(self):
+        """Mirror of the column-list test, for the ON CONFLICT branch.
+        If the column appears in SET, an upsert on an existing row would
+        clobber the DB value to NULL — preserving the existing value
+        requires keeping the column out of the SET clause entirely."""
+        db = DefaultsFakeDB(
+            rows=[(5, "2026-01-01T00:00:00Z")],
+            defaults={"widgets": {"created_at"}},
+        )
+        obj = Widget(id=5, name="Bolt", created_at=None)
+        await cygnet.save(db, obj)
+        set_clause = db.last_sql.split("DO UPDATE SET")[1].split("RETURNING")[0]
+        assert "created_at" not in set_clause, (
+            "created_at must not appear in SET — existing DEFAULT must be preserved"
+        )
+
+    async def test_save_returning_refreshes_obj(self):
+        """When DEFAULT columns are omitted, RETURNING fetches their
+        post-INSERT (or post-UPDATE-no-op) values and patches the
+        in-memory object so the caller's view matches the DB."""
+        db = DefaultsFakeDB(
+            rows=[(5, "2026-01-01T00:00:00Z")],
+            defaults={"widgets": {"created_at"}},
+        )
+        obj = Widget(id=5, name="Bolt", created_at=None)
+        await cygnet.save(db, obj)
+        assert "RETURNING id, created_at" in db.last_sql
+        assert obj.created_at == "2026-01-01T00:00:00Z", (
+            "obj.created_at must be refreshed from RETURNING after save()"
+        )
+
+    async def test_save_explicit_value_emits_and_updates(self):
+        """A non-None value on a DEFAULTed column is the app overriding
+        the default.  The column appears in both the INSERT list and the
+        SET clause; the historical behaviour is preserved for explicitly
+        set values."""
+        db = DefaultsFakeDB(
+            rows=[(5, "2020-01-01")],
+            defaults={"widgets": {"created_at"}},
+        )
+        obj = Widget(id=5, name="Bolt", created_at="2020-01-01")
+        await cygnet.save(db, obj)
+        col_list = db.last_sql.split("VALUES")[0]
+        assert "created_at" in col_list
+        set_clause = db.last_sql.split("DO UPDATE SET")[1]
+        assert "created_at = EXCLUDED.created_at" in set_clause
+        assert "2020-01-01" in db.last_params
+
+    async def test_save_with_no_defaults_unchanged_behaviour(self):
+        """Plain FakeDB (no column_defaults) gets the historical SQL:
+        every field emitted, no RETURNING, no obj mutation.  Back-compat
+        guard — pre-existing FakeDB-based tests must keep passing."""
+        db = FakeDB()
+        obj = Account(id=1, name="Fred", email="fred@example.com")
+        await cygnet.save(db, obj)
+        # All fields in INSERT col list and SET clause; no RETURNING.
+        col_list = db.last_sql.split("VALUES")[0]
+        assert "name" in col_list and "email" in col_list
+        assert "RETURNING" not in db.last_sql
+
+
 class TestGetSQL:
     async def test_get_produces_correct_where(self):
         db = FakeDB(rows=[(1, "Fred", "fred@example.com")])
