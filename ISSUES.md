@@ -559,31 +559,30 @@ branch covers the unhashable-adapter fallback).
 
 ## Open issues — nits
 
-### N1. `_columns` field assigned without annotation  *[2026-04-29 typing]*
+### ~~N1. `_columns` field assigned without annotation~~  *[2026-04-29 typing] — CLOSED 2026-05-22*
 
-`cygnet/builders.py:142`. `self._columns = columns` relies on
-`*columns: SQLRenderable` typing through. Inconsistent with sibling
-fields that carry explicit annotations.
+Closed: ``self._columns: tuple[SQLRenderable, ...] = columns`` in
+``SelectBuilder.__init__``.  Matches the explicit-annotation pattern
+of sibling fields.
 
-**Direction of fix**: `self._columns: tuple[SQLRenderable, ...] = columns`.
+### ~~N2. `EXCEPT_` trailing underscore~~  *[2026-04-29 NIT] — CLOSED 2026-05-22 (no fix needed)*
 
-### N2. `EXCEPT_` trailing underscore  *[2026-04-29 NIT]*
+Resolved as a no-op: ``except`` is a Python reserved word, the
+trailing-underscore convention is documented in README, and there's
+no improvement available without renaming the SQL keyword.  Kept
+in this list for traceability.
 
-`cygnet/builders.py:469-472`. `except` is reserved; trailing underscore
-documented in README. UNION/INTERSECT don't have one. Cosmetic.
+### ~~N3. Two `from .proxy import ColumnProxy` calls inside two methods~~  *[2026-04-29 nits] — CLOSED 2026-05-22*
 
-**Direction of fix**: None — the language constraint is real.
+Closed alongside **S6**: both function-local ``ColumnProxy`` imports
+(and the two ``cte`` ones) lifted to module scope in ``executor.py``.
 
-### N3. Two `from .proxy import ColumnProxy` calls inside two methods  *[2026-04-29 nits]*
+### ~~N4. `_render_select` iterates `_joins` twice~~  *[2026-04-29 perf] — CLOSED 2026-05-22 (acceptable)*
 
-`cygnet/executor.py:419` and `:481`. Same import in two methods.
-Subsumed by **S6** (lift to module level).
-
-### N4. `_render_select` iterates `_joins` twice  *[2026-04-29 perf]*
-
-`cygnet/executor.py:_render_select` bare-FROM path iterates `b._joins`
-twice (once for SELECT list, once for JOIN clause). For typical join
-counts (1-3) the cost is negligible.
+Resolved as acceptable: for typical join counts (1-3) the cost is
+negligible, and the two passes do semantically different work
+(column projection then join emission).  Folding them would couple
+unrelated logic for no measurable benefit.
 
 ### ~~N5. Inline comment example `~~cygnet.exists(any_log)` would help~~  *[2026-04-29 tests] — CLOSED 2026-05-22*
 
@@ -592,19 +591,21 @@ Closed: inline comment added at
 explaining that the double tilde is intentional and what each
 application of ``~`` does to a Predicate.
 
-### N6. First-INSERT-per-table introspection round-trip  *[2026-05-22-deepdive perf]*
+### ~~N6. First-INSERT-per-table introspection round-trip~~  *[2026-05-22-deepdive perf] — CLOSED 2026-05-22 (acceptable)*
 
-`cygnet/executor.py:_get_defaulted_columns`. First INSERT to a
-never-seen table pays one synchronous round-trip for the
-`information_schema.columns` lookup. Cached thereafter. Acceptable;
-documented because it's a behaviour change vs. the pre-May-17
-contract.
+Resolved as acceptable: the one-time round-trip per (adapter, table)
+is the cost of correct DEFAULT-aware codegen, and it amortises away
+after the first INSERT.  The cache invalidation knob
+(``cygnet.flush_column_defaults``) makes it a knowable cost rather
+than an opaque one.  No fix needed.
 
-### N7. Bare `except TypeError` in cache-write  *[2026-05-22-deepdive exception]*
+### ~~N7. Bare `except TypeError` in cache-write~~  *[2026-05-22-deepdive exception] — CLOSED 2026-05-22*
 
-`cygnet/executor.py:104-112`. Narrow today (single-statement try
-block), worth a comment noting which TypeError is expected
-(unhashable adapter from `WeakKeyDictionary.__setitem__`).
+Closed alongside the **B2 + S29** cache refactor: the
+``except TypeError`` in ``Executor._get_defaulted_columns`` now
+carries an explanatory comment naming the unhashable-adapter case
+(``WeakKeyDictionary`` refusing the key) and explaining the
+skip-caching fallback.
 
 ---
 

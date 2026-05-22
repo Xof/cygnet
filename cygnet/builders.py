@@ -168,7 +168,7 @@ class SelectBuilder(_Builder):
         # meta.fields regardless of PG's physical column order, which the
         # _map_select / _row_to_obj mapping depends on.  Non-empty columns
         # mean the caller wants raw tuples, with no object hydration.
-        self._columns = columns
+        self._columns: tuple[SQLRenderable, ...] = columns
         self._table: TableSource | None = None
         # _joins is (kind, table, on) tuples where kind is one of
         # "INNER", "LEFT", "RIGHT", "FULL" — directly interpolated into
