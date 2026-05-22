@@ -130,9 +130,15 @@ def _format_type(t: Any) -> str:
     parameterised generic types fall through to str() which gives
     `int | None`, `list[str]`, etc.
     """
-    name: Any = getattr(t, "__name__", None)
-    if isinstance(name, str):
-        return name
+    # `type(t) is type` is the precise discriminator between bare
+    # classes and parameterised forms.  A naive `getattr(t, "__name__")`
+    # check is wrong: PEP 585 generics like `list[str]` still carry
+    # `__name__` on their origin class (`'list'`), so the readable
+    # `str(t)` fallback never fires and the parameters silently vanish.
+    # `type(list[str])` is `types.GenericAlias`, `type(int | None)` is
+    # `types.UnionType`, neither is `type` — both correctly fall through.
+    if type(t) is type:
+        return t.__name__
     return str(t)
 
 

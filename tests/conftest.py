@@ -43,10 +43,23 @@ class TaggedAccount:
     tag: Annotated[str, Column("tag_name")]
 
 
+# Carries parameterised generics so stubs codegen can be tested against
+# `list[str]` / `dict[str, int]` shapes (B4 / S15).  Cygnet itself doesn't
+# care what Python type a column carries — JSONB and array columns are
+# commonly typed this way at the dataclass level and serialized by the
+# adapter.  Kept minimal: just enough surface for the stub-format tests.
+@dataclasses.dataclass
+class Doc:
+    id: Annotated[int, DBKey]
+    tags: list[str]
+    metadata: dict[str, int]
+
+
 AccountTable = cygnet.Table(Account)
 LogTable = cygnet.Table(LogEntry)
 EventTable = cygnet.Table(Event)
 TaggedTable = cygnet.Table(TaggedAccount)
+DocTable = cygnet.Table(Doc)
 
 
 # ── Fake db that captures calls ───────────────────────────────────────────────

@@ -74,3 +74,22 @@ class TestGenerate:
         # resolution.  That's enough to catch indentation / brace /
         # missing-colon bugs in the generator.
         compile(out, "<generated>", "exec")
+
+    def test_parameterised_generics_keep_their_params(self):
+        """B4 / S15.  `list[str]` must render as `ColumnProxy[list[str]]`,
+        not the bare `ColumnProxy[list]` that `getattr(t, '__name__')`
+        produces on Python 3.12 parameterised generics.
+
+        The fixture is Doc in tests/conftest.py — it has a `tags:
+        list[str]` field and a `metadata: dict[str, int]` field.  Before
+        the fix at cygnet/stubs.py:_format_type, the generated stub
+        dropped the type parameters because Python's PEP 585 generics
+        still carry `__name__` on the origin class (list, dict).
+        """
+        out = generate("tests.conftest")
+        assert "        tags: ColumnProxy[list[str]]" in out
+        assert "        metadata: ColumnProxy[dict[str, int]]" in out
+        # Bug-symptom guard: the unparameterised form must not appear
+        # for these fields.
+        assert "tags: ColumnProxy[list]" not in out
+        assert "metadata: ColumnProxy[dict]" not in out

@@ -181,24 +181,16 @@ RETURNING for the same shape), or document the user-visible semantics
 on `save()`'s docstring and in README. The former is correct behavior;
 the latter is at least honest. See **OQ1** for the design question.
 
-### B4. `stubs._format_type` loses generic parameters  *[2026-05-22-deepdive #4; comment-run #1]*
+### ~~B4. `stubs._format_type` loses generic parameters~~  *[2026-05-22-deepdive #4; comment-run #1] — CLOSED 2026-05-22*
 
-`cygnet/stubs.py:126-136`. `getattr(t, "__name__", None)` returns
-`"list"` for `list[str]`, `"dict"` for `dict[str, int]`, etc. — Python
-3.12 parameterised generics still carry `__name__` on the origin
-class. The docstring says parameterised types should fall through to
-`str()`; only `UnionType` (which has no `__name__`) actually does.
-
-**Failure mode**: Running `python -m cygnet.stubs myapp.models` with a
-model containing `Annotated[list[str], …]` produces
-`ColumnProxy[list]`. Mypy then sees the attribute as
-`ColumnProxy[list[Unknown]]` and any operation expecting
-`list[str]` elements fails to type-check.
-
-**Direction of fix**: `if type(t) is type: return t.__name__`, or
-check for `__class_getitem__` presence on the type itself. Add a test
-case in `tests/test_stubs.py` with a parameterised-generic field
-(currently absent — see **S15**).
+Fixed by replacing the `getattr(t, "__name__")` test with
+`type(t) is type` — the precise discriminator between bare classes
+(where `type(t) is type` holds) and parameterised forms (`list[str]`
+is `types.GenericAlias`, `int | None` is `types.UnionType`; neither
+matches `type` and both fall through to the readable `str(t)`).
+Regression test added at `tests/test_stubs.py::test_parameterised_generics_keep_their_params`
+with a `Doc` fixture in `tests/conftest.py` carrying `list[str]` and
+`dict[str, int]` fields (closes **S15** too).
 
 ### ~~B5. `pip-audit --strict || true` swallows CVEs~~  *[2026-05-22-deepdive #5] — CLOSED 2026-05-22*
 
@@ -399,14 +391,12 @@ DEFAULTs only fire when save() routes through the initial INSERT path
 (DBKey with None). Use INSERT or create() if you need DEFAULTs to fire
 for an existing PK."
 
-### S15. `tests/test_stubs.py` lacks parameterised-generic coverage  *[2026-05-22-deepdive tests]*
+### ~~S15. `tests/test_stubs.py` lacks parameterised-generic coverage~~  *[2026-05-22-deepdive tests] — CLOSED 2026-05-22*
 
-No existing test exercises a field like `Annotated[list[str], …]`. That
-is why **B4** is invisible to CI.
-
-**Direction of fix**: Add a model with `list[str]` and `dict[str, int]`
-fields; assert the generated stub contains `ColumnProxy[list[str]]`
-and `ColumnProxy[dict[str, int]]`, not `ColumnProxy[list]`.
+Closed alongside **B4**. The new fixture (`Doc` in `tests/conftest.py`)
+and test (`test_parameterised_generics_keep_their_params`) cover both
+`list[str]` and `dict[str, int]` and assert the bug-symptom strings
+(`ColumnProxy[list]`, `ColumnProxy[dict]`) are absent.
 
 ### S16. FakeDB has no `column_defaults` template  *[2026-05-22-deepdive tests]*
 
