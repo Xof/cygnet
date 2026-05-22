@@ -126,6 +126,10 @@ def op(*args: Any) -> Any:
     vector.  Operands (left/right values) ARE parameterised; only the
     operator itself is trusted.
     """
+    # Arity dispatch is positional, with no keyword arguments accepted.
+    # The dispatch order matters here: a stray 0-arg or 4+-arg call falls
+    # through to the explicit TypeError at the bottom, rather than being
+    # silently bound to one of the overload arms.
     if len(args) == 3:
         return Predicate(args[0], args[1], args[2])
     if len(args) == 2:
@@ -269,6 +273,12 @@ class FunctionCall:
     args: tuple[Any, ...]
 
     def render_sql(self, params: list[Any]) -> str:
+        # Left-to-right traversal of self.args is load-bearing: $N indexes
+        # are assigned by mutation of `params`, and they must match the
+        # order in which the rendered SQL fragments reference them.
+        # hasattr(a, "render_sql") is the duck-typed SQLRenderable check;
+        # anything else becomes a $N parameter.  Note that this duck-typing
+        # mirrors predicate._render_operand — keep the two in step.
         rendered: list[str] = []
         for a in self.args:
             if hasattr(a, "render_sql"):
@@ -299,6 +309,11 @@ class FunctionCall:
         return Predicate(self, ">=", other)
 
     # Arithmetic.  See ColumnProxy / Predicate for full rationale.
+    # The reflected operators (__radd__, __rsub__, …) are not just mirrors:
+    # they swap operand order so that `1 + fn(...)` renders as `$1 + fn(...)`
+    # rather than `fn(...) + $1`.  This matters for non-commutative SQL ops
+    # like `-` and `/`, where preserving Python source order in the rendered
+    # SQL is the only sensible behaviour.
     def __add__(self, other: object) -> Predicate:
         return Predicate(self, "+", other)
 
@@ -421,6 +436,11 @@ class WindowSpec:
         if self.frame:
             parts.append(self.frame)
         inside = " ".join(parts)
+        # Empty OVER () is valid SQL and unambiguous: it requests the
+        # full unpartitioned, unordered window.  We emit it explicitly
+        # rather than skipping the OVER entirely, since the caller asked
+        # for a window expression and silently dropping it would mask
+        # programming errors at the SQL-shape level.
         return f"OVER ({inside})" if inside else "OVER ()"
 
 

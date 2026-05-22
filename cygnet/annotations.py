@@ -12,6 +12,14 @@ from dataclasses import dataclass
 from typing import Any
 
 
+# Frozen so the two module-level singletons below (DBKey / AppKey) are
+# hashable and safely shared across all dataclass annotations without
+# mutation hazards.  The class itself is intentionally underscore-prefixed:
+# users never construct one directly — they reference the DBKey / AppKey
+# singletons.  Two PK fields on the same model is a configuration error,
+# but a misconfigured user reusing the same singleton across fields would
+# otherwise quietly succeed; meta._introspect's "more than one primary
+# key" check catches that case.
 @dataclass(frozen=True)
 class _PrimaryKey:
     # "db" means the database assigns the value (e.g., SERIAL / IDENTITY);
@@ -30,6 +38,10 @@ DBKey = _PrimaryKey(assigned_by="db")
 AppKey = _PrimaryKey(assigned_by="app")
 
 
+# Column-name override carrier.  Frozen+hashable so the same _Column
+# instance could in principle be shared, though in practice every
+# Column("…") call produces a fresh instance — sharing has no measurable
+# benefit and reads worse at the use site.
 @dataclass(frozen=True)
 class _Column:
     # When None, the Python attribute name is used as the column name.
@@ -64,6 +76,9 @@ def table(name: str) -> Any:
     # the default naming convention (lowercase class name + "s").  The decorator
     # returns the class unmodified — no wrapper, no metaclass — so dataclass
     # semantics are fully preserved.
+    # Ordering note: @cygnet.table must be applied to a class that is already
+    # (or will be) a dataclass; the stamp survives @dataclass either way
+    # because @dataclass mutates the class in place rather than wrapping it.
     def decorator(cls: Any) -> Any:
         cls.__cygnet_table__ = name
         return cls

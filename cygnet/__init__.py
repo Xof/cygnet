@@ -11,6 +11,25 @@ Query verbs are UPPER_CASE (SELECT, INSERT, UPDATE, DELETE, TRUNCATE) to
 mirror SQL and read naturally in Python: `await cygnet.SELECT(db).FROM(T)`.
 The noqa: N802 suppressions silence PEP 8 naming complaints on these
 intentionally-named functions.
+
+This file also hosts cross-cutting helpers that don't belong inside a
+specific builder module — `transaction` (savepoint-based nesting context
+manager), `get` (PK fetch), `save` (insert-or-upsert dispatch), `create`
+(insert-without-upsert), `follow` (FK traversal), and `TRUNCATE` (no
+builder needed).  These are kept here because they sit between the
+builders and the executor: they coordinate across multiple builder
+operations or sit outside the builder pattern entirely.
+
+Naming convention recap for callers reading the export list:
+  - UPPER_CASE  → SQL verbs / statement entry points
+    (SELECT, INSERT, UPDATE, DELETE, TRUNCATE)
+  - PascalCase  → factories returning a proxy / decorator / class
+    (Table, Column, DBKey, AppKey, ForeignKey, table, CTE, Lateral,
+     RecursiveCTE)
+  - lower_case  → helpers, sentinels, and convenience functions
+    (get, save, create, follow, transaction, lit, op, ops, is_null,
+     is_not_null, exists, not_exists, fn, cte, lateral, recursive_cte,
+     all)
 """
 
 from __future__ import annotations
@@ -21,6 +40,8 @@ from typing import Any, cast
 # builders (returned by query-verb factories, not constructed directly by
 # users), expression helpers (op/ops/is_null/is_not_null), and the `all`
 # sentinel (see predicate.py — required for unrestricted UPDATE/DELETE).
+# `cygnet.all` shadows Python's builtin `all` *inside this module only*;
+# callers do `cygnet.all` which is unambiguous at the call site.
 from .annotations import AppKey, Column, DBKey, ForeignKey, table
 from .builders import DeleteBuilder, InsertBuilder, SelectBuilder, UpdateBuilder
 from .cte import CTE, Lateral, RecursiveCTE, cte, lateral, recursive_cte
@@ -86,6 +107,14 @@ def Table[T](cls: type[T]) -> TableProxy[T]:  # noqa: N802
 # db.execute() / db.execute_one().  Cygnet never imports a specific database
 # driver — the db protocol is duck-typed (see tests/conftest.py:FakeDB for
 # the minimal interface).
+#
+# Each builder is awaitable: `await SELECT(db).FROM(T)` triggers execution
+# via the builder's __await__.  Builders also expose `.sql()` for caller
+# inspection without execution.
+#
+# UPDATE and DELETE refuse to run without an explicit .WHERE() — pass
+# cygnet.all to act on every row intentionally.  See predicate.py for the
+# sentinel; the guard lives in the builder, not here.
 
 
 def SELECT(db: Any, *columns: Any) -> SelectBuilder:  # noqa: N802
@@ -111,6 +140,9 @@ async def TRUNCATE(db: Any, *tables: TableProxy[Any], cascade: bool = False) -> 
     single statement with no clauses to chain, so a direct async function
     is simpler.
     """
+    # TRUNCATE doesn't go through the Executor: there are no rows to map
+    # back to objects and no params to bind, so this is a direct
+    # db.execute() with the empty-params list the protocol requires.
     if not tables:
         raise ValueError("TRUNCATE requires at least one table")
     names = ", ".join(t._meta.table_name for t in tables)
@@ -133,6 +165,18 @@ def lit(sql: str) -> Literal:
 # ── Convenience functions ────────────────────────────────────────────────────
 # These wrap common patterns (get-by-PK, insert-without-upsert, upsert)
 # so callers don't have to spell out the full builder chain for simple cases.
+#
+# The save / create / INSERT distinction is intentional and worth keeping
+# straight when reading caller code:
+#   - INSERT(db).INTO(T).VALUES(...) — generic builder; user controls
+#     ON CONFLICT, RETURNING, etc.  Most flexible, most verbose.
+#   - create(db, obj) — INSERT with no ON CONFLICT.  Duplicates raise
+#     IntegrityError from the driver.  PK populated on obj for DBKey.
+#   - save(db, obj) — INSERT ... ON CONFLICT DO UPDATE (upsert) when a
+#     PK is known; plain INSERT ... RETURNING when DBKey + PK is None.
+#     Idempotent; the default "persist this object" call.
+# follow() and get() are read-side conveniences; they always SELECT and
+# never mutate.
 
 
 async def get[T](db: Any, table: TableProxy[T], **pk_kwargs: Any) -> T | None:
@@ -178,6 +222,10 @@ async def follow(db: Any, obj: Any, fk_column: Any) -> Any:
     if not isinstance(fk_column, ColumnProxy):
         raise ValueError(f"{fk_column!r} is not a column proxy")
 
+    # Order of checks below: type-validate fk_column → type-validate obj →
+    # check FK metadata → read FK value → null-short-circuit → SELECT.
+    # Validating obj before reading field metadata gives a clearer error
+    # for the common "passed the wrong instance" mistake.
     field = fk_column._field
     source_meta = fk_column._table._meta
 
@@ -229,6 +277,29 @@ async def save(db: Any, obj: Any) -> None:
     await Executor(db).run_save(obj)
 
 
+# State machine summary for transaction:
+#
+#   db._in_transaction = False  ──BEGIN──▶  db._in_transaction = True
+#                       ▲                                  │
+#                       └────COMMIT or ROLLBACK────────────┘
+#
+# A nested `async with cygnet.transaction(db)` finds the flag already
+# True and issues SAVEPOINT spN / RELEASE / ROLLBACK TO instead of
+# BEGIN / COMMIT / ROLLBACK.  The flag is *not* a counter — nesting depth
+# isn't tracked here; SAVEPOINTs nest naturally on the server side, and
+# the unique-per-instance savepoint name (`sp_{id(self)}`) keeps the
+# release pair matched.
+#
+# Why a bool and not a counter: a counter would require Cygnet to
+# manage the depth explicitly, which doesn't add safety (the server
+# rejects mismatched COMMITs anyway) but does add a failure mode where
+# a counter and the server's view diverge after an unexpected exception.
+# The flag-plus-savepoint approach is monotonic and self-healing.
+#
+# This is NOT task-local on purpose: Cygnet expects one db adapter
+# instance per asyncio task.  Sharing one PsycopgDB across concurrent
+# tasks will corrupt the flag.  See PsycopgDB's docstring for the same
+# warning at the adapter layer.
 class transaction:
     """
     Async context manager for database transactions.
@@ -260,6 +331,9 @@ class transaction:
 
     def __init__(self, db: Any) -> None:
         self._db = db
+        # Set to a savepoint name on __aenter__ when nested; stays None at
+        # the outermost level.  Acts as the "am I the outermost?" signal
+        # in __aexit__ — see the branch there.
         self._savepoint: str | None = None
 
     async def __aenter__(self) -> Any:
@@ -268,6 +342,9 @@ class transaction:
         # savepoint name leaking from a prior nested entry into a fresh
         # BEGIN/COMMIT cycle.
         self._savepoint = None
+        # getattr-with-default rather than direct access: adapters in the
+        # wild (or freshly-constructed fakes in tests) may not have set
+        # the attribute yet.  Treat absence as "not in a transaction".
         if getattr(self._db, "_in_transaction", False):
             # Already in a transaction → use SAVEPOINT for nesting.
             # id(self) produces a unique name per context manager instance,
@@ -278,6 +355,10 @@ class transaction:
             self._savepoint = f"sp_{id(self)}"
             await self._db.execute(f"SAVEPOINT {self._savepoint}")
         else:
+            # Outermost layer: open a real transaction and claim the flag.
+            # Ordering matters: BEGIN is sent first so a failing execute()
+            # leaves the flag at False and the next transaction() call
+            # opens cleanly instead of trying to SAVEPOINT against nothing.
             await self._db.execute("BEGIN")
             self._db._in_transaction = True
         # Returns the original db, not self — the caller uses the same
@@ -290,7 +371,14 @@ class transaction:
         exc_val: BaseException | None,
         exc_tb: Any,
     ) -> None:
+        # Branch on "did __aenter__ open a savepoint?" rather than re-reading
+        # _in_transaction: the flag is True for both inner and outer layers
+        # while a nested transaction is active, so it can't distinguish them.
         if self._savepoint:
+            # Nested layer: leave _in_transaction alone — the outermost
+            # context manager owns it.  Note: we do NOT swallow exc_type;
+            # returning None (implicit) re-raises it after the savepoint
+            # is rolled back, which is the standard CM contract.
             if exc_type:
                 await self._db.execute(f"ROLLBACK TO SAVEPOINT {self._savepoint}")
             else:

@@ -6,6 +6,20 @@
 # the query via the db adapter, and optionally maps results back to
 # dataclass instances.
 #
+# This is the ONLY place in Cygnet where SQL strings get assembled —
+# every other layer (builders, predicates, proxies, JSON/array/FTS
+# helpers, CTEs) either holds state or contributes a render_sql()
+# fragment, but never produces a complete statement.  Concentrating
+# string assembly here means the $N renumbering invariant, the
+# clause-ordering invariant, and the DEFAULT-aware INSERT codegen
+# all have exactly one place to live and be reasoned about.
+#
+# Row mapping (the inverse direction — rows back to objects) also lives
+# here, in _map_row / _row_to_obj.  Keeping both directions in one file
+# means the "column order matches meta.fields order" invariant — set up
+# by the SELECT renderer and consumed by the row mapper — never has to
+# cross a module boundary.
+#
 # The Executor is stateless (aside from the db handle) and short-lived —
 # builders create one per .sql() or .__await__() call.  This keeps the
 # executor free of accumulated state between queries.
@@ -22,7 +36,10 @@
 #     builder's method-call order.  Builders just collect state.
 #   - Transactions are NOT this module's concern.  cygnet.transaction() in
 #     __init__.py flips db._in_transaction and issues BEGIN/SAVEPOINT; the
-#     Executor only calls db.execute / db.execute_one.
+#     Executor only calls db.execute / db.execute_one.  The one exception
+#     is stream_select: PG portal cursors require a transaction, but the
+#     check is on the *adapter's* side (psycopg raises), not here —
+#     stream_select just passes the call through.
 
 from __future__ import annotations
 
@@ -112,6 +129,16 @@ class Executor:
         cygnet.all with real predicates, which used to be silently dropped
         in SELECT and is now consistently rejected.
         """
+        # The returned list is the exact set of predicates the caller should
+        # render.  Three return shapes the callers branch on:
+        #   - []  → no WHERE clause should be emitted (either user wrote
+        #           WHERE(cygnet.all) explicitly, or this is a SELECT with
+        #           no predicates at all)
+        #   - non-empty → emit WHERE with each predicate ANDed
+        # The verb argument is used only in the error message; callers
+        # MUST still gate WHERE emission on the returned list being
+        # non-empty (see how _render_select, _render_update,
+        # _render_delete all use `if checked:`).
         has_all = any(isinstance(p, _All) for p in predicates)
         real = [p for p in predicates if not isinstance(p, _All)]
         if not predicates:
@@ -142,11 +169,19 @@ class Executor:
     # ── SELECT ────────────────────────────────────────────────────────────────
 
     def render_select(self, b: Any) -> tuple[str, list[Any]]:
+        # Public entry: own the params list here so the caller never has to
+        # think about $N numbering.  _render_select mutates this list as
+        # it walks the builder; on return its length == number of $N
+        # placeholders in the SQL string.
         params: list[Any] = []
         sql = self._render_select(b, params)
         return sql, params
 
     async def run_select(self, b: Any) -> list[Any]:
+        # No transaction handling here: SELECT is read-only and the adapter
+        # decides whether it needs to be inside a transaction.  Contrast
+        # with stream_select, which has a documented transaction
+        # requirement on the PG-portal side.
         sql, params = self.render_select(b)
         rows = await self._db.execute(sql, params)
         return self._map_select(b, rows)
@@ -171,6 +206,15 @@ class Executor:
         # Recursive CTEs render as `name AS (anchor UNION ALL step)`; if
         # ANY of the WITH-list entries is recursive, PG requires the
         # WITH RECURSIVE keyword on the whole list (not per-CTE).
+        #
+        # Anchor and step are each rendered with the SAME params list,
+        # in declaration order: anchor params come before step params.
+        # This is a self-recursive call into _render_select, which is
+        # safe — the CTE bodies are themselves SelectBuilders with no
+        # shared state to corrupt.  Nested CTEs (CTE referencing another
+        # CTE) work because the inner SELECTs reference CTE names as
+        # plain table identifiers; the WITH-list itself is flat at
+        # render time.
         cte_prefix = ""
         if b._ctes:
             from .cte import RecursiveCTE
@@ -205,6 +249,15 @@ class Executor:
             # "table.*") so the result order matches meta.fields regardless
             # of the physical column order (attnum) in PostgreSQL.
             # has_from must be True here (caught above when both are missing).
+            #
+            # This is the load-bearing invariant for the row mapper:
+            # _map_row / _row_to_obj rely on result[i] corresponding to
+            # meta.fields[i].  Emitting columns in meta.fields order here
+            # is what makes that work.  Joins extend the same convention:
+            # left table's fields first (length = len(left.fields)), then
+            # each right table's fields (length = len(jt.fields)) in
+            # b._joins order — which is exactly what _map_row's offset
+            # arithmetic assumes.
             assert b._table is not None
             table = b._table._meta
             from_name = b._table._sql_name
@@ -239,6 +292,13 @@ class Executor:
 
             from .cte import Lateral
 
+            # Join order in the emitted SQL matches b._joins iteration
+            # order, which matches the user's chained-method order on the
+            # builder.  Mixing LATERAL with normal JOINs in one query is
+            # legal — the isinstance(jt, Lateral) branch handles each
+            # entry independently.  Both branches append on_pred params
+            # AFTER any subquery-internal params for LATERAL, so $N
+            # numbering keeps marching forward correctly.
             for kind, jt, on_pred in b._joins:
                 if isinstance(jt, Lateral):
                     # JOIN LATERAL (inner_sql) alias ON cond.  The
@@ -327,6 +387,11 @@ class Executor:
         (stream_select) can reuse the exact same mapping logic per row.
         """
         # 1. Explicit columns → raw tuple (no object mapping).
+        # We can't reconstruct dataclasses here because the user may have
+        # projected only some columns, computed expressions, or columns
+        # from multiple tables — there's no general "fields N..M map to
+        # dataclass X" rule that holds.  Caller deals with the tuple
+        # shape they asked for.
         if b._columns:
             return tuple(row)
 
@@ -338,6 +403,12 @@ class Executor:
         if b._joins:
             left_meta = b._table._meta
             left_n = len(left_meta.fields)
+            # Each iteration produces a fresh dataclass instance via
+            # _row_to_obj.  No instance reuse across rows — distinct
+            # rows produce distinct objects even when the row data
+            # would compare equal.  The result list is never
+            # de-duplicated; that's the caller's responsibility if
+            # JOINs produce duplicate left-side rows.
             left_obj = self._row_to_obj(left_meta, row[:left_n])
             offset = left_n
             right_objs: list[Any] = []
@@ -381,6 +452,14 @@ class Executor:
         for portal cursors, so wrap the streaming code in
         `async with cygnet.transaction(db)` for typical use.
         """
+        # The executor doesn't check db._in_transaction here on purpose:
+        # the portal-vs-transaction requirement is a PG-side rule that
+        # the adapter is responsible for surfacing (psycopg raises a
+        # clear error if cursor.stream() is invoked in autocommit mode).
+        # Checking it here would entangle the executor with adapter-
+        # specific behaviour and would also reject legitimate use cases
+        # like an adapter that streams via a server-side cursor in
+        # autocommit.
         if not hasattr(self._db, "stream"):
             raise TypeError(
                 f"{type(self._db).__name__} does not implement stream(); "
@@ -388,6 +467,9 @@ class Executor:
                 "method to support streaming SELECTs"
             )
         sql, params = self.render_select(b)
+        # Yield-per-row; mapping is done lazily so the row buffer never
+        # has to materialise the whole result set.  Each yielded object
+        # is a fresh dataclass instance (or tuple, per _map_row's mode).
         async for row in self._db.stream(sql, params):
             yield self._map_row(b, row)
 
@@ -464,6 +546,9 @@ class Executor:
 
         # Object takes precedence over kwargs — if both are provided,
         # all fields are extracted from the object and kwargs are ignored.
+        # This is intentional: VALUES(obj, key=val) would otherwise have
+        # ambiguous semantics ("override one field on the obj"?  "merge
+        # both"?), so we collapse to the simpler rule and document it.
         if obj is not None:
             # Type check: catch wrong-model VALUES() before getattr blows up
             # on a missing attribute.  Mirrors the same check in render_update.
@@ -772,6 +857,10 @@ class Executor:
                     setattr(b._obj, f.attr_name, row[i])
             return None
 
+        # Final fallthrough: AppKey + no obj, or AppKey + obj + no omitted
+        # defaults.  No RETURNING was emitted upstream so no row to read;
+        # we just dispatch the INSERT and return None.  Matches the
+        # historical pre-DEFAULT-aware contract for AppKey inserts.
         await self._db.execute(sql, params)
         return None
 
@@ -817,6 +906,15 @@ class Executor:
             raise ValueError(
                 f"Unknown field(s) for {meta.cls.__name__}: {sorted(unknown)}"
             )
+        # Three parallel accumulators grow in lockstep:
+        #   columns[i]  → column_name for the i'th emitted slot
+        #   values[i]   → the in-memory value being inserted
+        #   params      → SAME values (caller-supplied list, mutated)
+        # The caller derives $N placeholders from len(columns), so columns
+        # and params MUST stay aligned; appending to params without
+        # appending to columns (or vice versa) would skew the numbering.
+        # `values` is kept around mainly for the historical contract /
+        # debug-friendly return shape; it duplicates `params`.
         columns: list[str] = []
         values: list[Any] = []
         omitted_default_fields: list[Any] = []
@@ -869,6 +967,14 @@ class Executor:
         from save() is that create() never generates ON CONFLICT — if the
         row already exists, the database raises a unique constraint violation.
         """
+        # Path duplicates a fair bit of _render_insert intentionally:
+        # run_create has no builder to consult (no ON CONFLICT, no bulk,
+        # no INSERT…SELECT, no kwargs-only path), so reusing
+        # _render_insert would require synthesising a builder shape just
+        # to throw most of it away.  The simpler thing is to inline the
+        # single-row VALUES path here and keep the two implementations
+        # in sync by hand.  Drift risk: if _render_insert's RETURNING
+        # logic changes, this code must change too.
         meta = TableProxy(type(obj))._meta
         params: list[Any] = []
         kwargs = {f.attr_name: getattr(obj, f.attr_name) for f in meta.fields}
@@ -907,6 +1013,12 @@ class Executor:
                     f"INSERT...RETURNING produced no row for "
                     f"{meta.cls.__name__} — driver bug or row not inserted"
                 )
+            # Row layout: [pk?, *omitted_defaults].  `pos` tracks the
+            # offset where omitted-default values begin.  For DBKey:
+            # pos=1, row[0] is the PK, row[1..] are the omitted defaults.
+            # For AppKey-with-omitted: pos=0, row[0..] are the omitted
+            # defaults.  enumerate(start=pos) makes the index `i` line
+            # up with the actual row tuple position.
             pos = 0
             if meta.pk and meta.pk.primary_key == DBKey:
                 setattr(obj, meta.pk.attr_name, row[0])
@@ -922,6 +1034,10 @@ class Executor:
     # ── UPDATE ────────────────────────────────────────────────────────────────
 
     def render_update(self, b: Any) -> tuple[str, list[Any]]:
+        # Final emitted clause order: UPDATE table SET ... [FROM ...]
+        # WHERE ... [RETURNING ...].  This matches PG's documented
+        # syntax and the order in which params are appended below;
+        # any reordering would silently corrupt $N numbering.
         if b._table is None:
             raise ValueError("UPDATE requires SET(table, …) before WHERE / await")
         params: list[Any] = []
@@ -1080,6 +1196,15 @@ class Executor:
         duplicating INSERT logic, because the object needs its PK
         populated via RETURNING.
         """
+        # Note: the explicit-upsert path below does NOT participate in
+        # the DEFAULT-aware column-omission machinery — every column is
+        # emitted with its current in-memory value, including None for
+        # columns with a DEFAULT.  An upsert where a None-valued column
+        # has a DEFAULT will INSERT NULL and on conflict will UPDATE to
+        # NULL, regardless of the schema default.  This is consistent
+        # with save() semantics ("persist the object's current state")
+        # but means save() and create() differ in their DEFAULT
+        # handling — see run_create for the contrast.
         meta = TableProxy(type(obj))._meta
 
         if meta.pk is None:
@@ -1158,5 +1283,11 @@ class Executor:
         dataclass that declares init=False on any field, or uses __init__
         with positional-only parameters, will not be hydratable this way.
         """
+        # Every row produces a NEW dataclass instance — no caching, no
+        # identity map, no de-duplication.  Two SELECTs that return the
+        # same DB row produce two distinct Python objects.  This is a
+        # deliberate simplification compared to richer ORMs (no session,
+        # no unit-of-work) and is the reason "stale instance" hazards
+        # don't exist in Cygnet.
         kwargs = {f.attr_name: val for f, val in zip(meta.fields, row)}
         return meta.cls(**kwargs)

@@ -212,7 +212,7 @@ PairingTable = cygnet.Table(Pairing)
 
 
 class TestSelfJoinRoundtrip:
-    """Closes REVIEW.md item 8.1: a real-PG self-join via aliasing.
+    """Closes ISSUES.md item 8.1 (formerly REVIEW.md): a real-PG self-join via aliasing.
 
     The unit-level test_multi_join_mapping uses identical ON clauses with
     the same table twice — that SQL would be rejected by PG's parser as

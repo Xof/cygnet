@@ -9,6 +9,12 @@
 # cygnet.Table(Account) always returns the same object.  This is important
 # for identity: executor.py and builders.py compare proxies by reference
 # (e.g., b._table) when deciding how to render queries.
+#
+# Aliased proxies (T.AS("a")) are the deliberate exception to the singleton
+# rule.  They share their TableMeta with the canonical proxy (introspection
+# happens once per dataclass) but live outside the cache so a single query
+# can hold two distinct proxies for the same table without aliasing them
+# together.
 
 from __future__ import annotations
 
@@ -30,7 +36,7 @@ class ColumnProxy[FT]:
     NOTE on IDE autocomplete: at the call site `T.name` resolves to a
     plain `ColumnProxy` (no field-type inference) because Python's type
     system can't project a generic-parameter class's fields into typed
-    proxy attributes without a mypy plugin or codegen.  See REVIEW.md
+    proxy attributes without a mypy plugin or codegen.  See ISSUES.md
     item 5.4 for the trade-offs.  Users who want strict typing can spell
     the type explicitly:
         name_col: ColumnProxy[str] = T.name
@@ -58,7 +64,11 @@ class ColumnProxy[FT]:
     # hijacks Python's comparison semantics to build an AST node instead of
     # evaluating to True/False.  Consequence: you can never use a ColumnProxy
     # in a boolean context (if T.col == val: ...) — it will always be truthy
-    # because Predicate is a non-empty object.
+    # because Predicate is a non-empty object.  Likewise, chained comparisons
+    # `0 < T.col < 10` do NOT do what they look like: Python evaluates them as
+    # `(0 < T.col) and (T.col < 10)` and the `and` short-circuits on the
+    # first (truthy) Predicate, returning only the second comparison.  Use
+    # `(T.col > 0) & (T.col < 10)` instead.
     # The # type: ignore[override] suppressions are needed because the
     # signatures don't match object.__eq__'s return type (bool).
     def __eq__(self, other: object) -> Predicate:  # type: ignore[override]
@@ -140,7 +150,7 @@ _proxy_cache: weakref.WeakValueDictionary[type, TableProxy[Any]] = (
 # thread the model type through `cygnet.Table(Account) -> TableProxy[Account]`
 # and `cygnet.get(...) -> Account | None` without affecting runtime behaviour
 # (ColumnProxy attributes are still stamped dynamically; static autocomplete
-# on T.col is the deferred next step — see REVIEW.md item 5.4).
+# on T.col is the deferred next step — see ISSUES.md item 5.4).
 class TableProxy[T]:
     # Same __new__ / _initialised caching pattern as TableMeta.  The proxy
     # cache is separate from the meta cache so that their lifetimes are
@@ -161,6 +171,10 @@ class TableProxy[T]:
         # identity comparisons elsewhere in the codebase.
         if hasattr(self, "_initialised"):
             return
+        # Set the flag BEFORE building the proxy state.  TableMeta() can in
+        # principle trigger further attribute access on `self` (e.g., during
+        # an exception's __repr__), and we want the guard to short-circuit
+        # those nested calls cleanly rather than half-initialise twice.
         self._initialised = True
         self._meta = TableMeta(target_cls)
         # Aliased proxies (.AS("name")) carry _alias; the cached "main"
@@ -200,6 +214,12 @@ class TableProxy[T]:
         # Bypass cache via __new__'s super-call path.  Re-runs the same
         # initialisation flow that the cached instance went through, but
         # against a brand-new self that the cache never sees.
+        # The TableMeta is shared with the canonical proxy — introspection
+        # is keyed by class, not by alias, so an aliased view sees the same
+        # FieldMeta list.  Only _alias and the freshly-stamped ColumnProxies
+        # differ, and the new ColumnProxies back-reference `new` (not the
+        # canonical proxy), which is what makes their render_sql emit the
+        # alias instead of the table name.
         new = object.__new__(type(self))
         new._initialised = True
         new._meta = self._meta

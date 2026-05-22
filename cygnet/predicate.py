@@ -9,6 +9,14 @@
 # tree depth-first, appending parameter values to a shared list and emitting
 # positional $N placeholders.  The shared list is what makes parameter
 # numbering work correctly across multiple predicates in the same query.
+#
+# Note: chained .WHERE() calls on a builder are stored as a list and ANDed
+# together externally by executor._render_where, NOT by composing a giant
+# AND tree inside this module.  So a Predicate's & operator is only invoked
+# when the user explicitly writes `(a == 1) & (b == 2)`.  Two semantically
+# equivalent forms (one chained .WHERE() per term vs. one .WHERE() with
+# & between terms) render to subtly different — but functionally identical —
+# SQL.
 
 from __future__ import annotations
 
@@ -37,7 +45,11 @@ class Predicate:
 
     # Overloading & and | (not `and`/`or`, which can't be overloaded in Python).
     # Users must parenthesise: (T.a == 1) & (T.b == 2), because & binds
-    # tighter than == in Python's operator precedence.
+    # tighter than == in Python's operator precedence.  Forgetting the
+    # parens — `T.a == 1 & T.b == 2` — parses as `T.a == (1 & T.b) == 2`,
+    # which is a chained comparison Python evaluates as boolean `and`,
+    # NOT the SQL AND we want.  See the file header for the corresponding
+    # `0 < T.col < 10` trap on the ColumnProxy side.
     def __and__(self, other: Predicate) -> Predicate:
         return Predicate(self, "AND", other)
 
@@ -141,6 +153,11 @@ class Predicate:
         # Python values become positional parameters.  This is what makes
         # T.id == T2.fk render as "t.id = t2.fk" (no params) while
         # T.id == 42 renders as "t.id = $1" (42 appended to params).
+        # Side-effect ordering: params.append() runs AFTER any nested
+        # render_sql() calls (which may themselves append).  The returned
+        # placeholder index therefore always matches the position of THIS
+        # value in the final list, even when sibling subtrees contribute
+        # parameters in between.
         if hasattr(value, "render_sql"):
             result: str = value.render_sql(params)
             return result

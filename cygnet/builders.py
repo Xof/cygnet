@@ -121,6 +121,10 @@ class _Builder:
         # rejects it if mixed with real predicates.
         self._predicates: list[SQLRenderable | _All] = []
 
+    # Each subclass shadows WHERE() to refine the return type (SelectBuilder,
+    # InsertBuilder, UpdateBuilder, DeleteBuilder) so chained calls preserve
+    # the concrete builder's type for IDE autocomplete and mypy.  The body
+    # is identical across overrides; only the annotation differs.
     def WHERE(self, predicate: SQLRenderable | _All) -> _Builder:
         # Multiple WHERE() calls are ANDed together in executor._render_where.
         # This is intentional: it lets callers conditionally chain filters
@@ -141,7 +145,16 @@ class SelectBuilder(_Builder):
         # mean the caller wants raw tuples, with no object hydration.
         self._columns = columns
         self._table: TableSource | None = None
+        # _joins is (kind, table, on) tuples where kind is "INNER" or "LEFT"
+        # — the only two kinds Cygnet currently emits.  Order matters: the
+        # executor emits joins in insertion order, so JOIN A then LEFT_JOIN B
+        # produces `... JOIN A ON ... LEFT JOIN B ON ...` and the right-hand-
+        # side column visibility cascades accordingly.
         self._joins: list[tuple[str, TableSource, Predicate]] = []
+        # _order entries are (column, "ASC"|"DESC") — the direction is
+        # per-call, not per-column, so ORDER_BY(a, b, DESC=True) flips
+        # both.  Mix directions across separate calls if you need that:
+        # .ORDER_BY(a).ORDER_BY(b, DESC=True).
         self._order: list[tuple[Any, str]] = []
         self._group: list[Any] = []
         self._having: list[SQLRenderable] = []
@@ -194,6 +207,10 @@ class SelectBuilder(_Builder):
         self._table = table
         return self
 
+    # `ON` is keyword-only across the JOIN family.  Forcing it keyword-only
+    # makes call sites self-documenting (`JOIN(T, ON=T.a == U.b)`) and
+    # prevents the easy mistake of passing the predicate where a table
+    # is expected.
     def JOIN(self, table: TableSource, *, ON: Predicate) -> SelectBuilder:
         _check_table_source(table, "JOIN")
         self._joins.append(("INNER", table, ON))
@@ -272,6 +289,10 @@ class SelectBuilder(_Builder):
                 f"is not a foreign key"
             )
 
+        # Build the join target from FK metadata and synthesise
+        # `fk_column == target.pk` as the ON predicate.  Always joins on PK
+        # because ForeignKey is constrained to PK references at annotation
+        # time — the simpler invariant lets _follow stay this short.
         target_proxy: TableProxy[Any] = TableProxy(field.foreign_key.target)
         # FK validation in _introspect() guarantees the target has a PK.
         assert target_proxy._meta.pk is not None
@@ -383,6 +404,9 @@ class SelectBuilder(_Builder):
             raise ValueError(
                 "FOR_UPDATE / FOR_SHARE: nowait and skip_locked are mutually exclusive"
             )
+        # Second-call rejection: a single _lock slot means re-calling
+        # FOR_UPDATE / FOR_SHARE would silently clobber the prior lock.
+        # Raising forces the caller to be explicit about what they meant.
         if self._lock is not None:
             raise ValueError(
                 "FOR_UPDATE / FOR_SHARE called twice on the same SELECT — "
@@ -506,9 +530,16 @@ class SelectBuilder(_Builder):
     def __await__(self) -> Generator[Any, None, list[Any]]:
         # Delegating __await__ to an async coroutine is what makes
         # `await builder` syntactically valid without a trailing .fetch().
+        # The same two-method pattern (__await__ → _execute) repeats in
+        # InsertBuilder / UpdateBuilder / DeleteBuilder; _execute is split
+        # out so subclasses can `await` the same flow internally without
+        # re-implementing __await__'s generator wiring.
         return self._execute().__await__()
 
     async def _execute(self) -> list[Any]:
+        # Fresh Executor per await: keeps the builder stateless w.r.t. the
+        # last execution, so a builder can be safely awaited more than
+        # once (each call re-renders SQL and re-numbers params from $1).
         return await Executor(self._db).run_select(self)
 
     def stream(self) -> Any:
@@ -524,6 +555,15 @@ class SelectBuilder(_Builder):
 
 
 class InsertBuilder(_Builder):
+    # Four mutually-exclusive value sources are tracked by separate
+    # attributes; the methods that set them (VALUES, BULK_VALUES, SELECT)
+    # each guard against the other three being populated, so the state
+    # machine is enforced at the call site rather than at render time.
+    # The four states:
+    #   1. single object        — _obj is set (kwargs empty, _bulk_objs None)
+    #   2. column-kwargs        — _kwargs populated (_obj None, _bulk_objs None)
+    #   3. BULK_VALUES list     — _bulk_objs is a non-empty list
+    #   4. INSERT…SELECT        — _select_source is set
     def __init__(self, db: Any) -> None:
         super().__init__(db)
         self._table: TableProxy[Any] | None = None
@@ -647,6 +687,11 @@ class InsertBuilder(_Builder):
 
     def DO_NOTHING(self) -> InsertBuilder:  # noqa: N802
         """Pair with a preceding ON_CONFLICT(*cols) or ON_CONFLICT_CONSTRAINT."""
+        # Ordering invariant: target must be set first.  We surface this
+        # at the call site rather than at render time so the traceback
+        # points at the bad chain rather than deep in the executor.
+        # ON_CONFLICT_DO_NOTHING() is the dedicated shorthand for the
+        # no-target form; DO_NOTHING() alone is the post-target action.
         if self._on_conflict_target is None and self._on_conflict_constraint is None:
             raise ValueError(
                 "DO_NOTHING requires a preceding ON_CONFLICT or "
@@ -662,6 +707,10 @@ class InsertBuilder(_Builder):
         For "use the value the new row tried to insert" semantics
         (i.e. SET col = EXCLUDED.col), use DO_UPDATE_FROM_EXCLUDED.
         """
+        # _set and _excluded are sibling slots, but only one populates per
+        # call: DO_UPDATE goes through _set (literal kwargs), and
+        # DO_UPDATE_FROM_EXCLUDED goes through _excluded (column refs that
+        # render as EXCLUDED.col).  The executor reads exactly one.
         if self._on_conflict_target is None and self._on_conflict_constraint is None:
             raise ValueError(
                 "DO_UPDATE requires a preceding ON_CONFLICT (column target) "
@@ -709,6 +758,9 @@ class InsertBuilder(_Builder):
         produces a row per source row, and there's no input list to
         mutate the way single-row / BULK_VALUES does.
         """
+        # No _check_table_source here: source is a SelectBuilder, not a
+        # TableSource.  The executor's render path passes it through
+        # SelectBuilder.render_sql to inline it as the row source.
         if self._obj is not None or self._kwargs or self._bulk_objs is not None:
             raise ValueError("INSERT cannot combine SELECT with VALUES / BULK_VALUES")
         self._select_source = source
@@ -758,6 +810,11 @@ class UpdateBuilder(_Builder):
         # SQLRenderable values (T.col + 1, cygnet.fn(...), Other.col)
         # render in place — that's how `count = count + 1` and
         # cross-table UPDATE FROM joins work.
+        #
+        # Re-calling SET clobbers _table / _obj / _kwargs entirely.  There's
+        # no .SET(...).SET(...) accumulation pattern by design — UPDATE has
+        # a single SET clause in SQL, and merging kwargs across calls would
+        # invite confusion about which call's values win.
         _check_table_source(table, "UPDATE … SET")
         self._table = table
         self._obj = obj

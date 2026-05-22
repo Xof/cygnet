@@ -25,6 +25,12 @@ def _unwrap_optional(t: type) -> type:
     common in SQL. The FK type check needs to compare the base type against
     the target PK's type, ignoring the None alternative.
     """
+    # Both Union spellings must be handled: typing.Optional[X] / typing.Union[…]
+    # produce typing.Union as the origin, while X | None (PEP 604, 3.10+)
+    # produces types.UnionType.  Checking both covers user style preference.
+    # Wider unions (len(non_none) != 1) are left unchanged — Cygnet has no
+    # meaningful FK type to compare them against, and the caller will surface
+    # the resulting mismatch as a type-error message.
     origin = typing.get_origin(t)
     if origin is Union or origin is types.UnionType:
         non_none: list[type] = [a for a in typing.get_args(t) if a is not type(None)]
@@ -78,6 +84,9 @@ class TableMeta:
         return instance
 
     def __init__(self, target_cls: type) -> None:
+        # Cache-hit short-circuit: __new__ may have returned an
+        # already-initialised instance; re-running _introspect would
+        # double-populate self.fields and corrupt the cached state.
         if hasattr(self, "_initialised"):
             return
 
@@ -148,6 +157,11 @@ class TableMeta:
                 # surfacing a confusing FrozenInstanceError at insert time.
                 # AppKey + frozen is fine because the app supplies the PK
                 # before the object is created.
+                # `pk_meta == DBKey` is value-equality on the frozen
+                # _PrimaryKey dataclass — both sides have assigned_by="db",
+                # so this succeeds even if a user (or future code) ever
+                # constructs a fresh _PrimaryKey("db") instead of reusing
+                # the module-level singleton.
                 if (
                     pk_meta == DBKey
                     and getattr(self.cls, "__dataclass_params__", None)

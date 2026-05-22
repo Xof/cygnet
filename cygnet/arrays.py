@@ -7,6 +7,20 @@
 # FunctionCall expressions; pair them with `==` / `!=` / etc. or wrap
 # with cygnet.op for non-standard comparisons.
 #
+# Index notes: @>, <@, and && are accelerated by GIN indexes on the
+# array column.  `=` and ordering operators use btree on the array as a
+# whole (rarely useful).  array_length / cardinality / unnest are not
+# index-friendly — filter on a containment predicate first when possible.
+#
+# NULL handling: in arrays, NULL elements are not equal to anything, so
+# `NULL = ANY(arr)` yields NULL (not true), even if arr contains NULL.
+# Use `arr.contains(col, [None])` semantics with care — PG treats NULLs
+# in arrays as distinct from absence.
+#
+# `ANY` also accepts a subquery (e.g. `= ANY(SELECT id FROM t)`); the
+# any() helper here is array-flavoured but happens to render identically
+# for either operand since both forms emit `ANY(<expr>)`.
+#
 # Usage:
 #   import cygnet.arrays as arr
 #   .WHERE(arr.contains(T.tags, ["python", "sql"]))

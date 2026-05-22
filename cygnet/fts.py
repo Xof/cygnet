@@ -9,6 +9,24 @@
 # The default text-search config is "english"; pass a different one as
 # the keyword arg if your column or query is in another language.
 #
+# Index notes: a GIN index on `to_tsvector('english', body)` (a functional
+# index) is the typical accelerator for @@.  GIST works too but is
+# generally slower for static documents.  For the index to be usable the
+# expression in the WHERE clause must match the indexed expression
+# exactly — same config string, same column.  Storing a generated
+# tsvector column is the most reliable path when search is hot.
+#
+# Immutability gotcha: to_tsvector(text) (one-arg form) uses the session
+# `default_text_search_config` GUC and is therefore STABLE, not
+# IMMUTABLE — it cannot back a functional index.  Always pass the
+# config explicitly (which is what these helpers do).
+#
+# Ranking is not pushed into the index: rank() / rank_cd() recompute on
+# each row that survives the @@ filter, so they're cheap only when the
+# match set is small.  ts_rank itself does not normalize by document
+# length unless you pass a normalization flag (not exposed here — use
+# cygnet.lit for that).
+#
 # Usage:
 #   import cygnet.fts as fts
 #   .WHERE(fts.matches(T.body, fts.web_query("fierce small ORM")))
@@ -61,6 +79,12 @@ def phrase_query(text: Any, config: str = "english") -> FunctionCall:
     return fn("phraseto_tsquery")(config, text)
 
 
+# Choosing among to_tsquery / plain_query / phrase_query / web_query:
+#   - to_tsquery: caller controls operators (& | ! <->), syntax errors raise.
+#   - plain_query: words AND-ed, no operators honoured.
+#   - phrase_query: words must appear in order (uses <-> internally).
+#   - web_query: handles bare user input safely; the right default for
+#     anything driven by an end-user search box.
 def web_query(text: Any, config: str = "english") -> FunctionCall:
     """`websearch_to_tsquery(config, text)` — Google-style query syntax.
 

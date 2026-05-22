@@ -6,6 +6,16 @@
 # wrappers exist for discoverability, readability in WHERE clauses, and
 # typo prevention, not as a closed set.
 #
+# Index hints — worth memorializing because the operator choice
+# determines which index can satisfy the query:
+#   - @>, ?, ?|, ?&  : accelerated by the default jsonb_ops GIN index.
+#   - get / get_text (->, ->>) : not accelerated by GIN unless wrapped in
+#     a functional expression index (e.g., on (data->>'email')).
+#   - @?, @@ (jsonpath) : accelerated by jsonb_path_ops or jsonb_ops GIN.
+# Containment semantics (@>) are structural, not lexical: `{"a":1}` does
+# not contain `{"a":1, "b":2}`, and array containment ignores order and
+# duplicates.  Surprising for newcomers; cite the PG docs when in doubt.
+#
 # Usage:
 #   import cygnet.jsonb as jb
 #   .WHERE(jb.contains(T.data, '{"active": true}'))
@@ -54,6 +64,9 @@ def contained_by(col: Any, val: Any) -> Predicate:
     return op(col, "<@", val)
 
 
+# `?`, `?|`, `?&` only inspect top-level keys of an object (or membership
+# in a string array).  They do not recurse into nested objects — use a
+# jsonpath operator (@?/@@) for deep checks.
 def has_key(col: Any, key: Any) -> Predicate:
     """`col ? key` — does the JSON object have the named top-level key?"""
     return op(col, "?", key)
@@ -86,6 +99,9 @@ def delete_key(col: Any, key: Any) -> Predicate:
     return op(col, "-", key)
 
 
+# @? and @@ take a jsonpath string ('$.foo[*] ? (@ > 3)'), not a text[]
+# path like #> / #>>.  Mixing them up is a common source of "syntax error
+# at or near" messages.
 def path_exists(col: Any, path: Any) -> Predicate:
     """`col @? path` — does the JSON path expression yield any item?"""
     return op(col, "@?", path)

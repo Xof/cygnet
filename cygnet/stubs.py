@@ -16,6 +16,13 @@
 # `else:` branch reproduces the original `XTable = cygnet.Table(X)`
 # lines so the snippet is the *only* place the proxies are
 # constructed (no risk of double-construction).
+#
+# Regeneration is *manual*: there is no import-time hook and no
+# watch mode.  The user runs `python -m cygnet.stubs ...` after
+# changing models and pastes the result back into the module.  That
+# trade-off is intentional — a runtime auto-stub would add import
+# cost and a hidden codegen step, which conflicts with Cygnet's
+# "models are plain dataclasses" promise.
 
 from __future__ import annotations
 
@@ -42,6 +49,13 @@ def generate(module_path: str) -> str:
     module = importlib.import_module(module_path)
     # Preserve declaration order from the module's namespace; for
     # 3.7+ Python this matches the source order.
+    #
+    # We collect by isinstance(TableProxy) rather than by scanning
+    # dataclasses + @cygnet.table: a user might have model classes
+    # defined elsewhere and only construct the proxies here, and
+    # conversely they might define a class with DBKey but never
+    # build a proxy for it.  The proxy variables are what mypy
+    # actually sees, so they are what we emit stubs for.
     proxies: list[tuple[str, Any]] = [
         (name, value)
         for name, value in vars(module).items()
@@ -71,6 +85,21 @@ def generate(module_path: str) -> str:
         cls = proxy._meta.cls
         shadow_name = f"_{name}"
         lines.append(f"    class {shadow_name}(TableProxy[{cls.__name__}]):")
+        # f.attr_name is the Python identifier, NOT f.column_name.
+        # `Column("renamed")` overrides the SQL name but leaves the
+        # attribute alone, and IDE autocomplete is about the Python
+        # attribute the user actually types (T.col_attr), so the SQL
+        # rename is irrelevant for stub purposes.
+        #
+        # f.python_type is already the Annotated-stripped underlying
+        # type from meta.py — DBKey / AppKey / ForeignKey markers are
+        # gone by the time we see the field, so a FK like
+        # `Annotated[int, ForeignKey(Parent)]` correctly renders as
+        # `ColumnProxy[int]` rather than leaking metadata.
+        #
+        # Frozen-dataclass + DBKey is rejected at TableMeta construction
+        # time, so by the time a TableProxy exists, the field list is
+        # already guaranteed safe — no need to filter here.
         for f in proxy._meta.fields:
             ft_str = _format_type(f.python_type)
             lines.append(f"        {f.attr_name}: ColumnProxy[{ft_str}]")

@@ -47,6 +47,11 @@ def count(*args: Any) -> FunctionCall:
 # when star-imported; that's a deliberate trade-off documented in the
 # original enhancement plan.  Use `import cygnet.functions as f` to avoid
 # the clash.
+#
+# PG semantics worth remembering: sum/avg/min/max ignore NULL inputs.
+# sum() over an all-NULL or empty set returns NULL (not 0) — wrap in
+# coalesce(f.sum(...), 0) if you need a numeric default.  count() is
+# the exception: it returns 0 for an empty set.
 sum = fn("sum")
 avg = fn("avg")
 min = fn("min")

@@ -8,8 +8,30 @@
 # construction time so `cte.id == 5` returns a Predicate, just like
 # `T.id == 5` on a regular table.
 #
+# The duck-typing here is deliberate: a CTE is NOT a thin TableProxy
+# subclass because TableProxy is tied to a concrete dataclass (its
+# TableMeta is keyed on `cls`, fields are dataclasses.Field-derived, PK
+# resolution assumes Annotated[..., DBKey|AppKey] metadata).  A CTE has
+# none of that — it's "a name plus a column list" — so inheriting from
+# TableProxy would mean fighting the meta system to fake a dataclass.
+# Instead we expose the *minimum* surface the executor actually reads:
+#   _sql_name           → emitted as the FROM/JOIN identifier
+#   _meta.table_name    → fallback label used by some code paths
+#   _meta.fields        → list of FieldMeta-shaped records for projection
+#   _meta.pk            → None (CTEs have no PK; gates get/save paths)
+#   _meta.cls           → used only for error messages (cls.__name__)
+#   _alias              → mirrors TableProxy's alias attribute (None for now)
+# Any executor path that reaches for something outside this surface will
+# AttributeError loudly — preferable to silent wrong behaviour.
+#
 # Recursive CTEs (`WITH RECURSIVE …`) are deliberately out of scope for
 # this initial pass; revisit once a real use case appears.
+# (Update: RecursiveCTE / recursive_cte() were added below — the comment
+# above predates them.  The "out of scope" note applies only to the
+# initial CTE class.)
+#
+# Lateral subqueries (`LATERAL (…) alias` in FROM/JOIN) reuse the same
+# duck-typed surface via the Lateral subclass — see bottom of file.
 
 from __future__ import annotations
 
@@ -17,6 +39,11 @@ from dataclasses import dataclass
 from typing import Any
 
 
+# _PseudoField stands in for FieldMeta.  It is intentionally *not* the
+# real FieldMeta from meta.py: that class carries dataclasses.Field and
+# Annotated metadata Cygnet doesn't have for a CTE column.  Keeping a
+# separate, smaller shape makes it explicit that CTE columns are opaque
+# names with no introspected type / annotation behind them.
 @dataclass(frozen=True)
 class _PseudoField:
     """A FieldMeta-shaped record for CTE columns.
@@ -62,6 +89,11 @@ class CTE:
         self._alias: str | None = None
         # Stamp ColumnProxy-like attributes so `cte.id == 5` works.  Lazy-
         # imported to avoid the circular dep proxy → predicate → cte.
+        # Why setattr instead of __getattr__: stamping makes the column
+        # set fixed at construction time and observable via dir(), and
+        # avoids the cost of intercepting *every* attribute lookup.  The
+        # downside (collisions with class methods / properties) is fine
+        # here because the CTE class deliberately exposes a tiny surface.
         from .proxy import ColumnProxy
 
         for col in self._cols:
@@ -72,6 +104,13 @@ class CTE:
             # TableProxy / FieldMeta.  The ignore is intentional.
             setattr(self, col, ColumnProxy(self, field))  # type: ignore[arg-type]
 
+    # Column-name resolution order (each falls through to the next):
+    #   1. explicit columns=[...] argument            — authoritative
+    #   2. bare SELECT FROM T (no projected columns)  — inherit T's fields
+    #   3. explicit projection list of ColumnProxies  — read attr_name off each
+    # Anything else (lit / fn / op in the projection without an alias) is
+    # opaque — Cygnet can't recover a stable column name from a raw SQL
+    # fragment, so we raise rather than guess.
     def _resolve_columns(self, builder: Any, columns: list[str] | None) -> list[str]:
         if columns is not None:
             return list(columns)
@@ -101,6 +140,10 @@ class CTE:
         return names
 
     # ── TableProxy-shaped surface used by the executor ──────────────────
+    # Every property below exists *only* to satisfy something the executor
+    # / predicate / builder code reads on a TableProxy.  Adding to this
+    # surface means either Cygnet's internals grew a new dependency on
+    # TableProxy or a new CTE-specific feature was added.
 
     @property
     def _sql_name(self) -> str:
@@ -120,6 +163,9 @@ class CTE:
 
     @property
     def fields(self) -> list[_PseudoField]:
+        # Rebuilt on every access — cheap (small list, frozen dataclass)
+        # and avoids having to invalidate a cached list if _cols ever
+        # becomes mutable in the future.
         return [_PseudoField(c, c) for c in self._cols]
 
     @property
@@ -235,6 +281,13 @@ def recursive_cte(name: str, columns: list[str]) -> RecursiveCTE:
     return RecursiveCTE(name, columns)
 
 
+# Lateral is *the* legitimate use of CTE as a base class: the storage
+# shape (name + inner builder + column list) is identical, and we want
+# the same column-proxy stamping behaviour.  Only the rendering site
+# differs, and that's the executor's concern — disambiguated by
+# isinstance(jt, Lateral).  RecursiveCTE above is NOT a subclass because
+# its internal state shape is different enough (anchor + step instead of
+# a single builder) that inheritance would force awkward overrides.
 class Lateral(CTE):
     """A LATERAL subquery — `LATERAL (inner_sql) alias` — usable as the
     right side of a JOIN where the inner SELECT can correlate to columns
