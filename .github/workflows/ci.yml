@@ -165,7 +165,14 @@ jobs:
         run: pip install pip-audit
 
       - name: Run pip-audit
-        run: pip-audit --strict || true
+        # --skip-editable skips the local cygnet-orm editable install (it
+        # isn't on PyPI, so it can't be audited).  Without --strict the
+        # skipped editable is a notice rather than a hard failure, so the
+        # job exits non-zero ONLY when pip-audit actually finds a CVE in
+        # a dep — which is the point.  The previous `--strict || true`
+        # combo was contradictory: --strict failed on the editable skip,
+        # and `|| true` swallowed both that AND any real CVE.
+        run: pip-audit --skip-editable
 
   # ── Benchmarks (advisory) ─────────────────────────────────────────────────
   # Runs the perf suite against a fresh PG instance and uploads the

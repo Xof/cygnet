@@ -200,19 +200,18 @@ check for `__class_getitem__` presence on the type itself. Add a test
 case in `tests/test_stubs.py` with a parameterised-generic field
 (currently absent — see **S15**).
 
-### B5. `pip-audit --strict || true` swallows CVEs  *[2026-05-22-deepdive #5]*
+### ~~B5. `pip-audit --strict || true` swallows CVEs~~  *[2026-05-22-deepdive #5] — CLOSED 2026-05-22*
 
-`.github/workflows/ci.yml:168`. The `|| true` discards pip-audit's
-exit code unconditionally, including the strict-mode failures the
-`--strict` flag opts into. A CVE in psycopg or any dev dep produces
-a non-zero exit which the shell silently consumes.
-
-**Failure mode**: CVE published, audit job logs the finding, job
-passes green. No notification, no merge block, nothing.
-
-**Direction of fix**: Drop one or the other. Recommend dropping
-`|| true` — `--strict` mode is exactly when you want to block.
-See **OQ4** for the design question.
+Closed by changing the audit step to `pip-audit --skip-editable`. The
+investigation found the original `--strict || true` was contradictory
+for a deeper reason than the review caught: `--strict` exits 1 on the
+unauditable local editable install (cygnet-orm isn't on PyPI), so
+`|| true` had been added not just to swallow CVEs but to swallow that
+expected false-positive. `--skip-editable` skips the editable cleanly
+without escalating it to a failure, and dropping `--strict` means the
+job exits non-zero only when a real CVE shows up. OQ4 is resolved by
+implication: strict-mode-blocking-on-CVE is now the default for the
+non-editable portion of the dep tree.
 
 ---
 
