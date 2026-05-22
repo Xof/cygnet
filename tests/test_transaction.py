@@ -112,6 +112,60 @@ class TestTransaction:
         assert db.log[-2:] == ["BEGIN", "COMMIT"]
         assert not any("RELEASE SAVEPOINT" in s for s in db.log[-2:])
 
+    async def test_cross_task_nesting_raises(self):
+        """S10: a second asyncio task that nests into a transaction
+        opened by a *different* task must raise.  The ``_in_transaction``
+        flag lives on the db adapter, not the task; without the guard a
+        silently-nested SAVEPOINT would run inside the other task's
+        transaction and corrupt commit boundaries.
+        """
+        import asyncio
+
+        db = FakeTransactionalDB()
+
+        # Two Events deterministically interleave the tasks:
+        # 1. task_a enters its transaction and signals task_a_inside.
+        # 2. The test task tries to enter (must raise).
+        # 3. task_a_can_exit is set so task_a can finish cleanly.
+        task_a_inside = asyncio.Event()
+        task_a_can_exit = asyncio.Event()
+
+        async def task_a():
+            async with cygnet.transaction(db):
+                task_a_inside.set()
+                await task_a_can_exit.wait()
+
+        task_a_handle = asyncio.create_task(task_a())
+        await task_a_inside.wait()
+        try:
+            with pytest.raises(RuntimeError, match="different asyncio task"):
+                async with cygnet.transaction(db):
+                    pass
+        finally:
+            task_a_can_exit.set()
+            await task_a_handle
+
+    async def test_sequential_cross_task_transactions_work(self):
+        """Cross-task usage is only a problem when *concurrent*; sequential
+        transactions on the same db from different tasks must work, since
+        the outermost ``__aexit__`` clears both ``_in_transaction`` and
+        ``_transaction_task``.
+        """
+        import asyncio
+
+        db = FakeTransactionalDB()
+
+        async def task_a():
+            async with cygnet.transaction(db):
+                pass
+
+        await asyncio.create_task(task_a())
+        # task_a is finished; ownership is cleared.  Entering here (in
+        # the test task) must take the outermost BEGIN path, not raise.
+        async with cygnet.transaction(db):
+            pass
+        assert db.log == ["BEGIN", "COMMIT", "BEGIN", "COMMIT"]
+
     async def test_in_transaction_resets_when_commit_raises(self):
         """If COMMIT itself raises, _in_transaction must still be reset so a
         subsequent transaction on the same connection takes the BEGIN path

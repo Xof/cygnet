@@ -34,6 +34,7 @@ Naming convention recap for callers reading the export list:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 
 # Re-exports are grouped by role: annotations (used in model definitions),
@@ -332,8 +333,15 @@ async def save(db: Any, obj: Any) -> None:
 #
 # This is NOT task-local on purpose: Cygnet expects one db adapter
 # instance per asyncio task.  Sharing one PsycopgDB across concurrent
-# tasks will corrupt the flag.  See PsycopgDB's docstring for the same
-# warning at the adapter layer.
+# tasks is now actively detected (S10): outermost __aenter__ captures
+# `asyncio.current_task()` onto `db._transaction_task`, and nested
+# __aenter__ verifies the same task is owning the transaction —
+# cross-task nesting raises with a clear message instead of silently
+# turning into a SAVEPOINT against another task's transaction.  The
+# guard is best-effort: it requires the outer layer to use
+# cygnet.transaction (not an externally-managed BEGIN), and treats a
+# None current_task (e.g., outside any task context) as "no claim".
+# See PsycopgDB's docstring for the same warning at the adapter layer.
 class transaction:
     """
     Async context manager for database transactions.
@@ -353,7 +361,11 @@ class transaction:
     it only on BEGIN/COMMIT/ROLLBACK at the outermost level; SAVEPOINT
     operations leave it alone, which is what makes nesting work without a
     counter.  Concurrent use of the same db handle across tasks is not
-    supported — the flag is not task-local.
+    supported — the flag is not task-local — but Cygnet actively detects
+    cross-task misuse (S10): the outermost ``__aenter__`` records the
+    owning ``asyncio.current_task()`` on the db, and a nested entry from
+    a different task raises ``RuntimeError`` rather than silently
+    SAVEPOINTing inside the other task's transaction.
 
     Instance reuse: a single `transaction(db)` instance can be reused
     across sequential `async with` blocks — `__aenter__` resets
@@ -386,11 +398,36 @@ class transaction:
         # savepoint name leaking from a prior nested entry into a fresh
         # BEGIN/COMMIT cycle.
         self._savepoint = None
+        # S10: task-locality guard.  asyncio.current_task() returns None
+        # outside any task context (rare for async code — needs to be
+        # awaited from somewhere), in which case we skip the check rather
+        # than fight the runtime.  The captured-vs-current comparison
+        # uses `is`, not equality, because tasks have no meaningful
+        # __eq__ — identity is the right relation.
+        current_task = asyncio.current_task()
         # getattr-with-default rather than direct access: adapters in the
         # wild (or freshly-constructed fakes in tests) may not have set
         # the attribute yet.  Treat absence as "not in a transaction".
         if getattr(self._db, "_in_transaction", False):
-            # Already in a transaction → use SAVEPOINT for nesting.
+            # Already in a transaction → SAVEPOINT path, but first verify
+            # we're in the same task that opened the outer transaction.
+            # If `owner` is None (older code populated _in_transaction
+            # without going through cygnet.transaction), be permissive:
+            # the user has opted out of the guard by managing transactions
+            # externally and we have no signal to compare against.
+            owner = getattr(self._db, "_transaction_task", None)
+            if (
+                owner is not None
+                and current_task is not None
+                and owner is not current_task
+            ):
+                raise RuntimeError(
+                    "cygnet.transaction: nested entry from a different "
+                    "asyncio task than the one that opened the outer "
+                    "transaction — db adapters are not task-safe.  Use "
+                    "one db adapter (and connection) per task, or "
+                    "serialise transactional access across tasks."
+                )
             # id(self) produces a unique name per context manager instance,
             # avoiding collisions even with deeply nested savepoints.  The
             # id is stable for the lifetime of `self`, which covers enter
@@ -405,6 +442,11 @@ class transaction:
             # opens cleanly instead of trying to SAVEPOINT against nothing.
             await self._db.execute("BEGIN")
             self._db._in_transaction = True
+            # Claim the task identity for the duration of the outermost
+            # transaction.  Stored on the db (not self) because the
+            # `_in_transaction` state is on the db — keeping ownership
+            # next to the state it protects.
+            self._db._transaction_task = current_task
         # Returns the original db, not self — the caller uses the same
         # connection handle for queries inside the block.
         return self._db
@@ -432,7 +474,10 @@ class transaction:
             # in a `finally` so a failure inside ROLLBACK/COMMIT itself
             # doesn't strand the flag at True and silently turn the next
             # transaction on this connection into a SAVEPOINT against a
-            # server-side-nonexistent transaction.
+            # server-side-nonexistent transaction.  The task-ownership
+            # claim is paired with the flag and cleared in the same
+            # finally block — sequential cross-task reuse needs both
+            # gone, not just _in_transaction.
             try:
                 if exc_type:
                     await self._db.execute("ROLLBACK")
@@ -440,3 +485,4 @@ class transaction:
                     await self._db.execute("COMMIT")
             finally:
                 self._db._in_transaction = False
+                self._db._transaction_task = None

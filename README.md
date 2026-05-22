@@ -781,6 +781,14 @@ async with cygnet.transaction(db) as tx:
 > psycopg connections are themselves not task-safe, so the recommended
 > pattern is one connection per task — typically by acquiring from a pool
 > inside each task. Fresh connections must start with `_in_transaction = False`.
+>
+> Cygnet actively detects cross-task misuse: the outermost
+> `__aenter__` records the owning `asyncio.current_task()` on the db,
+> and a nested `__aenter__` from a different task raises `RuntimeError`
+> rather than silently SAVEPOINTing inside the other task's
+> transaction. The guard is best-effort — it only fires when the outer
+> layer uses `cygnet.transaction` rather than an externally-managed
+> `BEGIN`.
 
 ## Annotations
 

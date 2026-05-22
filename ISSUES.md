@@ -311,18 +311,34 @@ the exception class.  No test change needed: the existing DML-
 without-RETURNING coverage (every UPDATE / DELETE / DDL test) is the
 regression surface.
 
-### S10. `transaction(db)` offers no task-locality guard  *[2026-04-29 concurrency]*
+### ~~S10. `transaction(db)` offers no task-locality guard~~  *[2026-04-29 concurrency] — CLOSED 2026-05-22*
 
-`cygnet/__init__.py:230-308`. The class docstring and the README's
-Concurrency Caveat both call out that `_in_transaction` is not
-task-local. Strong documentation, no runtime guard. A user who reuses
-one PsycopgDB across two `asyncio` tasks silently corrupts nesting.
+Closed by adding an ``asyncio.current_task()`` fingerprint at the
+outermost ``transaction.__aenter__``: stored on
+``db._transaction_task`` alongside the ``_in_transaction`` flag, then
+checked at every nested ``__aenter__``.  Cross-task nesting now
+raises ``RuntimeError`` with a clear message instead of silently
+SAVEPOINTing inside another task's transaction.
 
-**Direction of fix**: Optional `__aenter__` fingerprint via
-`asyncio.current_task()`; raise loudly if it diverges from the task
-that flipped `_in_transaction = True`. Cost: one
-`asyncio.current_task()` per nesting boundary. Benefit: the failure
-mode is hard to debug, so a loud check pays for itself.
+Implementation notes:
+- The guard is best-effort: a ``None`` current task (outside any task
+  context) skips the check, and a ``None`` stored owner (older code
+  that flipped ``_in_transaction`` without going through
+  ``cygnet.transaction``) is treated as "no claim" — preserves
+  backward compatibility for adapters that manage transactions
+  externally.
+- Both ``_in_transaction`` and ``_transaction_task`` are cleared in
+  the outermost ``__aexit__``'s finally block, so sequential
+  cross-task use (A's transaction commits before B starts) continues
+  to work unchanged.
+
+Coverage:
+- ``test_cross_task_nesting_raises`` — deterministic interleave via
+  ``asyncio.Event`` proving the concurrent case raises.
+- ``test_sequential_cross_task_transactions_work`` — proves the
+  finally-block cleanup keeps the sequential case working.
+
+README's Concurrency Caveat updated to mention the runtime guard.
 
 ### ~~S11. `lit()` doesn't document the `$N`-rewrite trap~~  *[2026-04-29 docs] — CLOSED 2026-05-22*
 
