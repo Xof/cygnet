@@ -47,7 +47,16 @@ from .annotations import AppKey, Column, DBKey, ForeignKey, table
 from .builders import DeleteBuilder, InsertBuilder, SelectBuilder, UpdateBuilder
 from .cte import CTE, Lateral, RecursiveCTE, cte, lateral, recursive_cte
 from .executor import Executor
-from .expression import exists, fn, is_not_null, is_null, not_exists, op, ops
+from .expression import (
+    DBAdapter,
+    exists,
+    fn,
+    is_not_null,
+    is_null,
+    not_exists,
+    op,
+    ops,
+)
 from .predicate import Literal, all
 from .proxy import ColumnProxy, TableProxy
 
@@ -58,6 +67,8 @@ __all__ = [
     "Column",
     "ForeignKey",
     "table",
+    # Adapter contract
+    "DBAdapter",
     # Table factory
     "Table",
     # Query verbs
@@ -119,23 +130,25 @@ def Table[T](cls: type[T]) -> TableProxy[T]:  # noqa: N802
 # sentinel; the guard lives in the builder, not here.
 
 
-def SELECT(db: Any, *columns: Any) -> SelectBuilder:  # noqa: N802
+def SELECT(db: DBAdapter, *columns: Any) -> SelectBuilder:  # noqa: N802
     return SelectBuilder(db, *columns)
 
 
-def INSERT(db: Any) -> InsertBuilder:  # noqa: N802
+def INSERT(db: DBAdapter) -> InsertBuilder:  # noqa: N802
     return InsertBuilder(db)
 
 
-def UPDATE(db: Any) -> UpdateBuilder:  # noqa: N802
+def UPDATE(db: DBAdapter) -> UpdateBuilder:  # noqa: N802
     return UpdateBuilder(db)
 
 
-def DELETE(db: Any) -> DeleteBuilder:  # noqa: N802
+def DELETE(db: DBAdapter) -> DeleteBuilder:  # noqa: N802
     return DeleteBuilder(db)
 
 
-async def TRUNCATE(db: Any, *tables: TableProxy[Any], cascade: bool = False) -> None:  # noqa: N802
+async def TRUNCATE(  # noqa: N802
+    db: DBAdapter, *tables: TableProxy[Any], cascade: bool = False
+) -> None:
     """Truncate one or more tables. Use cascade=True to drop dependent rows.
 
     Unlike SELECT/INSERT/UPDATE/DELETE, TRUNCATE has no builder — it's a
@@ -172,7 +185,7 @@ def lit(sql: str) -> Literal:
     return Literal(sql=sql)
 
 
-def flush_column_defaults(db: Any = None) -> None:
+def flush_column_defaults(db: DBAdapter | None = None) -> None:
     """Evict cached column-DEFAULT introspection results.
 
     Cygnet caches the set of columns carrying a non-NULL DEFAULT on
@@ -214,7 +227,7 @@ def flush_column_defaults(db: Any = None) -> None:
 # never mutate.
 
 
-async def get[T](db: Any, table: TableProxy[T], **pk_kwargs: Any) -> T | None:
+async def get[T](db: DBAdapter, table: TableProxy[T], **pk_kwargs: Any) -> T | None:
     """Fetch a single object by primary key. Returns None if not found.
 
     The pk kwarg name must match the Python attribute name (not the DB
@@ -247,7 +260,7 @@ async def get[T](db: Any, table: TableProxy[T], **pk_kwargs: Any) -> T | None:
     return cast("T | None", results[0] if results else None)
 
 
-async def follow(db: Any, obj: Any, fk_column: Any) -> Any:
+async def follow(db: DBAdapter, obj: Any, fk_column: Any) -> Any:
     """Load the object that a foreign key points to.
 
     Returns None if the FK value is None or no matching row exists.
@@ -285,7 +298,7 @@ async def follow(db: Any, obj: Any, fk_column: Any) -> Any:
     return await get(db, target_proxy, **{target_pk.attr_name: fk_value})
 
 
-async def create(db: Any, obj: Any) -> Any:
+async def create(db: DBAdapter, obj: Any) -> Any:
     """
     INSERT obj into its table. No ON CONFLICT — duplicates raise from the DB.
 
@@ -294,7 +307,7 @@ async def create(db: Any, obj: Any) -> Any:
     return await Executor(db).run_create(obj)
 
 
-async def save(db: Any, obj: Any) -> None:
+async def save(db: DBAdapter, obj: Any) -> None:
     """
     Persist obj to its table.
 
@@ -385,7 +398,7 @@ class transaction:
                 await cygnet.UPDATE(tx2).SET(LogTable, entry).WHERE(...)
     """
 
-    def __init__(self, db: Any) -> None:
+    def __init__(self, db: DBAdapter) -> None:
         self._db = db
         # Set to a savepoint name on __aenter__ when nested; stays None at
         # the outermost level.  Acts as the "am I the outermost?" signal

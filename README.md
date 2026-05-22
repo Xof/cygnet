@@ -802,18 +802,35 @@ async with cygnet.transaction(db) as tx:
 
 ## The db object
 
-CYGNET does not manage connections. Pass any object that implements:
+CYGNET does not manage connections. Pass any object that conforms to
+`cygnet.DBAdapter` — a `@runtime_checkable` Protocol declared in
+`cygnet/expression.py` and re-exported at the package root. Required
+members:
 
 ```python
-async def execute(sql: str, params: list) -> list[tuple]: ...
-async def execute_one(sql: str, params: list) -> tuple | None: ...
+class DBAdapter(Protocol):
+    _in_transaction: bool        # False on fresh adapter; toggled by cygnet.transaction
+    _transaction_task: Any       # Cygnet-managed task-locality stash; init to None
 
-# Optional — only required if you call SelectBuilder.stream():
-async def stream(sql: str, params: list) -> AsyncIterator[tuple]: ...
+    async def execute(self, sql: str, params: list | None = None) -> list[tuple]: ...
+    async def execute_one(self, sql: str, params: list | None = None) -> tuple | None: ...
 ```
 
-and has an `_in_transaction: bool` attribute (used by `cygnet.transaction`
-to detect whether to open a `BEGIN` or a `SAVEPOINT`).
+Optional methods (duck-typed via `hasattr`, not on the Protocol):
+
+```python
+# Only required for SelectBuilder.stream():
+async def stream(self, sql: str, params: list | None = None) -> AsyncIterator[tuple]: ...
+
+# Only required for DEFAULT-aware INSERT codegen (None-valued columns
+# with a schema DEFAULT omitted from INSERT, refreshed via RETURNING):
+async def column_defaults(self, table_name: str) -> set[str]: ...
+```
+
+Because `DBAdapter` is `runtime_checkable`, custom adapters can
+verify conformance with a plain `isinstance(my_db, cygnet.DBAdapter)`
+check before shipping. The reference `PsycopgDB` adapter implements
+both required AND both optional methods.
 
 ### Reference psycopg3 adapter
 

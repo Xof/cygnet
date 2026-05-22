@@ -239,20 +239,30 @@ a message explaining that HAVING is for aggregate-group filters, not
 "all groups".  Regression test:
 ``TestSelectSQL::test_having_rejects_cygnet_all``.
 
-### S4. `column_defaults` as optional-via-hasattr fragments the adapter protocol  *[2026-05-22-deepdive API design]*
+### ~~S4. `column_defaults` as optional-via-hasattr fragments the adapter protocol~~  *[2026-05-22-deepdive API design] — CLOSED 2026-05-22*
 
-`cygnet/executor.py:_get_defaulted_columns` (`hasattr` probe) +
-`cygnet/psycopg_db.py:column_defaults`. The duck-typed db contract
-was three methods (`execute`, `execute_one`, `stream`); the May 17
-commit added a fourth as *optional*, probed via `hasattr`. With one
-optional method this is fine; with two it becomes a documentation
-problem. Today's pattern doesn't scale to "does this adapter
-support X? does it support Y?" matrix.
+Closed via **OQ2** (resolved to "formalise as Protocol"): added
+``DBAdapter`` as a ``@runtime_checkable`` Protocol in
+``cygnet/expression.py`` and re-exported at the package root
+(``cygnet.DBAdapter``).
 
-**Direction of fix**: Formalize with `typing.Protocol` (decorated
-`runtime_checkable`), document optionality explicitly. Or expose
-capabilities via `adapter_capabilities() -> set[str]` to keep
-detection in one place. See **OQ2**.
+Required members in the Protocol: ``_in_transaction``,
+``_transaction_task``, ``execute``, ``execute_one``.  Optional
+methods (``stream`` and ``column_defaults``) stay duck-typed via
+``hasattr`` at the consumer sites — explicitly documented in the
+Protocol's docstring and in README's "The db object" section.  This
+preserves the opt-in nature (adapters without these methods get the
+historical behaviour) while making the documentation surface
+discoverable.
+
+``runtime_checkable`` lets ``isinstance(my_adapter, DBAdapter)``
+work as a conformance smoke-test for adapter authors.  The public
+entry points (``SELECT`` / ``INSERT`` / ``UPDATE`` / ``DELETE`` /
+``TRUNCATE`` / ``get`` / ``follow`` / ``create`` / ``save`` /
+``transaction`` / ``flush_column_defaults``) all carry ``db:
+DBAdapter`` annotations now, replacing the previous ``db: Any``.
+The capability-set alt (``adapter_capabilities() -> set[str]``) was
+rejected as premature for two optionals.
 
 ### ~~S5. `InsertBuilder` ON CONFLICT cluster — 6 methods, 5 state fields~~  *[2026-04-29 #3] — CLOSED 2026-05-22*
 

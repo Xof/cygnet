@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, overload
+from typing import Any, Protocol, overload, runtime_checkable
 
 from .predicate import Predicate
 
@@ -129,6 +129,73 @@ class TableSourceProtocol(Protocol):
 
     @property
     def _alias(self) -> str | None: ...
+
+
+# ── DB adapter contract ─────────────────────────────────────────────
+#
+# Cygnet's ``db`` parameter accepts anything that satisfies this
+# Protocol structurally.  PsycopgDB (the reference adapter in
+# cygnet/psycopg_db.py) and FakeDB (the test fixture in
+# tests/conftest.py) both conform without inheriting from it.
+# Custom adapters — say, an asyncpg wrapper or a tracing proxy —
+# only need to expose these members to be usable.
+#
+# Optional methods (``stream`` and ``column_defaults``) are
+# deliberately NOT on the Protocol: they're probed via ``hasattr``
+# at the consumer sites.  Adapters that don't implement them get
+# the historical behaviour (no streaming, no DEFAULT-aware INSERT
+# codegen).  If a third optional method ever shows up, the
+# capability-set pattern (S4 alt) becomes worth considering — for
+# now, two optionals stays under the documentation budget.
+
+
+@runtime_checkable
+class DBAdapter(Protocol):
+    """Contract for objects that can be passed as ``db`` to Cygnet builders.
+
+    Required members:
+
+    - ``_in_transaction`` — ``bool``, ``False`` on a fresh adapter;
+      flipped by ``cygnet.transaction`` at outermost BEGIN/COMMIT.
+      Drives nesting detection (savepoints) and the task-locality guard.
+    - ``_transaction_task`` — Cygnet-managed: ``cygnet.transaction``
+      stashes ``asyncio.current_task()`` here at outermost entry and
+      clears it at outermost exit.  Adapters should initialise this
+      to ``None`` (matches the S10 task-locality guard contract).
+      Typed ``Any`` to spare adapter authors an asyncio import; the
+      runtime value is ``asyncio.Task[Any] | None``.
+    - ``execute(sql, params)`` — issue a statement and return the result
+      rows as a list of tuples.  Statements that don't return rows
+      (DDL / INSERT-without-RETURNING / UPDATE / DELETE) return ``[]``.
+    - ``execute_one(sql, params)`` — issue a statement expected to
+      produce at most one row.  Returns ``None`` if no row.  Used for
+      ``INSERT … RETURNING`` and ``cygnet.get``.
+
+    Optional members (duck-typed via ``hasattr`` — not in the Protocol):
+
+    - ``async stream(sql, params) -> AsyncIterator[tuple]`` — yields
+      rows incrementally for memory-efficient large reads.  Without
+      it, ``SelectBuilder.stream()`` raises TypeError.
+    - ``async column_defaults(table_name) -> set[str]`` — return the
+      set of columns on ``table_name`` carrying a non-NULL DEFAULT.
+      Without it, Cygnet falls back to the historical "emit every
+      field including NULL" INSERT codegen.
+
+    ``@runtime_checkable`` means ``isinstance(my_adapter, DBAdapter)``
+    works for "is my adapter shaped right?" checks — useful for
+    adapter authors verifying conformance before shipping.
+    """
+
+    _in_transaction: bool
+    _transaction_task: Any
+
+    async def execute(
+        self, sql: str, params: list[Any] | None = None
+    ) -> list[tuple[Any, ...]]: ...
+
+    async def execute_one(
+        self, sql: str, params: list[Any] | None = None
+    ) -> tuple[Any, ...] | None: ...
 
 
 @dataclass(frozen=True)

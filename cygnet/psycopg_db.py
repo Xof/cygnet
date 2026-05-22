@@ -78,6 +78,10 @@ class PsycopgDB:
     def __init__(self, conn: psycopg.AsyncConnection[Any]) -> None:
         self._conn = conn
         self._in_transaction = False
+        # Cygnet's task-locality guard (S10) stashes the owning task
+        # here at outermost transaction entry.  Initialised to None so
+        # the cygnet.DBAdapter Protocol conformance check is honest.
+        self._transaction_task: Any = None
 
     @classmethod
     def _adapt_sql(cls, sql: str) -> str:
