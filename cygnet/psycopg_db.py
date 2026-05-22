@@ -128,23 +128,37 @@ class PsycopgDB:
         opt-in keeps test fakes simple and protects custom adapters that
         don't have a notion of schema introspection.
 
-        Looks up the unqualified table name in the connection's current
-        schema search_path (no explicit ``table_schema`` filter).  A
-        consumer using qualified table names (``"public.foo"``) would
-        need to pre-split or extend this method; Cygnet doesn't emit
-        schema-qualified names from @cygnet.table() today, so the
-        single-schema lookup matches what the rest of the library does.
+        Resolves the unqualified table name through PG's own search_path
+        logic via ``to_regclass($1)``, so two tables with the same name
+        in different schemas (``s1.events`` / ``s2.events``) are
+        correctly disambiguated by whichever appears first in
+        ``current_schemas(false)``.  Returns the empty set if the table
+        doesn't resolve (e.g., unknown name, hidden from the role) —
+        callers treat that as "no DEFAULTs known" and fall back to the
+        full-field INSERT path.
         """
-        # `pg_get_expr(adbin, adrelid)` returns the rendered DEFAULT
-        # expression; information_schema.columns.column_default is the
-        # convenient view-level wrapper.  IS NOT NULL filters out
-        # columns that have no DEFAULT at all (and also DEFAULT NULL,
-        # which is equivalent to no DEFAULT for our purposes — both
-        # produce NULL when the column is omitted from INSERT).
+        # pg_attrdef stores DEFAULT expressions keyed by (adrelid, adnum);
+        # joining to pg_attribute on the same key returns the column name
+        # for each defaulted column.  Using pg_catalog directly (rather
+        # than information_schema.columns) keeps the resolution explicit:
+        # to_regclass($1) collapses search_path resolution into a single
+        # OID, and the JOIN naturally filters to that one table.  The
+        # earlier information_schema query had no schema filter at all
+        # and would return the union across every same-named table the
+        # role could see (B1).
+        #
+        # attnum > 0 skips system columns (oid, ctid, etc., attnum < 0);
+        # NOT attisdropped excludes columns marked dropped by ALTER TABLE
+        # DROP COLUMN, which leave the pg_attribute row in place.
         async with self._conn.cursor() as cur:
             await cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = %s AND column_default IS NOT NULL",
+                "SELECT a.attname "
+                "FROM pg_catalog.pg_attribute a "
+                "JOIN pg_catalog.pg_attrdef ad "
+                "  ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum "
+                "WHERE a.attrelid = to_regclass(%s) "
+                "  AND a.attnum > 0 "
+                "  AND NOT a.attisdropped",
                 [table_name],
             )
             rows = await cur.fetchall()

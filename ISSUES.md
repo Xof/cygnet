@@ -120,27 +120,27 @@ documented divergence — see **B3** below.
 
 ## Open issues — bugs
 
-### B1. `PsycopgDB.column_defaults` lookup ignores schema  *[2026-05-22-deepdive #1]*
+### ~~B1. `PsycopgDB.column_defaults` lookup ignores schema~~  *[2026-05-22-deepdive #1] — CLOSED 2026-05-22*
 
-`cygnet/psycopg_db.py:144-151`. The SQL is `SELECT column_name FROM
-information_schema.columns WHERE table_name = %s AND column_default IS NOT
-NULL`. No `table_schema` filter, no `search_path` consultation.
-`information_schema.columns` returns rows for every schema visible to
-the connection's role — so a deployment with `public.events` and
-`archive.events` gets the union of DEFAULTs across both.
+Fixed by switching the query from `information_schema.columns` (no
+schema filter possible without re-encoding search_path) to a direct
+`pg_catalog.pg_attribute JOIN pg_attrdef WHERE attrelid = to_regclass($1)`.
+`to_regclass()` reuses PG's own search_path resolution, so the lookup
+now matches whatever PG would resolve an unqualified `FROM events` to —
+correctly disambiguating `s1.events` from `s2.events` even when both
+exist. Also handles the previously-incorrect edge case of a same-named
+table in two search_path schemas (PG picks the first; the lookup now
+matches that exact choice).
 
-The docstring at lines 131-136 claims the query "respects the
-connection's current schema search_path"; it does not.
-
-**Failure mode**: Cygnet silently omits columns from INSERT that don't
-have DEFAULTs in the actually-targeted table, leading to wrong NULLs or
-column-not-found errors. *Silent* data corruption in the multi-schema
-case.
-
-**Direction of fix**: Add `AND table_schema = ANY(current_schemas(false))`
-to the SQL — `current_schemas(false)` returns the resolved search_path.
-Alternatively, use `pg_catalog.pg_attribute` joined to `pg_class` filtered
-by `relnamespace` for a single-schema answer.
+Regression test: `tests/integration/test_column_defaults.py::TestColumnDefaultsRespectsSearchPath`
+sets up `s1.events` (default on `created_at`) and `s2.events` (default
+on `archived_at`), flips `search_path` between them, and asserts the
+returned set tracks the active schema without leakage. The third test
+pins `to_regclass`'s NULL-on-missing semantics to "empty set" so the
+contract matches the old information_schema behaviour for unknown
+tables. Closes **S12** (the docstring now matches the code) and
+**S13** (the misleading `pg_get_expr` comment is replaced with a
+correct description of the pg_attrdef join).
 
 ### B2. `_defaults_cache` has no schema-change invalidation  *[2026-05-22-deepdive #3]*
 
@@ -353,30 +353,18 @@ that adapters may translate placeholders.
 that the reference psycopg adapter rewrites `$\d+` patterns and that
 `lit()` consumers should avoid those substrings.
 
-### S12. `psycopg_db.column_defaults` docstring claims search_path lookup  *[2026-05-22-deepdive docs]*
+### ~~S12. `psycopg_db.column_defaults` docstring claims search_path lookup~~  *[2026-05-22-deepdive docs] — CLOSED 2026-05-22*
 
-`cygnet/psycopg_db.py:131-136`. *"Looks up the unqualified table name
-in the connection's current schema search_path."* The query does no
-schema filtering whatsoever. Docs-vs-reality. Tied to **B1** (the
-underlying bug).
+Closed by the B1 fix. The docstring is now accurate: the code does
+honour search_path (via `to_regclass`), and the prose describes that
+mechanism explicitly.
 
-**Direction of fix**: Either fix the code to honor search_path (see
-**B1**) and the docstring becomes correct, or rewrite the docstring
-to describe what the code actually does ("matches `table_name`
-across every schema visible to the role — undefined behaviour with
-same-named tables in multiple schemas").
+### ~~S13. `psycopg_db.column_defaults` comment mentions `pg_get_expr` it doesn't call~~  *[2026-05-22-deepdive docs] — CLOSED 2026-05-22*
 
-### S13. `psycopg_db.column_defaults` comment mentions `pg_get_expr` it doesn't call  *[2026-05-22-deepdive docs]*
-
-`cygnet/psycopg_db.py:138-143`. The comment refers to
-`pg_get_expr(adbin, adrelid)` as how PG renders DEFAULT expressions —
-informative-by-analogy — but the code uses
-`information_schema.columns.column_default IS NOT NULL`, not
-`pg_get_expr`. A reader expecting to find `pg_get_expr` below the
-comment will be confused.
-
-**Direction of fix**: Make the comment relative to the actual SQL, or
-add a sentence clarifying the analogy.
+Closed by the B1 fix. The new comment describes the actual SQL —
+`pg_attribute JOIN pg_attrdef` keyed by `(adrelid, adnum)` — and
+notes the system-column / dropped-column filters explicitly. The
+`pg_get_expr` reference is gone (it was never in the query path).
 
 ### S14. README save() doc doesn't mention DEFAULT suppression  *[2026-05-22-deepdive docs]*
 
