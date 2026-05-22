@@ -142,25 +142,19 @@ tables. Closes **S12** (the docstring now matches the code) and
 **S13** (the misleading `pg_get_expr` comment is replaced with a
 correct description of the pg_attrdef join).
 
-### B2. `_defaults_cache` has no schema-change invalidation  *[2026-05-22-deepdive #3]*
+### ~~B2. `_defaults_cache` has no schema-change invalidation~~  *[2026-05-22-deepdive #3] — CLOSED 2026-05-22*
 
-`cygnet/executor.py:55-114`. The cache lives at class level keyed by
-adapter instance via `WeakKeyDictionary`. It is permanent for the
-adapter's lifetime, with no expiration, no version tag, no manual
-flush. The class-level comment says "stable for the lifetime of the
-schema" — true, but the adapter typically lives for the lifetime of
-the connection, which can outlive a schema migration.
-
-**Failure mode**: A long-running service that pulls a connection from
-a pool, INSERTs into `events` (caching `{created_at}`), then sees a
-migration drop the DEFAULT — keeps omitting `created_at` until the
-connection is reconstructed. NULL writes where the application
-expected the historical default.
-
-**Direction of fix**: Add a `flush_column_defaults()` method on the
-adapter protocol, or expose a class-level cache-clear utility. A TTL
-is heavier-handed; a manual flush is enough for migration-aware
-deployments.
+Closed by adding `cygnet.flush_column_defaults(db=None)` as a public
+API surface. Delegates to `Executor.flush_column_defaults`, a class-
+method that either pops a specific adapter from the WeakKeyDictionary
+or clears it entirely. Documented as the post-migration knob in
+`cygnet/__init__.py` and in the cache-comment block at
+`cygnet/executor.py:55-78`. Three unit tests cover the cases:
+specific-adapter eviction triggers re-introspection on the next
+INSERT, no-arg flush clears every adapter, flushing an uncached
+adapter is a silent no-op. The class-level cache-clear utility was
+preferred over an adapter-protocol method to keep the duck-typed
+contract small.
 
 ### B3. `run_save` ignores schema DEFAULTs and never refreshes  *[2026-04-29 #5 unresolved half; 2026-05-22-deepdive #2; comment-run #2]*
 
@@ -541,19 +535,15 @@ INSERTs that succeed always return a row, so None here is impossible
 unless the driver is misbehaving — same as DBKey, so should raise the
 same way").
 
-### S29. Cache-miss race in `_get_defaulted_columns`  *[2026-05-22-deepdive concurrency]*
+### ~~S29. Cache-miss race in `_get_defaulted_columns`~~  *[2026-05-22-deepdive concurrency] — CLOSED 2026-05-22*
 
-`cygnet/executor.py:96-114`. Two `asyncio.gather` tasks each holding
-their own adapter can race on the class-level `_defaults_cache`: each
-task creates its own `per_table` dict for its own adapter, no
-contention there. If the user incorrectly shares one adapter across
-tasks (documented unsupported), the second task's
-`per_table = self._defaults_cache.get(self._db); if per_table is None:
-per_table = {}` could clobber the first task's already-cached entries.
-
-**Direction of fix**: `per_table = self._defaults_cache.setdefault(self._db, {})`.
-One-line robustness improvement that doesn't change the legal-use
-behaviour.
+Closed alongside **B2**. The `_get_defaulted_columns` body now uses
+`self._defaults_cache.setdefault(self._db, {})` — a single atomic
+dictionary operation that returns the existing per-table dict if any
+task has already installed one, eliminating the get-then-set window
+where two tasks could each construct a fresh dict and clobber each
+other's writes. Net code is also simpler (one early `TypeError`
+branch covers the unhashable-adapter fallback).
 
 ---
 

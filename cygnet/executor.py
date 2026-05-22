@@ -61,16 +61,35 @@ class Executor:
     #
     # The cache lives at class level (not instance level) because Executor
     # is short-lived — one per .sql() / .__await__() call — and we want
-    # the introspection cost to amortise across calls.  The answer is
-    # stable for the lifetime of the schema, so we cache it on first
-    # INSERT and reuse on every subsequent INSERT against the same
-    # connection + table.
+    # the introspection cost to amortise across calls.  Entries are stable
+    # for the lifetime of the schema, but adapters in long-running
+    # services (pooled connections, daemons) typically outlive the
+    # schemas they were first populated against.  After a migration that
+    # changes DEFAULT clauses, callers must invoke
+    # ``cygnet.flush_column_defaults(db?)`` to force re-introspection on
+    # the next INSERT — otherwise the cache keeps omitting columns whose
+    # DEFAULT was dropped or honouring a DEFAULT that's since been
+    # rewritten.  Cygnet has no way to detect migrations on its own.
     _defaults_cache: weakref.WeakKeyDictionary[Any, dict[str, frozenset[str]]] = (
         weakref.WeakKeyDictionary()
     )
 
     def __init__(self, db: Any) -> None:
         self._db = db
+
+    @classmethod
+    def flush_column_defaults(cls, db: Any | None = None) -> None:
+        """Evict cached column_defaults entries from the class-level cache.
+
+        With ``db=None``: clears every adapter's entries.  With a specific
+        adapter: pops just that adapter.  ``WeakKeyDictionary.pop`` with a
+        default makes "adapter never cached" a silent no-op, so callers
+        don't have to track whether they've INSERTed yet.
+        """
+        if db is None:
+            cls._defaults_cache.clear()
+        else:
+            cls._defaults_cache.pop(db, None)
 
     async def _get_defaulted_columns(self, table_name: str) -> frozenset[str]:
         """Return the cached set of columns on ``table_name`` that carry a
@@ -89,27 +108,27 @@ class Executor:
         """
         if not hasattr(self._db, "column_defaults"):
             return frozenset()
-        # WeakKeyDictionary.get returns None for both "key missing" and
-        # "key was GC'd"; we treat them the same — re-introspect and
-        # repopulate.  Inner dict is created lazily on first miss so we
-        # don't waste an empty dict for adapters that never INSERT.
-        per_table = self._defaults_cache.get(self._db)
-        if per_table is not None:
-            cached = per_table.get(table_name)
-            if cached is not None:
-                return cached
+        # setdefault is the atomic "get-or-create" that closes the race
+        # window the previous get-then-set pattern carried: two tasks
+        # could both see `per_table is None`, each construct a fresh
+        # dict, and the slower one would clobber the faster one's writes
+        # on assignment (S29).  setdefault returns the existing dict if
+        # any thread has populated it, or installs ours otherwise, in a
+        # single dictionary operation.
+        #
+        # The try/except handles the rare case of a custom adapter that
+        # doesn't support weak references — WeakKeyDictionary refuses
+        # such keys with TypeError.  We fall back to skip-caching for
+        # that adapter: every INSERT re-introspects, which is slow but
+        # correctness-preserving.
+        try:
+            per_table = self._defaults_cache.setdefault(self._db, {})
+        except TypeError:
+            return frozenset(await self._db.column_defaults(table_name))
+        cached = per_table.get(table_name)
+        if cached is not None:
+            return cached
         result = frozenset(await self._db.column_defaults(table_name))
-        if per_table is None:
-            per_table = {}
-            try:
-                self._defaults_cache[self._db] = per_table
-            except TypeError:
-                # The db adapter doesn't support weak refs (rare but
-                # legal for custom adapters).  Skip caching for this
-                # adapter — every INSERT will re-introspect, which is
-                # the correctness-preserving fallback.  Return the
-                # freshly-computed result so the call still works.
-                return result
         per_table[table_name] = result
         return result
 

@@ -81,6 +81,7 @@ __all__ = [
     "get",
     "save",
     "transaction",
+    "flush_column_defaults",
     # CTEs
     "CTE",
     "cte",
@@ -160,6 +161,31 @@ def lit(sql: str) -> Literal:
     your SQL construct.  Use with care: the string is trusted.
     """
     return Literal(sql=sql)
+
+
+def flush_column_defaults(db: Any = None) -> None:
+    """Evict cached column-DEFAULT introspection results.
+
+    Cygnet caches the set of columns carrying a non-NULL DEFAULT on
+    first INSERT against each (adapter, table) pair, then reuses it on
+    every subsequent INSERT — the round-trip to PG's catalog amortises
+    away.  The cache is stable for the lifetime of the schema, but
+    adapters in long-running services (pooled connections, daemons)
+    typically outlive the schemas they were populated against.
+
+    After a migration that ALTERs a DEFAULT clause, call this function
+    so the next INSERT re-introspects.  Otherwise Cygnet will keep
+    omitting columns whose DEFAULT was dropped (writing NULL where the
+    schema expected a value) or vice versa.  Cygnet has no way to
+    detect migrations on its own.
+
+    With ``db=None``: clears every adapter's entries (covers "any
+    connection that goes through this process is post-migration").
+    With a specific adapter: evicts only that adapter — useful for
+    sharded / per-tenant migration patterns.  Either form is a no-op
+    when the adapter has no cached entries.
+    """
+    Executor.flush_column_defaults(db)
 
 
 # ── Convenience functions ────────────────────────────────────────────────────

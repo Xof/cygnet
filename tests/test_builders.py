@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Annotated
+from typing import Annotated, Any
 
 import pytest
 
@@ -753,6 +753,113 @@ class TestInsertDefaultColumnOmission:
         # instance would re-introspect, which is the intended behaviour
         # for fresh connections.)
         assert call_count == 1
+
+
+# ── B2: cache invalidation ────────────────────────────────────────────────
+#
+# The cache at Executor._defaults_cache otherwise persists for the
+# adapter's lifetime, which on a pooled long-running service can outlive
+# the schema it was populated against.  cygnet.flush_column_defaults
+# evicts entries so post-migration code sees the new DEFAULT shape on
+# the very next INSERT.
+
+
+class TestColumnDefaultsCacheFlush:
+    async def _count_introspections(self, db: DefaultsFakeDB) -> tuple[list[int], Any]:
+        """Wraps db.column_defaults to count calls; returns ([count], orig).
+
+        Returns the count in a list so the caller can observe mutations
+        from the closure without nonlocal gymnastics across helper calls.
+        """
+        counter = [0]
+        orig = db.column_defaults
+
+        async def wrapped(table_name: str) -> set[str]:
+            counter[0] += 1
+            return await orig(table_name)
+
+        db.column_defaults = wrapped  # type: ignore[method-assign]
+        return counter, orig
+
+    async def test_flush_for_specific_adapter_re_introspects_next_insert(self):
+        """After flush(db), the next INSERT against that adapter must
+        re-call column_defaults — the cached entry is gone."""
+        db = DefaultsFakeDB(
+            rows=[(1, "ts")],
+            defaults={"widgets": {"created_at"}},
+        )
+        counter, _ = await self._count_introspections(db)
+
+        # Prime the cache via two INSERTs (second should hit cache).
+        for _ in range(2):
+            await (
+                cygnet.INSERT(db)
+                .INTO(WidgetTable)
+                .VALUES(Widget(id=None, name="a", created_at=None))
+            )
+        assert counter[0] == 1, "cache wasn't priming on first INSERT"
+
+        # Flush this adapter's cache; next INSERT must re-introspect.
+        cygnet.flush_column_defaults(db)
+        await (
+            cygnet.INSERT(db)
+            .INTO(WidgetTable)
+            .VALUES(Widget(id=None, name="b", created_at=None))
+        )
+        assert counter[0] == 2, "flush didn't evict; next INSERT used stale cache"
+
+    async def test_flush_no_arg_clears_all_adapters(self):
+        """flush() with no argument clears the entire process-wide cache
+        — covers the "I just ran a migration, invalidate everything" case."""
+        db_a = DefaultsFakeDB(rows=[(1, "ts")], defaults={"widgets": {"created_at"}})
+        db_b = DefaultsFakeDB(rows=[(2, "ts")], defaults={"widgets": {"created_at"}})
+        counter_a, _ = await self._count_introspections(db_a)
+        counter_b, _ = await self._count_introspections(db_b)
+
+        # Prime both caches.
+        await (
+            cygnet.INSERT(db_a)
+            .INTO(WidgetTable)
+            .VALUES(Widget(id=None, name="a", created_at=None))
+        )
+        await (
+            cygnet.INSERT(db_b)
+            .INTO(WidgetTable)
+            .VALUES(Widget(id=None, name="b", created_at=None))
+        )
+        assert counter_a[0] == 1 and counter_b[0] == 1
+
+        # Global flush; both adapters re-introspect next time.
+        cygnet.flush_column_defaults()
+        await (
+            cygnet.INSERT(db_a)
+            .INTO(WidgetTable)
+            .VALUES(Widget(id=None, name="a2", created_at=None))
+        )
+        await (
+            cygnet.INSERT(db_b)
+            .INTO(WidgetTable)
+            .VALUES(Widget(id=None, name="b2", created_at=None))
+        )
+        assert counter_a[0] == 2 and counter_b[0] == 2, (
+            "global flush didn't clear both adapters"
+        )
+
+    async def test_flush_unknown_adapter_is_noop(self):
+        """Flushing an adapter that was never cached must not raise —
+        callers shouldn't have to track "did I INSERT yet?" before flushing."""
+        db = DefaultsFakeDB(
+            rows=[(1, "ts")],
+            defaults={"widgets": {"created_at"}},
+        )
+        # Never INSERTed; cache has no entry for this adapter.
+        cygnet.flush_column_defaults(db)  # must not raise
+        # Following INSERT still works.
+        await (
+            cygnet.INSERT(db)
+            .INTO(WidgetTable)
+            .VALUES(Widget(id=None, name="x", created_at=None))
+        )
 
 
 class TestUpdateSQL:
