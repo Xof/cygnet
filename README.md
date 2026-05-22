@@ -563,6 +563,26 @@ fragments, `cygnet.lit("...")`. **Operator and function names are
 trusted strings** — never pass user input as an operator or function
 name.
 
+`cygnet.op` has three arities:
+
+```python
+# 3-arg: one-shot infix predicate
+.WHERE(cygnet.op(T.name, "ILIKE", "%fred%"))
+
+# 2-arg: prefix operator (NOT, EXISTS-style)
+.WHERE(cygnet.op("NOT", T.active == True))
+
+# 1-arg: factory — bind the operator once, reuse the callable.
+# Idiomatic when the same non-standard operator appears repeatedly:
+ILIKE = cygnet.op("ILIKE")
+.WHERE(ILIKE(T.name, "%fred%") | ILIKE(T.email, "%fred%"))
+```
+
+The 1-arg form is a closure capturing the operator string and
+returning a `(left, right) -> Predicate` callable.  Operands are
+still parameterised; only the operator string is interpolated
+verbatim — same trusted-string rule as the other arities.
+
 ### JSONB, arrays, and full-text search
 
 Three curated submodules wrap the most common PG-native operators

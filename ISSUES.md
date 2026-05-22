@@ -662,15 +662,21 @@ tooling-ambiguity smell. See **S18**.
 Today the `--strict || true` combination is contradictory. Either is
 defensible; the current combination isn't. See **B5**.
 
-### OQ5. Is the `op()` 1-arg factory-factory pulling its weight?
+### ~~OQ5. Is the `op()` 1-arg factory-factory pulling its weight?~~  *— RESOLVED 2026-05-22 (keep all three)*
 
-**Source**: 2026-04-29 OQ2 (unresolved).
+Resolved in favour of keeping all three arities.  The 1-arg form is
+genuinely useful for callers using the same non-standard operator
+repeatedly (the canonical example: ``ILIKE = cygnet.op("ILIKE")``
+followed by multiple ``ILIKE(col, val)`` invocations), and the
+infrequent usage just means few existing tests need it — not that
+the API is wrong.
 
-`cygnet/expression.py:102-110`. Three behaviours under one name (1-arg
-factory, 2-arg prefix, 3-arg infix), distinguished by arity at
-runtime. The `@overload` decorations type-check correctly, but the
-1-arg form is rarely used in tests (grep finds one direct use).
-Tighten the public API by removing it?
+Closure: README's operators section now carries an explicit
+"three arities" block (`README.md`, after the inline-operators
+paragraph) with a worked example of the factory form.  The
+docstring in ``cygnet/expression.py`` already documented the use
+case; the README addition makes it discoverable from the entry
+point.
 
 ### OQ6. Should the comment-run "extend in place" pattern be sanctioned?
 
