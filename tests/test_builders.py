@@ -305,6 +305,16 @@ class TestSelectSQL:
         idx_having = db.last_sql.index("HAVING")
         assert idx_having > idx_group
 
+    async def test_having_rejects_cygnet_all(self):
+        """S3: cygnet.all is for WHERE on UPDATE/DELETE — "all aggregate
+        groups" isn't a meaningful HAVING.  Pre-S3 the sentinel silently
+        rendered through; now it raises at builder time."""
+        db = FakeDB(rows=[])
+        with pytest.raises(ValueError, match="HAVING does not accept cygnet.all"):
+            cygnet.SELECT(db, AccountTable.name).FROM(AccountTable).GROUP_BY(
+                AccountTable.name
+            ).HAVING(cygnet.all)
+
 
 class TestLiteralSQL:
     async def test_lit_in_where(self):
@@ -749,6 +759,27 @@ class TestInsertDefaultColumnOmission:
         assert "created_at" not in col_list
         # PK still flows back to the caller as the awaited result.
         assert result == 5
+
+    async def test_appkey_omitted_default_none_row_raises(self):
+        """S28: AppKey INSERT with omitted DEFAULT columns hits the
+        execute_one branch.  When the driver returns None (without ON
+        CONFLICT in scope), raise loudly — symmetric with the DBKey
+        path.  Pre-S28 the AppKey branch silently setattr-looped over
+        zero rows and returned None, masking a driver bug.
+        """
+
+        @dataclasses.dataclass
+        class Doc:
+            id: Annotated[str, AppKey]
+            body: str
+            created_at: str | None = None
+
+        DocTbl = cygnet.Table(Doc)
+        # rows=[] makes execute_one return None — the driver-bug shape.
+        db = DefaultsFakeDB(rows=[], defaults={"docs": {"created_at"}})
+        d = Doc(id="abc", body="hi", created_at=None)
+        with pytest.raises(RuntimeError, match="produced no row"):
+            await cygnet.INSERT(db).INTO(DocTbl).VALUES(d)
 
     async def test_default_introspection_cached_per_table(self):
         """Repeated INSERTs against the same table+adapter must only call

@@ -222,28 +222,22 @@ explaining the regex is string-literal-blind. The library's "lit is
 trusted" stance makes the documented limitation acceptable; proper SQL
 tokenisation was rejected as overkill for the escape hatch.
 
-### S2. `_row_to_obj` zip-truncation is silent  *[2026-05-22-deepdive smell; comment-run #4]*
+### ~~S2. `_row_to_obj` zip-truncation is silent~~  *[2026-05-22-deepdive smell; comment-run #4] — CLOSED 2026-05-22*
 
-`cygnet/executor.py:1267-1286`. `zip(meta.fields, row)` silently
-truncates the longer of the two. Docstring documents this; the
-failure mode (silently-wrong objects) is severe relative to the
-warning surface.
+Closed by ``zip(meta.fields, row, strict=True)`` in
+``Executor._row_to_obj``.  Length mismatches now raise ValueError at
+the seam instead of producing either a TypeError-raising-dataclass-
+constructor (too short) or a silent trailing-column drop (too long).
+The implicit-column SELECTs the executor emits guarantee length
+parity; only hand-written ``lit()`` projections trip the check.
 
-The renderer guarantees `len(row) == len(meta.fields)` in the
-implicit-columns case, so this only bites with `cygnet.lit()` columns
-that smuggle in extra positions, or hand-written `SELECT *` paths.
+### ~~S3. `HAVING` docstring promises a check it doesn't enforce~~  *[2026-05-22-deepdive smell; comment-run #3] — CLOSED 2026-05-22*
 
-**Direction of fix**: `zip(meta.fields, row, strict=True)`.
-
-### S3. `HAVING` docstring promises a check it doesn't enforce  *[2026-05-22-deepdive smell; comment-run #3]*
-
-`cygnet/builders.py` (HAVING method). The docstring claims `cygnet.all`
-is rejected, but no `isinstance(predicate, _All): raise` guard exists.
-A caller can pass `cygnet.all` and the sentinel renders through to
-SQL — probably harmless but inconsistent with WHERE's stricter rule.
-
-**Direction of fix**: Add the explicit isinstance check, or relax the
-docstring.
+Closed by adding the explicit ``isinstance(predicate, _All)`` guard
+to ``SelectBuilder.HAVING``: ``cygnet.all`` now raises ValueError with
+a message explaining that HAVING is for aggregate-group filters, not
+"all groups".  Regression test:
+``TestSelectSQL::test_having_rejects_cygnet_all``.
 
 ### S4. `column_defaults` as optional-via-hasattr fragments the adapter protocol  *[2026-05-22-deepdive API design]*
 
@@ -272,18 +266,14 @@ across method bodies.
 `target / action / set_kwargs / excluded_cols`, validated in
 `__post_init__`. One state object, one place to validate.
 
-### S6. Executor function-local imports of `cte`/`proxy`  *[2026-04-29 #4]*
+### ~~S6. Executor function-local imports of `cte`/`proxy`~~  *[2026-04-29 #4] — CLOSED 2026-05-22*
 
-`cygnet/executor.py:117/181/419/481`. Inline `from .cte import …` and
-`from .proxy import ColumnProxy` calls "to avoid the circular dep".
-Verified that no cycle exists today: `cte.py` does its `proxy` import
-lazily inside its constructor, so `executor → cte → proxy` is acyclic
-at module-load time. Same dead-weight pattern that `builders.py`
-already cleaned up.
-
-**Direction of fix**: Lift to module level. Leave the
-`from .builders import InsertBuilder` on line ~1221 in place — that
-one IS a real cycle (builders → executor at module level).
+Closed by lifting ``Lateral``, ``RecursiveCTE``, and ``ColumnProxy``
+to module-scope imports in ``cygnet/executor.py``.  Verified no cycle
+(``cte.py`` imports proxy lazily inside its constructor).  Module
+docstring annotated to explain that the ``from .builders import
+InsertBuilder`` inside ``run_save`` stays function-local — that one
+IS a real module-level cycle.
 
 ### S7. Broad `Any` in builder state  *[2026-04-29 typing]*
 
@@ -311,22 +301,15 @@ four properties + a `FieldLike` Protocol for `_PseudoField`). Use as
 the union member in `TableSource = …` and as the return type of
 `_meta`.
 
-### S9. `psycopg.ProgrammingError` swallow in `execute`  *[2026-04-29 exception hygiene]*
+### ~~S9. `psycopg.ProgrammingError` swallow in `execute`~~  *[2026-04-29 exception hygiene] — CLOSED 2026-05-22*
 
-`cygnet/psycopg_db.py:71-74`:
-```python
-try:
-    return await cur.fetchall()
-except psycopg.ProgrammingError:
-    return []
-```
-ProgrammingError is broad. Intent is "no result set" (DML without
-RETURNING, DDL, etc.); psycopg uses ProgrammingError there. A future
-psycopg version could narrow or change this. `cur.description is None`
-is a deterministic test for "no result set".
-
-**Direction of fix**: `if cur.description is None: return []` plus a
-`return await cur.fetchall()` else-branch.
+Closed by replacing the ``try: fetchall except ProgrammingError``
+swallow with ``if cur.description is None: return []`` —
+the deterministic DB-API contract test for "no result set".
+Insulates Cygnet from a future psycopg release narrowing or renaming
+the exception class.  No test change needed: the existing DML-
+without-RETURNING coverage (every UPDATE / DELETE / DDL test) is the
+regression surface.
 
 ### S10. `transaction(db)` offers no task-locality guard  *[2026-04-29 concurrency]*
 
@@ -448,17 +431,13 @@ documentation pattern. SQL has a single target slot for each verb, so
 clobber-on-recall is the honest behaviour; the docstrings make that
 explicit.
 
-### S22. `Predicate.__invert__` return-type annotation diverges from siblings  *[comment-run #12]*
+### ~~S22. `Predicate.__invert__` return-type annotation diverges from siblings~~  *[comment-run #12] — CLOSED 2026-05-22*
 
-`cygnet/predicate.py:Predicate.__invert__` is annotated `-> Any`.
-`ColumnProxy.__invert__`, `FunctionCall.__invert__`,
-`WindowExpression.__invert__`, and `SuffixOp.__invert__` all return
-`-> PrefixOp` explicitly. Probably to dodge a lazy-import forward
-reference.
-
-**Direction of fix**: Either harmonize to `-> PrefixOp` (with the
-forward reference as a string or `TYPE_CHECKING` import) or add a
-code comment explaining why this one diverges.
+Closed by harmonising the annotation to ``-> PrefixOp`` (matching the
+``__invert__`` methods on ColumnProxy / FunctionCall / WindowExpression /
+SuffixOp).  ``from __future__ import annotations`` was already in
+effect; added a ``TYPE_CHECKING`` import for PrefixOp to keep ruff
+happy without introducing the runtime cycle.
 
 ### ~~S23. `transaction._savepoint` mutable across `async with` reuse~~  *[comment-run #11] — CLOSED 2026-05-22*
 
@@ -469,16 +448,13 @@ unsupported (race on the field). The docstring now points users to
 "construct a fresh ``transaction(db)`` per task" for parallel contexts
 and reiterates the existing not-task-local caveat on the adapter.
 
-### S24. `_extract_insert_fields` returns an unused `values` accumulator  *[comment-run #14]*
+### ~~S24. `_extract_insert_fields` returns an unused `values` accumulator~~  *[comment-run #14] — CLOSED 2026-05-22*
 
-`cygnet/executor.py` returns `(columns, values, omitted)`. Every
-caller unpacks all three slots, but the `values` accumulator's
-contents never get used downstream — the actual params come from the
-rendered placeholders. Documented as part of the return tuple.
-
-**Direction of fix**: Trim to `(columns, omitted)`, or add a code
-comment explaining why the unused field stays in the tuple. Removing
-it would be a small internal refactor with no external API impact.
+Closed by trimming the return tuple from
+``(columns, values, omitted)`` to ``(columns, omitted)``.  Internal
+refactor — no external API impact.  Updated all five call sites and
+the function's docstring; values continue to flow through the
+``params`` list as before.
 
 ### ~~S25. Aliased-proxy DML claim in `proxy.py` is unverified~~  *[comment-run #9] — CLOSED 2026-05-22*
 
@@ -505,21 +481,13 @@ Coverage: four new unit tests in
 ``tests/test_builders.py::TestAliasedDMLRejected`` — one per verb plus
 a "unaliased still works" sanity test.
 
-### S26. `meta.TableMeta` caches before introspection runs  *[comment-run #10]*
+### ~~S26. `meta.TableMeta` caches before introspection runs~~  *[comment-run #10] — CLOSED 2026-05-22*
 
-`cygnet/meta.py` `TableMeta.__new__` inserts the new instance into
-`_cache` before `_introspect` runs. If introspection raises, the
-half-built instance is left in the cache. The next `TableMeta(cls)`
-short-circuits via the `_initialised` guard, returning a TableMeta
-with `fields=[]` and `pk=None`. The existing in-file comment claims
-the opposite ("doesn't leave a fully initialised empty TableMeta in
-the cache") — but that's about happy-path-with-no-fields, not the
-failed-introspection case.
-
-**Direction of fix**: Either evict on `_introspect` failure (cache in
-a `try/except` and `del self._cache[cls]` on raise), or argue that
-introspection failures are configuration bugs not worth retry semantics
-— and update the comment to match.
+Closed by wrapping ``_introspect`` in ``TableMeta.__init__`` with a
+``try/except`` that pops the half-built entry from ``_cache`` on any
+exception.  Preserves the "every cached entry is fully initialised"
+invariant against code that pokes ``_cache`` directly.  Regression
+test: ``TestTableMeta::test_failed_introspection_evicts_cache``.
 
 ### ~~S27. `psycopg_db.stream()` docstring overstates portal-cursor requirement~~  *[comment-run #8] — CLOSED 2026-05-22*
 
@@ -529,19 +497,14 @@ is active, but recommends an explicit ``cygnet.transaction(db)``
 wrapper for deterministic lifetime — same practical advice, accurate
 about the underlying mechanics.
 
-### S28. `run_insert` AppKey + omitted + row=None silent-skip  *[comment-run #5]*
+### ~~S28. `run_insert` AppKey + omitted + row=None silent-skip~~  *[comment-run #5] — CLOSED 2026-05-22*
 
-`cygnet/executor.py:853-858`. AppKey path with omitted DEFAULT columns
-calls `execute_one`; if `row is None`, the AppKey path silently
-`setattr`-loops over zero rows and returns `None`. The DBKey branch
-raises "driver bug or row not inserted" in the same situation —
-asymmetric error handling.
-
-**Direction of fix**: Match the DBKey branch's defensive raise, or add
-a code comment explaining why AppKey doesn't need one (e.g., "AppKey
-INSERTs that succeed always return a row, so None here is impossible
-unless the driver is misbehaving — same as DBKey, so should raise the
-same way").
+Closed by adding the symmetric defensive raise to the AppKey + omitted
+branch in ``run_insert``: ``RuntimeError("INSERT...RETURNING produced
+no row for X — driver bug or row not inserted")``, with the same
+``b._on_conflict_action`` escape hatch the DBKey path already uses
+for ON CONFLICT DO NOTHING.  Regression test:
+``TestInsertDefaultColumnOmission::test_appkey_omitted_default_none_row_raises``.
 
 ### ~~S29. Cache-miss race in `_get_defaulted_columns`~~  *[2026-05-22-deepdive concurrency] — CLOSED 2026-05-22*
 

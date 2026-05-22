@@ -21,7 +21,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+# TYPE_CHECKING gate avoids the runtime cycle (expression.py imports
+# Predicate from this module).  ``from __future__ import annotations``
+# turns every annotation into a string, so the only consumers of
+# PrefixOp here are type checkers, which see the import via the gate.
+if TYPE_CHECKING:
+    from .expression import PrefixOp
 
 
 @dataclass(eq=False)
@@ -56,12 +63,17 @@ class Predicate:
     def __or__(self, other: Predicate) -> Predicate:
         return Predicate(self, "OR", other)
 
-    def __invert__(self) -> Any:
+    def __invert__(self) -> PrefixOp:
         # ~ is Python's bitwise NOT — overloaded here for SQL negation, the
         # same way & / | stand in for AND / OR.  Returns a PrefixOp which
         # already participates in & / |, so ~(T.x == 1) & (T.y == 2) works.
         # Imported lazily to avoid a circular import (expression.py imports
-        # Predicate from this module).
+        # Predicate from this module).  ``-> PrefixOp`` is a forward
+        # reference here — ``from __future__ import annotations`` at the
+        # top of the file makes all annotations strings, so the import
+        # only has to exist at type-check time (not at definition time).
+        # S22: matches the explicit ``PrefixOp`` annotation on the
+        # sibling ``__invert__`` methods in ``expression.py``.
         from .expression import PrefixOp
 
         return PrefixOp(op="NOT", operand=self)

@@ -485,7 +485,14 @@ class SelectBuilder(_Builder):
         # HAVING without GROUP BY is occasionally useful (e.g. with window
         # functions) and the SQL planner will reject anything truly invalid.
         # cygnet.all isn't accepted: "all aggregate groups" isn't a thing
-        # the way "all rows" is for WHERE.
+        # the way "all rows" is for WHERE.  S3 (2026-05-22): the isinstance
+        # check below makes the docstring's promise enforceable; before
+        # this guard the sentinel would silently render through to SQL.
+        if isinstance(predicate, _All):
+            raise ValueError(
+                "HAVING does not accept cygnet.all — HAVING is for "
+                "aggregate-group filters, not 'all groups'"
+            )
         self._having.append(predicate)
         return self
 

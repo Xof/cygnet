@@ -89,14 +89,18 @@ class PsycopgDB:
     ) -> list[tuple[Any, ...]]:
         async with self._conn.cursor() as cur:
             await cur.execute(self._adapt_sql(sql), params or [])
-            # fetchall() raises ProgrammingError for statements that
-            # don't return rows (INSERT without RETURNING, UPDATE,
-            # DELETE, DDL).  Treating those as empty lists keeps
-            # callers free of branch-on-statement-shape logic.
-            try:
-                return await cur.fetchall()
-            except psycopg.ProgrammingError:
+            # cur.description is None when the statement didn't return
+            # rows (INSERT without RETURNING, UPDATE, DELETE, DDL) —
+            # this is the deterministic DB-API contract test for "no
+            # result set".  S9 (2026-05-22): replaces the historical
+            # ``try: fetchall except ProgrammingError`` swallow, which
+            # was vulnerable to psycopg narrowing or renaming the
+            # exception class out from under us.  Checking description
+            # is also slightly cheaper than letting the exception
+            # raise-and-catch.
+            if cur.description is None:
                 return []
+            return await cur.fetchall()
 
     async def execute_one(
         self, sql: str, params: list[Any] | None = None

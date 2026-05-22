@@ -47,8 +47,16 @@ import weakref
 from typing import Any
 
 from .annotations import DBKey
+from .cte import Lateral, RecursiveCTE
 from .predicate import _All
-from .proxy import TableProxy
+from .proxy import ColumnProxy, TableProxy
+
+# Note: ``from .builders import InsertBuilder`` stays function-local in
+# run_save — that one IS a real module-level cycle
+# (builders → executor → builders).  cte and proxy don't form cycles
+# (cte's only proxy reference is lazy, inside its __init__), so lifting
+# their imports to module scope is safe and removes the previous
+# "duplicate import per call site" overhead.
 
 
 class Executor:
@@ -236,8 +244,6 @@ class Executor:
         # render time.
         cte_prefix = ""
         if b._ctes:
-            from .cte import RecursiveCTE
-
             parts = []
             any_recursive = False
             for c in b._ctes:
@@ -308,8 +314,6 @@ class Executor:
             if b._table._alias:
                 from_clause += f" AS {b._table._alias}"
             sql += f" FROM {from_clause}"
-
-            from .cte import Lateral
 
             # Join order in the emitted SQL matches b._joins iteration
             # order, which matches the user's chained-method order on the
@@ -608,7 +612,7 @@ class Executor:
                 )
             kwargs = {f.attr_name: getattr(obj, f.attr_name) for f in meta.fields}
 
-        columns, _values, omitted = self._extract_insert_fields(
+        columns, omitted = self._extract_insert_fields(
             meta, kwargs, params, defaulted_columns
         )
         col_sql = ", ".join(columns)
@@ -653,8 +657,6 @@ class Executor:
         the no-target shorthand path (ON_CONFLICT_DO_NOTHING) skips
         target setup entirely so we don't need to re-check here.
         """
-        from .proxy import ColumnProxy
-
         parts = ["ON CONFLICT"]
         # Target.
         if b._on_conflict_target is not None:
@@ -715,8 +717,6 @@ class Executor:
         list.  Validates that every named column actually exists on the
         target so a typo doesn't reach PG as a confusing late error.
         """
-        from .proxy import ColumnProxy
-
         source = b._select_source
         if b._select_columns is not None:
             columns = list(b._select_columns)
@@ -782,7 +782,7 @@ class Executor:
         # break that invariant.  (See _render_insert's bulk branch.)
         first_kwargs = {f.attr_name: getattr(first, f.attr_name) for f in meta.fields}
         params: list[Any] = []
-        columns, _, _ = self._extract_insert_fields(meta, first_kwargs, params)
+        columns, _ = self._extract_insert_fields(meta, first_kwargs, params)
 
         # Reuse the column list for subsequent rows; collect each row's
         # values into params separately so we don't re-render the column
@@ -790,7 +790,7 @@ class Executor:
         # _extract_insert_fields runs per row.
         for o in objs[1:]:
             row_kwargs = {f.attr_name: getattr(o, f.attr_name) for f in meta.fields}
-            row_cols, _, _ = self._extract_insert_fields(meta, row_kwargs, params)
+            row_cols, _ = self._extract_insert_fields(meta, row_kwargs, params)
             if row_cols != columns:
                 raise ValueError(
                     "BULK_VALUES requires consistent column shape across rows; "
@@ -900,9 +900,22 @@ class Executor:
         # omitted defaults this collapses to the historical bare execute.
         if omitted and b._obj is not None:
             row = await self._db.execute_one(sql, params)
-            if row is not None:
-                for i, f in enumerate(omitted):
-                    setattr(b._obj, f.attr_name, row[i])
+            if row is None:
+                # S28 (2026-05-22): symmetric defensive raise matching
+                # the DBKey branch above — AppKey INSERTs with omitted
+                # defaults always produce exactly one RETURNING row
+                # unless ON CONFLICT DO NOTHING skipped it (in which
+                # case the obj's defaulted fields remain None, matching
+                # what the DB would have done).  Anything else is a
+                # driver bug.
+                if b._on_conflict_action is not None:
+                    return None
+                raise RuntimeError(
+                    f"INSERT...RETURNING produced no row for "
+                    f"{meta.cls.__name__} — driver bug or row not inserted"
+                )
+            for i, f in enumerate(omitted):
+                setattr(b._obj, f.attr_name, row[i])
             return None
 
         # Final fallthrough: AppKey + no obj, or AppKey + obj + no omitted
@@ -918,19 +931,18 @@ class Executor:
         kwargs: dict[str, Any],
         params: list[Any],
         defaulted_columns: frozenset[str] = frozenset(),
-    ) -> tuple[list[str], list[Any], list[Any]]:
-        """Build column and value lists for INSERT, skipping DBKey=None fields
-        and (when ``defaulted_columns`` is supplied) any non-PK fields whose
+    ) -> tuple[list[str], list[Any]]:
+        """Build the column list for INSERT, skipping DBKey=None fields and
+        (when ``defaulted_columns`` is supplied) any non-PK fields whose
         in-memory value is None and whose schema column carries a DEFAULT
-        clause.
+        clause.  Returns ``(columns, omitted_default_fields)``; values are
+        appended directly to the caller-supplied ``params`` list.
 
-        Returns ``(columns, values, omitted_default_fields)`` where
-        ``omitted_default_fields`` is the list of FieldMeta objects that
-        were skipped because of a DEFAULT (NOT including the PK; the PK
-        skip is unconditional and already handled by the RETURNING-id
-        machinery).  The caller uses ``omitted_default_fields`` to extend
-        the RETURNING clause and to patch the populated values back onto
-        the in-memory object.
+        ``omitted_default_fields`` is the list of FieldMeta objects skipped
+        because of a DEFAULT (NOT including the PK; the PK skip is
+        unconditional and already handled by the RETURNING-id machinery).
+        Callers use it to extend the RETURNING clause and patch the
+        populated values back onto the in-memory object.
 
         Why the schema-side DEFAULT skip lives here rather than at the
         builder layer: PostgreSQL's ``DEFAULT`` clause only fires when the
@@ -954,22 +966,23 @@ class Executor:
             raise ValueError(
                 f"Unknown field(s) for {meta.cls.__name__}: {sorted(unknown)}"
             )
-        # Three parallel accumulators grow in lockstep:
+        # Two parallel accumulators grow in lockstep:
         #   columns[i]  → column_name for the i'th emitted slot
-        #   values[i]   → the in-memory value being inserted
-        #   params      → SAME values (caller-supplied list, mutated)
+        #   params      → in-memory value for that slot (caller-supplied
+        #                 list, mutated).
         # The caller derives $N placeholders from len(columns), so columns
         # and params MUST stay aligned; appending to params without
         # appending to columns (or vice versa) would skew the numbering.
-        # `values` is kept around mainly for the historical contract /
-        # debug-friendly return shape; it duplicates `params`.
+        # S24 (2026-05-22): a third ``values`` accumulator was historically
+        # returned but never consumed (every caller spelled the unpack as
+        # ``columns, _values, omitted = …``).  Removed to keep the
+        # contract honest.
         columns: list[str] = []
-        values: list[Any] = []
         omitted_default_fields: list[Any] = []
         # Iterate meta.fields (not kwargs) so column order in the emitted
         # INSERT matches the dataclass declaration order.  This also makes
-        # the placeholder indices generated by the caller valid: columns,
-        # values, and appended params grow in lockstep.
+        # the placeholder indices generated by the caller valid: columns
+        # and appended params grow in lockstep.
         for f in meta.fields:
             val = kwargs.get(f.attr_name)
             # DBKey with None → omit from INSERT; the DB generates the value.
@@ -1001,9 +1014,8 @@ class Executor:
                 omitted_default_fields.append(f)
                 continue
             columns.append(f.column_name)
-            values.append(val)
             params.append(val)
-        return columns, values, omitted_default_fields
+        return columns, omitted_default_fields
 
     # ── CREATE (INSERT, no upsert) ─────────────────────────────────────────
 
@@ -1033,9 +1045,7 @@ class Executor:
         # extend RETURNING to fetch the DB-generated values back onto
         # the in-memory object.
         defaulted = await self._get_defaulted_columns(meta.table_name)
-        columns, _values, omitted = self._extract_insert_fields(
-            meta, kwargs, params, defaulted
-        )
+        columns, omitted = self._extract_insert_fields(meta, kwargs, params, defaulted)
 
         col_sql = ", ".join(columns)
         val_sql = ", ".join(f"${i + 1}" for i in range(len(columns)))
@@ -1293,9 +1303,7 @@ class Executor:
         params: list[Any] = []
         kwargs = {f.attr_name: getattr(obj, f.attr_name) for f in meta.fields}
         defaulted = await self._get_defaulted_columns(meta.table_name)
-        columns, _values, omitted = self._extract_insert_fields(
-            meta, kwargs, params, defaulted
-        )
+        columns, omitted = self._extract_insert_fields(meta, kwargs, params, defaulted)
 
         placeholders = [f"${i + 1}" for i in range(len(columns))]
 
@@ -1357,10 +1365,16 @@ class Executor:
         so the result columns always align with the dataclass fields
         regardless of the physical column order (attnum) in PostgreSQL.
 
-        zip() silently truncates on length mismatch: if the row is shorter
-        than meta.fields (schema drift, hand-written SQL via lit(), etc.),
-        the dataclass constructor raises TypeError for the missing fields.
-        A row longer than meta.fields silently drops the trailing columns.
+        Uses ``zip(..., strict=True)`` (S2): a length mismatch between
+        the row and ``meta.fields`` is now a ValueError at this seam
+        rather than a downstream surprise.  Pre-strict, a too-short row
+        produced a dataclass missing fields (constructor raised
+        TypeError far from the cause), and a too-long row silently
+        dropped the tail.  Both are renderer/adapter bugs that we'd
+        rather surface immediately.  The implicit-column SELECTs the
+        executor emits guarantee ``len(row) == len(meta.fields)``;
+        only hand-written ``lit()`` projections or custom-adapter row
+        shapes can trip the strict check.
 
         Construction uses meta.cls(**kwargs) with positional→name mapping,
         which means the dataclass must accept every field by keyword.  A
@@ -1373,5 +1387,5 @@ class Executor:
         # deliberate simplification compared to richer ORMs (no session,
         # no unit-of-work) and is the reason "stale instance" hazards
         # don't exist in Cygnet.
-        kwargs = {f.attr_name: val for f, val in zip(meta.fields, row)}
+        kwargs = {f.attr_name: val for f, val in zip(meta.fields, row, strict=True)}
         return meta.cls(**kwargs)

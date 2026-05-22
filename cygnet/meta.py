@@ -99,7 +99,20 @@ class TableMeta:
         )
         self.fields: list[FieldMeta] = []
         self.pk: FieldMeta | None = None
-        self._introspect()
+        # S26 (2026-05-22): __new__ inserts the new instance into _cache
+        # BEFORE _introspect runs.  If introspection raises, the
+        # half-built entry would linger — subsequent TableMeta(cls)
+        # calls would short-circuit through __new__'s cache hit and
+        # re-enter __init__ (where _initialised is missing, so this body
+        # would run again with the same data and re-raise), but the
+        # cache invariant "every entry is a fully-initialised TableMeta"
+        # would be silently violated for any code that pokes _cache
+        # directly.  Evicting on failure keeps the invariant strict.
+        try:
+            self._introspect()
+        except Exception:
+            _cache.pop(target_cls, None)
+            raise
         # _initialised is set ONLY after a successful _introspect so that a
         # class which fails introspection (no PK, duplicate PK, etc.) doesn't
         # leave a "fully initialised" empty TableMeta in the cache that

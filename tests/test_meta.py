@@ -60,6 +60,28 @@ class TestTableMeta:
         with pytest.raises(TypeError, match="no primary key"):
             TableMeta(Keyless)
 
+    def test_failed_introspection_evicts_cache(self):
+        """S26: a class that raises during _introspect must not leave a
+        half-built TableMeta entry in the cache.  Otherwise a subsequent
+        TableMeta(cls) lookup short-circuits through __new__'s cache
+        hit, runs __init__ again (no _initialised guard), and re-fails
+        with the same error — but anybody poking the cache directly
+        would see a "fully-constructed" empty-fields TableMeta that
+        wasn't fully constructed at all.
+        """
+        from cygnet.meta import _cache
+
+        @dataclasses.dataclass
+        class BrokenModel:
+            name: str  # No PK — will raise.
+
+        with pytest.raises(TypeError, match="no primary key"):
+            TableMeta(BrokenModel)
+        # The class must NOT be present in the cache after the failed
+        # introspection — eviction-on-failure preserves the
+        # "every cached entry is fully initialised" invariant.
+        assert BrokenModel not in _cache
+
     def test_non_dataclass_raises(self):
         class NotADataclass:
             name: str
