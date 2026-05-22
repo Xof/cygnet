@@ -94,6 +94,29 @@ class TestSelectSQL:
         )
         assert "LEFT JOIN log_entries ON" in db.last_sql
 
+    async def test_right_join(self):
+        """S19: RIGHT JOIN emits PG's RIGHT JOIN syntax with the right-side
+        table preserved.  Mostly redundant with LEFT_JOIN swapping the
+        FROM table, but useful when the FROM anchor is fixed."""
+        db = FakeDB(rows=[])
+        await (
+            cygnet.SELECT(db)
+            .FROM(AccountTable)
+            .RIGHT_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+        )
+        assert "RIGHT JOIN log_entries ON" in db.last_sql
+
+    async def test_full_join(self):
+        """S19: FULL JOIN (full outer join) — every row of both sides
+        preserved; unmatched side yields NULL."""
+        db = FakeDB(rows=[])
+        await (
+            cygnet.SELECT(db)
+            .FROM(AccountTable)
+            .FULL_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+        )
+        assert "FULL JOIN log_entries ON" in db.last_sql
+
     async def test_aliased_from_renders_as_clause(self):
         """T.AS('alias') puts `tablename AS alias` in FROM and uses the
         alias on the left of the dot for column refs."""

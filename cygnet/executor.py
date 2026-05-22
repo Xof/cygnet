@@ -397,6 +397,29 @@ class Executor:
 
         return sql
 
+    def _object_or_none_if_miss(self, meta: Any, chunk: Any, *, can_miss: bool) -> Any:
+        """Map a row-chunk to a dataclass instance, or None if this chunk
+        represents an outer-join miss.
+
+        ``can_miss`` is the caller's decision about whether the chunk can
+        legitimately be all-NULL: True for LEFT JOIN right-side, RIGHT
+        JOIN left-side, and FULL JOIN either side; False for INNER and
+        for the FROM table when no outer join makes it nullable.
+
+        Miss-detection prefers the PK column when present — a real PG
+        row never returns NULL for a non-null PK column from a matched
+        row, so PK=None is unambiguous.  Falls back to all-NULL only
+        when the table has no PK at all (CTEs, etc.).
+        """
+        if can_miss:
+            if meta.pk is not None:
+                pk_idx = meta.fields.index(meta.pk)
+                if chunk[pk_idx] is None:
+                    return None
+            elif all(v is None for v in chunk):
+                return None
+        return self._row_to_obj(meta, chunk)
+
     def _map_row(self, b: Any, row: Any) -> Any:
         """Map a single row tuple to the appropriate result shape.
 
@@ -428,28 +451,34 @@ class Executor:
             # would compare equal.  The result list is never
             # de-duplicated; that's the caller's responsibility if
             # JOINs produce duplicate left-side rows.
-            left_obj = self._row_to_obj(left_meta, row[:left_n])
+            #
+            # Left-side miss-detection: triggered when any join in the
+            # list is RIGHT or FULL — those make the FROM-side columns
+            # nullable in the result.  Same PK-vs-all-NULL heuristic as
+            # the right side.  When no join can null the left side
+            # (only INNER / LEFT joins present), we always map to an
+            # object, preserving the historical contract for callers
+            # that didn't ask for outer-join semantics.
+            left_can_miss = any(kind in ("RIGHT", "FULL") for kind, _, _ in b._joins)
+            left_chunk = row[:left_n]
+            left_obj = self._object_or_none_if_miss(
+                left_meta, left_chunk, can_miss=left_can_miss
+            )
             offset = left_n
             right_objs: list[Any] = []
             for kind, jt, _on in b._joins:
                 n = len(jt._meta.fields)
                 chunk = row[offset : offset + n]
-                # LEFT JOIN miss-detection: prefer the right-side PK
-                # column.  A real PG row never has a NULL primary key,
-                # so PK=None is an unambiguous signal that LEFT JOIN
-                # found no match.  Fall back to all-NULL only when the
-                # right-side has no PK at all.
-                is_miss = False
-                if kind == "LEFT":
-                    if jt._meta.pk is not None:
-                        pk_idx = jt._meta.fields.index(jt._meta.pk)
-                        is_miss = chunk[pk_idx] is None
-                    else:
-                        is_miss = all(v is None for v in chunk)
-                if is_miss:
-                    right_objs.append(None)
-                else:
-                    right_objs.append(self._row_to_obj(jt._meta, chunk))
+                # Right-side miss for this join: LEFT and FULL both make
+                # the right side nullable.  RIGHT and INNER guarantee
+                # the right side is present (RIGHT preserves the right;
+                # INNER requires the match).
+                right_can_miss = kind in ("LEFT", "FULL")
+                right_objs.append(
+                    self._object_or_none_if_miss(
+                        jt._meta, chunk, can_miss=right_can_miss
+                    )
+                )
                 offset += n
             return (left_obj, *right_objs)
 

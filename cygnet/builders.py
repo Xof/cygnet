@@ -164,11 +164,15 @@ class SelectBuilder(_Builder):
         # mean the caller wants raw tuples, with no object hydration.
         self._columns = columns
         self._table: TableSource | None = None
-        # _joins is (kind, table, on) tuples where kind is "INNER" or "LEFT"
-        # — the only two kinds Cygnet currently emits.  Order matters: the
+        # _joins is (kind, table, on) tuples where kind is one of
+        # "INNER", "LEFT", "RIGHT", "FULL" — directly interpolated into
+        # the executor's `{kind} JOIN` template.  Order matters: the
         # executor emits joins in insertion order, so JOIN A then LEFT_JOIN B
         # produces `... JOIN A ON ... LEFT JOIN B ON ...` and the right-hand-
-        # side column visibility cascades accordingly.
+        # side column visibility cascades accordingly.  The miss-detection
+        # in _map_row branches on kind to decide whether the left side
+        # (RIGHT, FULL), the right side (LEFT, FULL), or neither
+        # (INNER) can be NULL for a given join.
         self._joins: list[tuple[str, TableSource, Predicate]] = []
         # _order entries are (column, "ASC"|"DESC") — the direction is
         # per-call, not per-column, so ORDER_BY(a, b, DESC=True) flips
@@ -238,6 +242,33 @@ class SelectBuilder(_Builder):
     def LEFT_JOIN(self, table: TableSource, *, ON: Predicate) -> SelectBuilder:
         _check_table_source(table, "LEFT_JOIN")
         self._joins.append(("LEFT", table, ON))
+        return self
+
+    def RIGHT_JOIN(self, table: TableSource, *, ON: Predicate) -> SelectBuilder:  # noqa: N802
+        """`RIGHT JOIN` — every row of `table` is preserved; rows of the
+        FROM-side without a match yield NULL for FROM-side columns.
+
+        Mostly redundant with `LEFT_JOIN` written from the other table's
+        perspective, but readable when the call site is already anchored
+        on a FROM table you don't want to swap.  Row-mapping returns
+        ``(left_obj_or_None, right_obj)`` tuples; the left-side ``None``
+        signals an unmatched right row (FROM PK was NULL in the joined
+        result).
+        """
+        _check_table_source(table, "RIGHT_JOIN")
+        self._joins.append(("RIGHT", table, ON))
+        return self
+
+    def FULL_JOIN(self, table: TableSource, *, ON: Predicate) -> SelectBuilder:  # noqa: N802
+        """`FULL JOIN` (full outer join) — every row of both sides is
+        preserved; the unmatched side yields NULL columns.
+
+        Row-mapping returns ``(left_obj_or_None, right_obj_or_None)``
+        tuples — at least one side is always non-None in any given row,
+        but you must check both when consuming the result.
+        """
+        _check_table_source(table, "FULL_JOIN")
+        self._joins.append(("FULL", table, ON))
         return self
 
     def JOIN_LATERAL(  # noqa: N802

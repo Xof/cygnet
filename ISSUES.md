@@ -406,13 +406,33 @@ canonical (in which case the lockfile should be gitignored).
 
 **Direction of fix**: Pick one. See **OQ3**.
 
-### S19. CLAUDE.md JOIN family claims missing verbs  *[2026-05-22-deepdive docs; comment-run #6]*
+### ~~S19. CLAUDE.md JOIN family claims missing verbs~~  *[2026-05-22-deepdive docs; comment-run #6] — CLOSED 2026-05-22*
 
-CLAUDE.md lists `RIGHT_JOIN` and `FULL_JOIN` as part of the JOIN
-family. Neither exists in `cygnet/builders.py` or `cygnet/executor.py`.
+Closed by implementing both missing verbs rather than trimming the
+docs.
 
-**Direction of fix**: Trim CLAUDE.md, or implement them (one method
-each in the JOIN cluster — straightforward addition).
+- ``SelectBuilder.RIGHT_JOIN(table, *, ON)`` — appends a ``("RIGHT", …)``
+  entry to ``_joins``; emitted as ``RIGHT JOIN tablename ON …``.
+- ``SelectBuilder.FULL_JOIN(table, *, ON)`` — appends ``("FULL", …)``;
+  emitted as ``FULL JOIN tablename ON …``.
+
+Row-mapping extended symmetrically.  Extracted a
+``_object_or_none_if_miss`` helper (consolidates the previous LEFT
+JOIN PK-vs-all-NULL logic) and a per-join ``can_miss`` decision:
+LEFT/FULL → right side can miss; RIGHT/FULL → left side can miss;
+INNER → neither.  Result tuples are now
+``(left_obj_or_None, right_obj_or_None, …)`` — INNER and pure-LEFT
+queries preserve the historical contract (left never None).
+
+Coverage: SQL-emission unit tests in
+``TestSelectSQL::test_right_join`` and ``test_full_join``; row-mapping
+unit tests in ``TestRowMapping`` covering the left-miss and both-can-
+miss cases; integration tests in
+``TestOuterJoinRoundtrip::test_right_join_preserves_unmatched_right``
+and ``test_full_join_preserves_both_sides``.
+
+CLAUDE.md and README updated with the new verbs and the row-mapping
+contract.
 
 ### ~~S20. `cte.py` header says recursive CTEs are out of scope~~  *[comment-run #7] — CLOSED 2026-05-22*
 

@@ -125,6 +125,26 @@ rows = await (
 for account, entry in rows:
     print(account.name, entry.message if entry else "(no log)")
 
+# RIGHT JOIN — left (FROM-side) is None when there is no match
+rows = await (
+    cygnet.SELECT(db)
+    .FROM(AccountTable)
+    .RIGHT_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+)
+for account, entry in rows:
+    print(account.name if account else "(orphan log)", entry.message)
+
+# FULL JOIN — either side can be None (matched rows populate both)
+rows = await (
+    cygnet.SELECT(db)
+    .FROM(AccountTable)
+    .FULL_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+)
+for account, entry in rows:
+    a = account.name if account else "(no account)"
+    e = entry.message if entry else "(no log)"
+    print(a, e)
+
 # Self-join via aliases — same table referenced twice in one query
 A = AccountTable.AS("a")
 B = AccountTable.AS("b")

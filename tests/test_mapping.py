@@ -86,6 +86,68 @@ class TestRowMapping:
         assert log.id == 10
         assert log.message is None
 
+    async def test_right_join_none_on_left_miss(self):
+        """S19: RIGHT JOIN with a left-side miss yields (None, right_obj).
+
+        Left-side miss-detection mirrors the LEFT JOIN logic: when the
+        FROM-table's PK is NULL in the result row, that signals the
+        RIGHT JOIN preserved a row without an A-side match.
+        """
+        # FROM Account (3 fields) RIGHT JOIN Log (3 fields).
+        # Left PK (Account.id) is NULL → left should map to None.
+        db = FakeDB(rows=[(None, None, None, 10, 99, "stray")])
+        results = await (
+            cygnet.SELECT(db)
+            .FROM(AccountTable)
+            .RIGHT_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+        )
+        acc, log = results[0]
+        assert acc is None
+        assert isinstance(log, LogEntry)
+        assert log.message == "stray"
+
+    async def test_right_join_both_sides_present(self):
+        """Sanity: a real match in RIGHT JOIN populates both sides."""
+        db = FakeDB(rows=[(1, "Fred", "fred@example.com", 10, 1, "hello")])
+        results = await (
+            cygnet.SELECT(db)
+            .FROM(AccountTable)
+            .RIGHT_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+        )
+        acc, log = results[0]
+        assert isinstance(acc, Account)
+        assert isinstance(log, LogEntry)
+
+    async def test_full_join_either_side_can_be_none(self):
+        """S19: FULL JOIN — left, right, or both populated (never neither
+        in the same row).  Three rows cover the three populated-shape
+        cases.
+        """
+        db = FakeDB(
+            rows=[
+                # Both matched.
+                (1, "Fred", "fred@example.com", 10, 1, "hello"),
+                # Only left (no matching log).
+                (2, "Wilma", "wilma@example.com", None, None, None),
+                # Only right (no matching account).
+                (None, None, None, 11, 99, "orphan"),
+            ]
+        )
+        results = await (
+            cygnet.SELECT(db)
+            .FROM(AccountTable)
+            .FULL_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+        )
+        # Row 0: both objects.
+        assert isinstance(results[0][0], Account)
+        assert isinstance(results[0][1], LogEntry)
+        # Row 1: account, no log.
+        assert isinstance(results[1][0], Account)
+        assert results[1][1] is None
+        # Row 2: no account, log only.
+        assert results[2][0] is None
+        assert isinstance(results[2][1], LogEntry)
+
     async def test_left_join_miss_uses_pk_column(self):
         """LEFT JOIN miss-detection looks at the right-side PK, not all-NULL.
 

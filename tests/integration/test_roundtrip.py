@@ -696,3 +696,107 @@ class TestDefaultAwareInsertRoundtrip:
         loaded = await cygnet.get(db, TimestampedThingTable, id=original_id)
         assert loaded is not None
         assert loaded.status == "archived"
+
+
+# Outer-join fixtures (S19).  Two tables with a deliberate asymmetry so a
+# LEFT, RIGHT, or FULL join each surface a distinct miss case.
+@dataclasses.dataclass
+class JoinLeft:
+    id: Annotated[int, DBKey]
+    label: str
+
+
+@dataclasses.dataclass
+class JoinRight:
+    id: Annotated[int, DBKey]
+    left_id: int | None
+    value: str
+
+
+JoinLeftTable = cygnet.Table(JoinLeft)
+JoinRightTable = cygnet.Table(JoinRight)
+
+
+class TestOuterJoinRoundtrip:
+    """S19: RIGHT JOIN and FULL JOIN against real PG, validating both
+    the SQL execution and the (left_obj_or_None, right_obj_or_None)
+    row-mapping contract."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_tables(self, conn):
+        await conn.execute("""
+            CREATE TEMP TABLE joinlefts (
+                id    SERIAL PRIMARY KEY,
+                label TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TEMP TABLE joinrights (
+                id      SERIAL PRIMARY KEY,
+                left_id INT REFERENCES joinlefts(id),
+                value   TEXT NOT NULL
+            )
+        """)
+        db = PsycopgDB(conn)
+        # Seed: 3 lefts, 3 rights, asymmetrically linked so every join
+        # kind has a distinguishing miss case.
+        #   "alpha"  ↔  "x"
+        #   "lonely" — (no matching right)
+        #   "gamma"  ↔  "z"
+        #   (no left) ↔ "orphan"  (left_id IS NULL)
+        l1 = JoinLeft(id=None, label="alpha")
+        l2 = JoinLeft(id=None, label="lonely")
+        l3 = JoinLeft(id=None, label="gamma")
+        for lt in (l1, l2, l3):
+            await cygnet.create(db, lt)
+        await cygnet.create(db, JoinRight(id=None, left_id=l1.id, value="x"))
+        await cygnet.create(db, JoinRight(id=None, left_id=l3.id, value="z"))
+        await cygnet.create(db, JoinRight(id=None, left_id=None, value="orphan"))
+        yield db
+        await conn.execute("DROP TABLE IF EXISTS joinrights")
+        await conn.execute("DROP TABLE IF EXISTS joinlefts")
+
+    async def test_right_join_preserves_unmatched_right(self, setup_tables):
+        """RIGHT JOIN preserves every right-side row; the FROM-side
+        column maps to None when there's no matching left."""
+        db = setup_tables
+        results = await (
+            cygnet.SELECT(db)
+            .FROM(JoinLeftTable)
+            .RIGHT_JOIN(JoinRightTable, ON=JoinLeftTable.id == JoinRightTable.left_id)
+        )
+        pairs = sorted(
+            ((lt.label if lt else None, rt.value) for lt, rt in results),
+            key=lambda p: ("" if p[0] is None else p[0], p[1]),
+        )
+        assert pairs == [
+            (None, "orphan"),  # unmatched right (left.id is None)
+            ("alpha", "x"),
+            ("gamma", "z"),
+        ]
+
+    async def test_full_join_preserves_both_sides(self, setup_tables):
+        """FULL JOIN: rows from either side without a match yield None
+        on the other side; matched rows populate both."""
+        db = setup_tables
+        results = await (
+            cygnet.SELECT(db)
+            .FROM(JoinLeftTable)
+            .FULL_JOIN(JoinRightTable, ON=JoinLeftTable.id == JoinRightTable.left_id)
+        )
+        pairs = sorted(
+            (
+                (
+                    lt.label if lt else None,
+                    rt.value if rt else None,
+                )
+                for lt, rt in results
+            ),
+            key=lambda p: ("" if p[0] is None else p[0], p[1] or ""),
+        )
+        assert pairs == [
+            (None, "orphan"),  # right-only
+            ("alpha", "x"),  # matched
+            ("gamma", "z"),  # matched
+            ("lonely", None),  # left-only
+        ]

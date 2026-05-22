@@ -55,6 +55,7 @@ cygnet/
 - **`ForeignKey(TargetClass)`** — annotation declaring a foreign key. Always targets the PK of the referenced class. Validated at introspection time: target must be a dataclass with a PK, types must match, field can't be both PK and FK.
 - **`cygnet.follow(db, obj, T.fk_col)`** — loads the related object a FK points to. Returns `None` if FK value is `None` or no matching row exists.
 - **`FOLLOW(T.fk_col)` / `LEFT_FOLLOW(T.fk_col)`** — builder methods on `SelectBuilder`. Syntactic sugar for `JOIN` / `LEFT_JOIN` with auto-generated ON condition from FK metadata. Returns tuples like manual JOINs.
+- **JOIN family.** `JOIN` (INNER), `LEFT_JOIN`, `RIGHT_JOIN`, `FULL_JOIN` on `SelectBuilder`. Row mapping returns `(left_obj_or_None, right_obj_or_None, …)` tuples — `None` on a side signals an outer-join miss (LEFT misses on the right, RIGHT misses on the left, FULL misses on either; miss detection looks at the PK column when present, falls back to all-NULL otherwise). INNER never produces `None`.
 - **`cygnet.create(db, obj)`** — INSERT without ON CONFLICT. Duplicate keys raise from the database. Returns the object with PK populated.
 - **`cygnet.TRUNCATE(db, *tables, cascade=False)`** — truncates one or more tables. No builder needed.
 - **DB adapter protocol** — Cygnet expects a `db` object with `async execute(sql, params) -> list[tuple]` and `async execute_one(sql, params) -> tuple | None`. See `tests/conftest.py:FakeDB` and `cygnet/psycopg_db.py:PsycopgDB`.
