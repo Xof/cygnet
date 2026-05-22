@@ -21,7 +21,8 @@ from __future__ import annotations
 import weakref
 from typing import Any
 
-from .meta import FieldMeta, TableMeta
+from .expression import FieldLike, TableSourceProtocol
+from .meta import TableMeta
 from .predicate import Predicate
 
 
@@ -42,11 +43,15 @@ class ColumnProxy[FT]:
         name_col: ColumnProxy[str] = T.name
     """
 
-    def __init__(self, table: TableProxy[Any], field: FieldMeta) -> None:
-        # Back-reference to owning TableProxy is needed for fully-qualified
+    def __init__(self, table: TableSourceProtocol, field: FieldLike) -> None:
+        # Back-reference to owning table-source is needed for fully-qualified
         # rendering ("table.column") — see render_sql below.  Keeping the
         # back-ref means a ColumnProxy can be passed anywhere an SQLRenderable
         # is expected without needing its parent table as context.
+        # S8: the table arg is typed as ``TableSourceProtocol`` (not
+        # ``TableProxy[Any]``) so CTE / RecursiveCTE / Lateral satisfy the
+        # signature without ``# type: ignore[arg-type]``.  Same for field
+        # via FieldLike (covers FieldMeta and _PseudoField).
         self._table = table
         self._field = field
 

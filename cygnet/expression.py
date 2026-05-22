@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, overload
 
@@ -34,6 +34,101 @@ from .predicate import Predicate
 # monotonic, non-overlapping parameter numbers.
 class SQLRenderable(Protocol):
     def render_sql(self, params: list[Any]) -> str: ...
+
+
+# ── Duck-type Protocols for the table / field surfaces ──────────────
+#
+# TableProxy and the CTE family share enough structural surface that the
+# executor and ColumnProxy treat them interchangeably — but because CTE
+# isn't a TableProxy subclass (deliberate, see cte.py header for the
+# rationale), code that took `TableProxy[Any]` had to carry
+# `# type: ignore[arg-type]` at every CTE site.  These Protocols name
+# the shared shape so the type system can express "anything with these
+# attributes" without requiring inheritance.  Closes S8.
+#
+# Read-only Protocols: every attribute is consumed but never assigned
+# by the executor / ColumnProxy, so mypy will accept properties OR
+# bare attributes on the conforming side (TableMeta uses attributes,
+# CTE uses @property).
+
+
+class FieldLike(Protocol):
+    """The minimum field-meta surface ColumnProxy and the executor read.
+
+    ``FieldMeta`` (meta.py) and ``_PseudoField`` (cte.py) both conform
+    structurally — no explicit inheritance needed.  ``primary_key`` and
+    ``foreign_key`` are typed ``Any`` here because the concrete types
+    (``_PrimaryKey`` / ``_ForeignKey`` from annotations.py) would
+    create an import cycle if expression.py reached up to annotations.
+    The consumers (executor) only check ``is None`` / ``== DBKey``,
+    which works fine through ``Any``.
+
+    Property-style declarations (rather than bare attributes) make the
+    Protocol read-only, which is what lets ``_PseudoField`` (a frozen
+    dataclass with read-only attrs) conform alongside ``FieldMeta``
+    (regular dataclass with settable attrs).  Mypy treats settable
+    attrs as satisfying read-only property requirements.
+    """
+
+    @property
+    def attr_name(self) -> str: ...
+
+    @property
+    def column_name(self) -> str: ...
+
+    @property
+    def primary_key(self) -> Any: ...
+
+    @property
+    def foreign_key(self) -> Any: ...
+
+
+class MetaProtocol(Protocol):
+    """The minimum table-meta surface the executor reads.
+
+    Satisfied by ``TableMeta`` and by CTE/RecursiveCTE (which return
+    themselves from ``_meta``, then expose ``table_name`` / ``fields``
+    / ``pk`` / ``cls`` directly).
+
+    ``fields`` is ``Sequence[FieldLike]`` (not ``list``) so the variance
+    matches — ``list`` is invariant in its element type, but ``Sequence``
+    is covariant.  A ``list[FieldMeta]`` (TableMeta's actual type)
+    therefore conforms even though ``list[FieldLike]`` would not.
+    Same idiomatic move as ``collections.abc.Sequence`` provides
+    everywhere mypy needs to accept "any read-only sequence of an
+    interface".
+    """
+
+    @property
+    def table_name(self) -> str: ...
+
+    @property
+    def fields(self) -> Sequence[FieldLike]: ...
+
+    @property
+    def pk(self) -> FieldLike | None: ...
+
+    @property
+    def cls(self) -> type: ...
+
+
+class TableSourceProtocol(Protocol):
+    """The minimum table-source surface ColumnProxy and the executor read.
+
+    ``TableProxy``, ``CTE``, ``RecursiveCTE``, and ``Lateral`` all
+    conform.  Used to retype ColumnProxy.__init__ so the
+    duck-typed CTE → ColumnProxy stamping no longer needs
+    ``# type: ignore[arg-type]``.
+    """
+
+    @property
+    def _sql_name(self) -> str: ...
+
+    @property
+    def _meta(self) -> MetaProtocol: ...
+
+    @property
+    def _alias(self) -> str | None: ...
 
 
 @dataclass(frozen=True)

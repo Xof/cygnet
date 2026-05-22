@@ -92,10 +92,12 @@ class CTE:
         for col in self._cols:
             field = _PseudoField(attr_name=col, column_name=col)
             # Duck-typing: ColumnProxy reads `_sql_name` off its table
-            # back-ref and `column_name` off its field.  CTE / _PseudoField
-            # provide both, but the static types don't formally match
-            # TableProxy / FieldMeta.  The ignore is intentional.
-            setattr(self, col, ColumnProxy(self, field))  # type: ignore[arg-type]
+            # back-ref and `column_name` off its field.  Both CTE and
+            # _PseudoField conform to the TableSourceProtocol /
+            # FieldLike Protocols (see expression.py) — what S8 added
+            # so the previous ``# type: ignore[arg-type]`` could come
+            # out.
+            setattr(self, col, ColumnProxy(self, field))
 
     # Column-name resolution order (each falls through to the next):
     #   1. explicit columns=[...] argument            — authoritative
@@ -231,7 +233,7 @@ class RecursiveCTE:
 
         for col in self._cols:
             field = _PseudoField(attr_name=col, column_name=col)
-            setattr(self, col, ColumnProxy(self, field))  # type: ignore[arg-type]
+            setattr(self, col, ColumnProxy(self, field))
 
     # ── TableProxy-shaped surface used by the executor ──────────────────
     # Identical to CTE's; duplicated rather than refactored into a base

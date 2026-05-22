@@ -298,19 +298,34 @@ stays as belt-and-suspenders against direct (non-builder) spec
 construction.  The broader ``_obj: Any`` story is still deferred
 until/unless a ``DataclassWithTable`` Protocol exists.
 
-### S8. `_PseudoField` and CTE's TableMeta-shaped surface need a Protocol  *[2026-04-29 typing]*
+### ~~S8. `_PseudoField` and CTE's TableMeta-shaped surface need a Protocol~~  *[2026-04-29 typing] — CLOSED 2026-05-22*
 
-`cygnet/cte.py:21-37` (`_PseudoField`) uses `primary_key: Any = None`
-and `foreign_key: Any = None` defaults. Lines 122-134 expose CTE's
-`table_name / fields / pk / cls` to mimic TableMeta. The
-`# type: ignore[arg-type]` on the `setattr(self, col, ColumnProxy(…))`
-line is the tell: CTE is structurally TableProxy-like but isn't typed
-as one.
+Closed by adding three Protocols to ``cygnet/expression.py`` (next to
+the existing ``SQLRenderable``):
 
-**Direction of fix**: Extract a `TableSourceProtocol` (Protocol with the
-four properties + a `FieldLike` Protocol for `_PseudoField`). Use as
-the union member in `TableSource = …` and as the return type of
-`_meta`.
+- ``FieldLike`` — the minimum field-meta surface (``attr_name``,
+  ``column_name``, ``primary_key``, ``foreign_key``).  Declared with
+  ``@property`` so that both ``FieldMeta`` (regular dataclass with
+  settable attrs) and ``_PseudoField`` (frozen dataclass with
+  read-only attrs) conform structurally.
+- ``MetaProtocol`` — the minimum table-meta surface (``table_name``,
+  ``fields``, ``pk``, ``cls``).  ``fields`` is typed
+  ``Sequence[FieldLike]`` rather than ``list[FieldLike]`` so
+  ``list[FieldMeta]`` satisfies it under covariance (lists are
+  invariant; Sequence is covariant).
+- ``TableSourceProtocol`` — what ColumnProxy / executor actually
+  consume off a "table source": ``_sql_name``, ``_meta``, ``_alias``.
+  ``TableProxy`` / ``CTE`` / ``RecursiveCTE`` / ``Lateral`` all
+  conform.
+
+``ColumnProxy.__init__`` retyped from ``(TableProxy[Any], FieldMeta)``
+to ``(TableSourceProtocol, FieldLike)``.  Two ``# type: ignore[arg-type]``
+lines in ``cte.py`` removed.  The broader ``Any`` story on
+``_PseudoField.primary_key / foreign_key`` is left as the Protocol
+declares ``Any`` — the executor only checks ``is None`` / ``== DBKey``
+through that field, so a tighter type adds no static safety.
+
+Mypy: 0 errors across all 15 source files.  494 tests still green.
 
 ### ~~S9. `psycopg.ProgrammingError` swallow in `execute`~~  *[2026-04-29 exception hygiene] — CLOSED 2026-05-22*
 
