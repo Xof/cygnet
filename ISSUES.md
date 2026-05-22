@@ -639,28 +639,25 @@ Resolved in favour of "close the gap". `run_save`'s upsert path now
 mirrors `run_insert` / `run_create` on DEFAULT handling. Closed via
 **B3**.
 
-### OQ2. Should the duck-typed adapter contract become a formal `Protocol`?
+### ~~OQ2. Should the duck-typed adapter contract become a formal `Protocol`?~~  *— RESOLVED 2026-05-22 (yes, formal Protocol)*
 
-**Source**: 2026-05-22-deepdive OQ2.
+Resolved in favour of a formal ``@runtime_checkable`` Protocol.
+Closed via **S4**: ``cygnet.DBAdapter`` now declares the required
+adapter surface; optional methods (``stream`` / ``column_defaults``)
+stay duck-typed via ``hasattr``.
 
-The May 17 introduction of `column_defaults` as an optional method
-changes the protocol's shape. With one optional method, `hasattr`
-probing is fine. With two, the pattern feels like a capability
-bitmap. Decide while the surface is small.
+### ~~OQ3. Is `uv.lock` authoritative, advisory, or accidental?~~  *— RESOLVED 2026-05-22 (uv canonical)*
 
-### OQ3. Is `uv.lock` authoritative, advisory, or accidental?
+Resolved: uv is canonical for the dev workflow.  Closed via **S18**
+— justfile + CI both flow through ``uv sync --locked`` and
+``uv run`` now.  End-user ``pip install cygnet-orm`` unchanged.
 
-**Source**: 2026-05-22-deepdive OQ3.
+### ~~OQ4. Should the audit job's `--strict` block on CVEs?~~  *— RESOLVED 2026-05-22 (block on CVE)*
 
-Presence of a lockfile without a uv-driven workflow is the canonical
-tooling-ambiguity smell. See **S18**.
-
-### OQ4. Should the audit job's `--strict` block on CVEs?
-
-**Source**: 2026-05-22-deepdive OQ4.
-
-Today the `--strict || true` combination is contradictory. Either is
-defensible; the current combination isn't. See **B5**.
+Resolved: the audit job blocks on real CVEs.  Closed via **B5** —
+``pip-audit --skip-editable`` exits non-zero only when a real CVE
+is found in dep tree (the contradictory ``--strict || true`` was
+swallowing both the editable-skip false positive AND real CVEs).
 
 ### ~~OQ5. Is the `op()` 1-arg factory-factory pulling its weight?~~  *— RESOLVED 2026-05-22 (keep all three)*
 
