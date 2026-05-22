@@ -103,3 +103,42 @@ class FakeDB:
     @property
     def last_params(self) -> list:
         return self.calls[-1][1]
+
+
+class DefaultsFakeDB(FakeDB):
+    """FakeDB extended with a ``column_defaults`` probe — enables Cygnet's
+    DEFAULT-aware INSERT codegen against a non-PG fixture.
+
+    Lives in conftest (alongside FakeDB) rather than in a single test file
+    so consumers writing custom adapters can borrow the contract: the
+    optional ``column_defaults(table_name) -> set[str]`` method is the
+    sole shape that unlocks the "omit None-valued DEFAULTed columns from
+    INSERT, RETURNING-refresh them" codegen path in
+    ``executor._extract_insert_fields`` / ``run_insert`` / ``run_save``.
+
+    Usage:
+
+        db = DefaultsFakeDB(
+            rows=[(1, "2026-01-01T00:00:00Z")],
+            defaults={"widgets": {"created_at"}},
+        )
+
+    Callers preload ``rows`` to satisfy the RETURNING ``execute_one`` and
+    declare ``defaults`` per-table to control which columns Cygnet sees
+    as DEFAULT-bearing.  An adapter that mis-shapes ``column_defaults``
+    (returns a list, returns None, returns whitespace in names) can be
+    spotted by diffing against this reference.
+    """
+
+    def __init__(
+        self,
+        rows: list | None = None,
+        defaults: dict[str, set[str]] | None = None,
+    ) -> None:
+        super().__init__(rows=rows)
+        # Map from table_name -> set of column names that have DEFAULTs.
+        # If a table isn't in the map, column_defaults returns an empty set.
+        self._defaults = defaults or {}
+
+    async def column_defaults(self, table_name: str) -> set[str]:
+        return self._defaults.get(table_name, set())

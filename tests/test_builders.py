@@ -17,6 +17,7 @@ from cygnet.annotations import AppKey, DBKey
 from tests.conftest import (
     Account,
     AccountTable,
+    DefaultsFakeDB,
     Event,
     EventTable,
     FakeDB,
@@ -631,27 +632,6 @@ class Widget:
 
 
 WidgetTable = cygnet.Table(Widget)
-
-
-class DefaultsFakeDB(FakeDB):
-    """FakeDB extended with a column_defaults probe — enables Cygnet's
-    DEFAULT-aware INSERT codegen in unit tests.  The set of defaulted
-    columns is supplied at construction time so each test can declare
-    exactly which columns it expects to be DEFAULTed.
-    """
-
-    def __init__(
-        self,
-        rows: list | None = None,
-        defaults: dict[str, set[str]] | None = None,
-    ) -> None:
-        super().__init__(rows=rows)
-        # Map from table_name -> set of column names that have DEFAULTs.
-        # If a table isn't in the map, column_defaults returns an empty set.
-        self._defaults = defaults or {}
-
-    async def column_defaults(self, table_name: str) -> set[str]:
-        return self._defaults.get(table_name, set())
 
 
 class TestInsertDefaultColumnOmission:

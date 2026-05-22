@@ -374,27 +374,24 @@ and test (`test_parameterised_generics_keep_their_params`) cover both
 `list[str]` and `dict[str, int]` and assert the bug-symptom strings
 (`ColumnProxy[list]`, `ColumnProxy[dict]`) are absent.
 
-### S16. FakeDB has no `column_defaults` template  *[2026-05-22-deepdive tests]*
+### ~~S16. FakeDB has no `column_defaults` template~~  *[2026-05-22-deepdive tests] — CLOSED 2026-05-22*
 
-`tests/conftest.py:55-92`. By design — preserves existing tests. But
-that means `_DefaultedFakeDB` in `test_builders.py` is the only
-non-PG fixture covering the DEFAULT-aware path. A custom adapter
-that mis-shapes `column_defaults` (returns a list of tuples, returns
-None, returns whitespace in names) has no fixture to validate
-against.
+Closed by moving ``DefaultsFakeDB`` from ``tests/test_builders.py``
+into ``tests/conftest.py`` alongside its parent ``FakeDB``.  The
+docstring now describes its role as the protocol-shape reference for
+the optional ``column_defaults(table_name) -> set[str]`` method:
+custom-adapter authors can subclass or copy-paste it as the
+known-good implementation to diff their own against.
 
-**Direction of fix**: Expose `_DefaultedFakeDB` as a fixture (or add
-a `make_fake_defaulted_db` factory) so consumers writing custom
-adapters can borrow the contract.
+### ~~S17. CI no scheduled audit run~~  *[2026-05-22-deepdive CI] — CLOSED 2026-05-22*
 
-### S17. CI no scheduled audit run  *[2026-05-22-deepdive CI]*
-
-`.github/workflows/ci.yml`. No `schedule:` trigger. CVEs that fire
-between PRs surface only on the next push. Weekly cron on the audit
-job is the standard mitigation.
-
-**Direction of fix**: Add `schedule: - cron: "0 4 * * 1"` (Monday
-04:00 UTC) gating the audit job.
+Closed by adding ``schedule: - cron: "0 4 * * 1"`` to the top-level
+``on:`` block of ``.github/workflows/ci.yml``.  Non-audit jobs (unit,
+integration, build, bench) are gated with
+``if: github.event_name != 'schedule'`` so the cron only re-runs the
+audit step — code hasn't changed since the last push, so re-running
+unit/integration/build would be pure CI cost.  CVEs in dev deps now
+surface within a week even when no PRs are pushing.
 
 ### S18. `uv.lock` vs pip-based workflow  *[2026-05-22-deepdive packaging]*
 
