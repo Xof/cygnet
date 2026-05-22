@@ -71,6 +71,10 @@ class TestSubqueryRender:
         """~~exists(b) is just exists(b) — double negation simplifies."""
         db = FakeDB(rows=[])
         any_log = cygnet.SELECT(db, cygnet.lit("1")).FROM(LogTable)
+        # `~~cygnet.exists(any_log)` — the double tilde is intentional.
+        # `~` on a Predicate-shaped expression returns its boolean
+        # negation (`NOT EXISTS …`); applying `~` again collapses back
+        # to the unnegated form rather than producing `NOT NOT EXISTS`.
         await cygnet.SELECT(db).FROM(AccountTable).WHERE(~~cygnet.exists(any_log))
         sql = db.last_sql
         assert "EXISTS (" in sql

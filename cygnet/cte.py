@@ -1,12 +1,14 @@
-# cte.py — Common-table-expression support: WITH name AS (…).
+# cte.py — Common-table-expression support: WITH name AS (…), including
+# WITH RECURSIVE, plus LATERAL subqueries.
 #
-# A CTE is a named subquery that can be FROMed, JOINed, and have its
-# columns referenced.  This module's CTE class duck-types enough of
-# TableProxy's interface (`_sql_name`, `_meta.table_name`, `_meta.fields`,
-# `_alias`) that the executor can render `FROM cte_name` / `JOIN cte_name
-# ON …` paths without special-casing.  Column attributes are stamped at
-# construction time so `cte.id == 5` returns a Predicate, just like
-# `T.id == 5` on a regular table.
+# Three closely-related shapes live here:
+#   CTE           → plain non-recursive WITH name AS (SELECT …)
+#   RecursiveCTE  → WITH RECURSIVE name(cols) AS (anchor UNION ALL step)
+#   Lateral       → LATERAL (SELECT …) alias in FROM / JOIN
+# All three duck-type TableProxy's interface so the executor can render
+# FROM / JOIN / column-ref paths without special-casing.  Column
+# attributes are stamped at construction time so `cte.id == 5` returns a
+# Predicate, just like `T.id == 5` on a regular table.
 #
 # The duck-typing here is deliberate: a CTE is NOT a thin TableProxy
 # subclass because TableProxy is tied to a concrete dataclass (its
@@ -23,15 +25,6 @@
 #   _alias              → mirrors TableProxy's alias attribute (None for now)
 # Any executor path that reaches for something outside this surface will
 # AttributeError loudly — preferable to silent wrong behaviour.
-#
-# Recursive CTEs (`WITH RECURSIVE …`) are deliberately out of scope for
-# this initial pass; revisit once a real use case appears.
-# (Update: RecursiveCTE / recursive_cte() were added below — the comment
-# above predates them.  The "out of scope" note applies only to the
-# initial CTE class.)
-#
-# Lateral subqueries (`LATERAL (…) alias` in FROM/JOIN) reuse the same
-# duck-typed surface via the Lateral subclass — see bottom of file.
 
 from __future__ import annotations
 

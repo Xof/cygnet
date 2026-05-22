@@ -1118,6 +1118,45 @@ class TestSaveDefaultAwareness:
         assert "RETURNING" not in db.last_sql
 
 
+# ── S25: aliased proxies are not valid for DML ──────────────────────────
+#
+# T.AS("a") is a SELECT-side conceit (self-joins, cross-joins on the same
+# table); attempting INSERT / UPDATE / DELETE through an aliased proxy
+# produces SQL whose target is unaliased (good) but whose WHERE / SET
+# column refs carry the alias (bad — alias not in scope), so the
+# resulting query fails at the server.  Builder-time guard makes the
+# mistake loud locally.
+
+
+class TestAliasedDMLRejected:
+    async def test_insert_into_aliased_raises(self):
+        AT = AccountTable.AS("a")
+        db = FakeDB()
+        with pytest.raises(ValueError, match="INSERT.*aliased.*'a'"):
+            cygnet.INSERT(db).INTO(AT)
+
+    async def test_update_set_aliased_raises(self):
+        AT = AccountTable.AS("u")
+        db = FakeDB()
+        with pytest.raises(ValueError, match="UPDATE.*aliased.*'u'"):
+            cygnet.UPDATE(db).SET(AT, name="x")
+
+    async def test_delete_from_aliased_raises(self):
+        AT = AccountTable.AS("d")
+        db = FakeDB()
+        with pytest.raises(ValueError, match="DELETE.*aliased.*'d'"):
+            cygnet.DELETE(db).FROM(AT)
+
+    async def test_unaliased_dml_still_works(self):
+        """Sanity: the guard only fires on aliased proxies — the canonical
+        ``Table(cls)`` proxy still passes through every DML method."""
+        db = FakeDB(rows=[(1,)])
+        # All three verbs accept the unaliased proxy without raising.
+        cygnet.INSERT(db).INTO(AccountTable)
+        cygnet.UPDATE(db).SET(AccountTable, name="x")
+        cygnet.DELETE(db).FROM(AccountTable)
+
+
 class TestGetSQL:
     async def test_get_produces_correct_where(self):
         db = FakeDB(rows=[(1, "Fred", "fred@example.com")])

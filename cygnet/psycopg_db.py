@@ -15,6 +15,15 @@
 # The $N → %s translation is pure regex — no SQL parsing — so it stays
 # correct as long as Cygnet keeps emitting params left-to-right.  See
 # the limitations note on _DOLLAR_RE below.
+#
+# Caveat: the regex is string-literal-blind.  A ``cygnet.lit("'$1 foo'")``
+# payload contains ``$1`` and will be rewritten to ``%s foo`` even
+# though it sits inside a single-quoted SQL literal.  Since ``lit()`` is
+# documented as "trusted, no escaping", users constructing payloads
+# containing ``$\d+`` substrings need to avoid that lexical shape (or use
+# ``'$' || '1'``).  Proper SQL tokenisation would close this, but
+# Cygnet's stance is that ``lit()`` is the escape hatch — callers own
+# its content.
 
 from __future__ import annotations
 
@@ -100,10 +109,13 @@ class PsycopgDB:
         self, sql: str, params: list[Any] | None = None
     ) -> AsyncIterator[tuple[Any, ...]]:
         # Portal-based cursor.stream(): rows arrive as they're produced,
-        # not after the full result set has been buffered.  PG requires
-        # the connection to be in a transaction (or autocommit off) for
-        # portal cursors — typical usage wraps this in
-        # `async with cygnet.transaction(db)`.
+        # not after the full result set has been buffered.  PG portal
+        # cursors are most predictable inside an explicit transaction —
+        # psycopg3 will start an implicit one if none is active, but the
+        # implicit lifetime is harder to reason about (when does it
+        # commit? what if the consumer exits early?).  Wrapping the
+        # consumer in ``async with cygnet.transaction(db)`` gives the
+        # cursor a deterministic enclosing scope and a clean teardown.
         async with self._conn.cursor() as cur:
             async for row in cur.stream(self._adapt_sql(sql), params or []):
                 yield row

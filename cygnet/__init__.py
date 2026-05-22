@@ -159,6 +159,14 @@ def lit(sql: str) -> Literal:
     The SQL is emitted verbatim — no escaping, no parameter substitution.
     This is the escape hatch when Cygnet's expression API doesn't cover
     your SQL construct.  Use with care: the string is trusted.
+
+    Caveat for adapters that translate placeholder syntax: the reference
+    psycopg adapter (cygnet.psycopg_db.PsycopgDB) rewrites every ``$\\d+``
+    substring in the final SQL to psycopg's ``%s`` form — including any
+    such substrings inside a ``lit()`` payload.  If you need a literal
+    ``$1`` string in a SQL fragment going through that adapter, write it
+    as ``'$' || '1'`` or similar.  Custom adapters that don't translate
+    placeholders are unaffected.
     """
     return Literal(sql=sql)
 
@@ -346,6 +354,16 @@ class transaction:
     operations leave it alone, which is what makes nesting work without a
     counter.  Concurrent use of the same db handle across tasks is not
     supported — the flag is not task-local.
+
+    Instance reuse: a single `transaction(db)` instance can be reused
+    across sequential `async with` blocks — `__aenter__` resets
+    `self._savepoint` so the prior nested savepoint name never leaks
+    into a subsequent outermost BEGIN/COMMIT.  Concurrent re-entry of
+    the SAME transaction instance is unsupported (the `self._savepoint`
+    field would race); construct a fresh `transaction(db)` per task if
+    you need parallel transactional contexts on the same db handle —
+    and remember that the db adapter itself is also not task-local
+    (see the previous paragraph).
 
     Usage::
 

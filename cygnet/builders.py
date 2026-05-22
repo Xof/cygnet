@@ -43,6 +43,25 @@ from .proxy import ColumnProxy, TableProxy
 TableSource = TableProxy[Any] | CTE | RecursiveCTE
 
 
+def _reject_aliased_dml(table: Any, verb: str) -> None:
+    """Refuse aliased TableProxies in DML target position.
+
+    PG doesn't allow ``AS`` in INSERT / UPDATE / DELETE target position,
+    and Cygnet's column refs from an aliased proxy carry the alias on
+    the left of the dot — which then doesn't resolve, since the DML
+    target was emitted without the alias.  Raising at builder time gives
+    a clearer message than letting PG reject the malformed SQL later.
+    The aliased proxy is fine for SELECT-side use (self-joins, etc.);
+    callers wanting DML pass ``cygnet.Table(<model>)`` instead.
+    """
+    alias = getattr(table, "_alias", None)
+    if alias is not None:
+        raise ValueError(
+            f"{verb} does not support aliased proxies (got alias {alias!r}); "
+            f"pass the unaliased Table(<model>) proxy for DML"
+        )
+
+
 def _check_table_source(arg: Any, where: str) -> None:
     """Validate `arg` is a TableSource at runtime, with helpful errors.
 
@@ -590,7 +609,15 @@ class InsertBuilder(_Builder):
         self._on_conflict_excluded: tuple[Any, ...] | None = None
 
     def INTO(self, table: TableProxy[Any]) -> InsertBuilder:
+        """Set the INSERT target table.
+
+        Calling INTO a second time replaces the prior target outright
+        (the underlying builder holds a single _table slot — there's no
+        "merge two targets" semantics in INSERT SQL, so clobber is the
+        honest behaviour rather than an ambiguous merge).
+        """
         _check_table_source(table, "INSERT … INTO")
+        _reject_aliased_dml(table, "INSERT … INTO")
         self._table = table
         return self
 
@@ -816,6 +843,7 @@ class UpdateBuilder(_Builder):
         # a single SET clause in SQL, and merging kwargs across calls would
         # invite confusion about which call's values win.
         _check_table_source(table, "UPDATE … SET")
+        _reject_aliased_dml(table, "UPDATE … SET")
         self._table = table
         self._obj = obj
         self._kwargs = kwargs
@@ -869,7 +897,14 @@ class DeleteBuilder(_Builder):
         self._using_tables: list[TableSource] = []
 
     def FROM(self, table: TableProxy[Any]) -> DeleteBuilder:
+        """Set the DELETE target table.
+
+        Calling FROM a second time replaces the prior target outright
+        (same rationale as InsertBuilder.INTO: SQL has a single DELETE
+        target slot, so clobber is the honest behaviour).
+        """
         _check_table_source(table, "DELETE FROM")
+        _reject_aliased_dml(table, "DELETE FROM")
         self._table = table
         return self
 

@@ -212,17 +212,15 @@ non-editable portion of the dep tree.
 
 ## Open issues — smells
 
-### S1. `$N` → `%s` regex blind to string literals  *[2026-04-29 #2]*
+### ~~S1. `$N` → `%s` regex blind to string literals~~  *[2026-04-29 #2] — CLOSED 2026-05-22*
 
-`cygnet/psycopg_db.py:50-60`. The translation regex rewrites every
-`$\d+` substring, including those embedded inside `cygnet.lit("'$1 prefix'")`.
-The escape hatch is documented as trusted, but the literal-blindness
-isn't called out anywhere.
-
-**Direction of fix**: Either narrow the regex to skip string-literal
-contexts (invasive — proper SQL tokenization), or document the
-limitation on `lit()`'s docstring and `psycopg_db.py`'s header. The
-library's stance ("lit is trusted") makes the second acceptable.
+Closed by documenting the limitation in two places: a paragraph on
+``lit()``'s docstring in ``cygnet/__init__.py`` calling out that adapters
+which translate placeholders rewrite ``$\d+`` anywhere in the payload,
+and a corresponding comment on ``cygnet/psycopg_db.py``'s file header
+explaining the regex is string-literal-blind. The library's "lit is
+trusted" stance makes the documented limitation acceptable; proper SQL
+tokenisation was rejected as overkill for the escape hatch.
 
 ### S2. `_row_to_obj` zip-truncation is silent  *[2026-05-22-deepdive smell; comment-run #4]*
 
@@ -343,18 +341,11 @@ that flipped `_in_transaction = True`. Cost: one
 `asyncio.current_task()` per nesting boundary. Benefit: the failure
 mode is hard to debug, so a loud check pays for itself.
 
-### S11. `lit()` doesn't document the `$N`-rewrite trap  *[2026-04-29 docs]*
+### ~~S11. `lit()` doesn't document the `$N`-rewrite trap~~  *[2026-04-29 docs] — CLOSED 2026-05-22*
 
-`cygnet/__init__.py:122-129`. `lit()`'s docstring says "the SQL is
-emitted verbatim — no escaping, no parameter substitution. The
-string is trusted." True at the Cygnet layer. But combined with
-`psycopg_db.py`'s `$N`→`%s` regex (**S1**), a `lit()` containing
-`$1` substring gets rewritten downstream. Docstring should mention
-that adapters may translate placeholders.
-
-**Direction of fix**: Add a sentence to `lit()`'s docstring noting
-that the reference psycopg adapter rewrites `$\d+` patterns and that
-`lit()` consumers should avoid those substrings.
+Closed alongside **S1**. ``lit()``'s docstring now has a "Caveat for
+adapters that translate placeholder syntax" paragraph naming
+``PsycopgDB`` explicitly and giving the ``'$' || '1'`` workaround.
 
 ### ~~S12. `psycopg_db.column_defaults` docstring claims search_path lookup~~  *[2026-05-22-deepdive docs] — CLOSED 2026-05-22*
 
@@ -423,27 +414,19 @@ family. Neither exists in `cygnet/builders.py` or `cygnet/executor.py`.
 **Direction of fix**: Trim CLAUDE.md, or implement them (one method
 each in the JOIN cluster — straightforward addition).
 
-### S20. `cte.py` header says recursive CTEs are out of scope  *[comment-run #7]*
+### ~~S20. `cte.py` header says recursive CTEs are out of scope~~  *[comment-run #7] — CLOSED 2026-05-22*
 
-`cygnet/cte.py` top-of-file header originally said "Recursive CTEs are
-deliberately out of scope for this initial pass" — but `RecursiveCTE`
-and `recursive_cte()` are implemented in the same file. The May 22
-comment-run pass appended an `(Update: …)` clarification per the
-no-deletion rule. The original misleading line still reads as the
-top sentence.
+Closed by rewriting the file header.  The lead paragraph now lists all
+three shapes (CTE, RecursiveCTE, Lateral) and the obsolete "out of
+scope" + "(Update:…)" two-step is gone.
 
-**Direction of fix**: Rewrite the header so the recursive support is
-described from line 1, with the "Update" note merged in or removed.
+### ~~S21. INSERT.INTO / DELETE.FROM re-call clobber undocumented~~  *[comment-run #13] — CLOSED 2026-05-22*
 
-### S21. INSERT.INTO / DELETE.FROM re-call clobber undocumented  *[comment-run #13]*
-
-`cygnet/builders.py` `INTO` and `FROM` (DeleteBuilder) silently swap
-the target when called twice. Consistent with `UpdateBuilder.SET`'s
-clobber behaviour (now documented in the May 22 comment pass), but
-neither `INTO` nor `FROM` has a corresponding note.
-
-**Direction of fix**: Either reject the second call (defensive) or
-add a docstring sentence noting the clobber semantics.
+Closed by adding docstrings to ``InsertBuilder.INTO`` and
+``DeleteBuilder.FROM`` that mirror ``UpdateBuilder.SET``'s clobber-
+documentation pattern. SQL has a single target slot for each verb, so
+clobber-on-recall is the honest behaviour; the docstrings make that
+explicit.
 
 ### S22. `Predicate.__invert__` return-type annotation diverges from siblings  *[comment-run #12]*
 
@@ -457,19 +440,14 @@ reference.
 forward reference as a string or `TYPE_CHECKING` import) or add a
 code comment explaining why this one diverges.
 
-### S23. `transaction._savepoint` mutable across `async with` reuse  *[comment-run #11]*
+### ~~S23. `transaction._savepoint` mutable across `async with` reuse~~  *[comment-run #11] — CLOSED 2026-05-22*
 
-`cygnet/__init__.py` `transaction`. The class docstring suggests a
-single instance can be reused across sequential `async with` blocks.
-`__aenter__` resets `self._savepoint = None`, but `_savepoint` is
-instance state, so concurrent re-entry (already documented
-unsupported) would leak savepoint names. Sequential reuse is fine.
-Behaviour matches contract; the implicit-mutable-state pattern is
-worth a comment beyond what's there.
-
-**Direction of fix**: Either change to a local-variable approach (no
-mutable instance state across exits), or document the constraint more
-loudly. Most defensible: keep the state, beef up the docstring.
+Closed by beefing up the ``transaction`` docstring with an explicit
+"Instance reuse" paragraph: sequential reuse is fine (``__aenter__``
+resets ``_savepoint``), concurrent re-entry of the SAME instance is
+unsupported (race on the field). The docstring now points users to
+"construct a fresh ``transaction(db)`` per task" for parallel contexts
+and reiterates the existing not-task-local caveat on the adapter.
 
 ### S24. `_extract_insert_fields` returns an unused `values` accumulator  *[comment-run #14]*
 
@@ -482,18 +460,30 @@ rendered placeholders. Documented as part of the return tuple.
 comment explaining why the unused field stays in the tuple. Removing
 it would be a small internal refactor with no external API impact.
 
-### S25. Aliased-proxy DML claim in `proxy.py` is unverified  *[comment-run #9]*
+### ~~S25. Aliased-proxy DML claim in `proxy.py` is unverified~~  *[comment-run #9] — CLOSED 2026-05-22*
 
-`cygnet/proxy.py` aliased-proxy docstring says: "INSERT / UPDATE /
-DELETE on an aliased proxy work, but PG doesn't allow `AS` in DML
-target position; if a real need ever surfaces, the executor would
-need to drop the alias for those verbs." The commenting agent did
-not audit whether `_render_insert / _render_update / _render_delete`
-strip the alias. Reads as aspirational.
+Audit found the claim was worse than aspirational — actively wrong.
+The executor strips the alias from the DML target (uses
+``meta.table_name`` directly), but the ColumnProxies stamped onto an
+aliased view still emit the alias on the left of the dot, so any
+WHERE / SET RHS referencing the aliased proxy resolves to an
+undefined identifier (PG: "missing FROM-clause entry"). Confirmed by
+running ``UPDATE(db).SET(AT, name='x').WHERE(AT.id == 5)`` against a
+``T.AS('a')`` proxy: the emitted SQL was ``UPDATE accounts SET name =
+$1 WHERE (a.id = $2)`` — alias not in scope.
 
-**Direction of fix**: Audit. If executor doesn't strip, either add the
-strip + test, or rephrase the docstring to say "not currently
-supported; pass `Table(cls)` (unaliased) for DML."
+Closed by:
+- Adding a ``_reject_aliased_dml`` helper in
+  ``cygnet/builders.py`` that raises ``ValueError`` if a DML target
+  proxy carries ``_alias``.
+- Calling it from ``InsertBuilder.INTO``, ``UpdateBuilder.SET``, and
+  ``DeleteBuilder.FROM``.
+- Rewriting the AS() docstring in ``cygnet/proxy.py`` to describe the
+  actual constraint ("SELECT-side only; DML raises ValueError").
+
+Coverage: four new unit tests in
+``tests/test_builders.py::TestAliasedDMLRejected`` — one per verb plus
+a "unaliased still works" sanity test.
 
 ### S26. `meta.TableMeta` caches before introspection runs  *[comment-run #10]*
 
@@ -511,19 +501,13 @@ a `try/except` and `del self._cache[cls]` on raise), or argue that
 introspection failures are configuration bugs not worth retry semantics
 — and update the comment to match.
 
-### S27. `psycopg_db.stream()` docstring overstates portal-cursor requirement  *[comment-run #8]*
+### ~~S27. `psycopg_db.stream()` docstring overstates portal-cursor requirement~~  *[comment-run #8] — CLOSED 2026-05-22*
 
-`cygnet/psycopg_db.py:99-109`. Says "PG requires the connection to be
-in a transaction (or autocommit off) for portal cursors." In psycopg3,
-`cursor.stream()` starts an implicit transaction if none is active.
-The recommendation to wrap in `cygnet.transaction(db)` remains correct
-(deterministic lifetime, explicit cleanup), but the strict-requirement
-framing is slightly wrong.
-
-**Direction of fix**: Soften the docstring — replace "PG requires …"
-with "PG portal cursors are most predictable inside an explicit
-transaction; wrap in `cygnet.transaction(db)` for explicit lifetime
-control."
+Closed by softening the comment in ``PsycopgDB.stream()``. New wording
+acknowledges that psycopg3 will start an implicit transaction if none
+is active, but recommends an explicit ``cygnet.transaction(db)``
+wrapper for deterministic lifetime — same practical advice, accurate
+about the underlying mechanics.
 
 ### S28. `run_insert` AppKey + omitted + row=None silent-skip  *[comment-run #5]*
 
@@ -579,11 +563,12 @@ Subsumed by **S6** (lift to module level).
 twice (once for SELECT list, once for JOIN clause). For typical join
 counts (1-3) the cost is negligible.
 
-### N5. Inline comment example `~~cygnet.exists(any_log)` would help  *[2026-04-29 tests]*
+### ~~N5. Inline comment example `~~cygnet.exists(any_log)` would help~~  *[2026-04-29 tests] — CLOSED 2026-05-22*
 
-`tests/test_subquery.py:74`. Double-invert collapse is intentional but
-not obviously so. Docstring on the test explains it; a short inline
-comment would help future readers grep faster.
+Closed: inline comment added at
+``tests/test_subquery.py::test_double_invert_collapses_to_exists``
+explaining that the double tilde is intentional and what each
+application of ``~`` does to a Predicate.
 
 ### N6. First-INSERT-per-table introspection round-trip  *[2026-05-22-deepdive perf]*
 

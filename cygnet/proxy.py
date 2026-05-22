@@ -205,11 +205,15 @@ class TableProxy[T]:
         per class, so identity-based comparisons elsewhere in Cygnet
         (b._table is X) still hold for the canonical proxy.
 
-        Aliasing is mainly for self-joins and the rare cross-join cases
-        where the same table appears twice in one query.  INSERT /
-        UPDATE / DELETE on an aliased proxy work, but PG doesn't allow
-        AS in DML target position; if a real need ever surfaces, the
-        executor would need to drop the alias for those verbs.
+        Aliasing is for SELECT-side use only — self-joins and the rare
+        cross-join cases where the same table appears twice in one
+        query.  INSERT / UPDATE / DELETE on an aliased proxy is
+        unsupported and rejected at builder time with a ValueError: PG
+        doesn't allow ``AS`` in DML target position, AND the
+        ColumnProxies stamped onto an aliased view emit the alias on
+        the left of the dot, so any WHERE / SET RHS that referenced the
+        aliased proxy would resolve to an undefined identifier.  Pass
+        the unaliased ``Table(<model>)`` proxy for DML.
         """
         # Bypass cache via __new__'s super-call path.  Re-runs the same
         # initialisation flow that the cached instance went through, but
