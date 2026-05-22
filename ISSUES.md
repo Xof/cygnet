@@ -678,16 +678,25 @@ docstring in ``cygnet/expression.py`` already documented the use
 case; the README addition makes it discoverable from the entry
 point.
 
-### OQ6. Should the comment-run "extend in place" pattern be sanctioned?
+### ~~OQ6. Should the comment-run "extend in place" pattern be sanctioned?~~  *— RESOLVED 2026-05-22 (yes, EXTEND is sanctioned)*
 
-**Source**: 2026-05-22 comment-run summary.
+Resolved: yes.  The ``/comment-run`` skill at
+``~/.claude/commands/comment-run.md`` now lists three patterns
+explicitly:
 
-The three `git diff` deletions in the May 22 comment pass were all
-*extensions* of existing comments (original wording preserved,
-new content appended). The current "do not delete or rewrite any
-existing comment" rule is unambiguous but conservative — extending in
-place might be a useful third option alongside ADD and LEAVE for
-future comment passes.
+- **ADD** — no comment yet; write one.
+- **LEAVE** — existing comment accurate and complete.
+- **EXTEND** — existing comment correct as far as it goes but
+  doesn't cover a tradeoff / constraint / invariant.  Append to it,
+  preserving the original wording.
+
+The unifying rule is preserved: never DELETE existing comment text.
+EXTEND appends only.
+
+Guardrail: if an existing comment is actively *wrong* (not just
+incomplete), EXTEND is the wrong tool — memorialize the mismatch
+for later decisions instead.  EXTEND is for honest gaps; mismatches
+between comment and code should be surfaced, not papered over.
 
 ---
 
