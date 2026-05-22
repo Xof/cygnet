@@ -41,26 +41,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      # OQ3 migration: uv is now canonical (justfile + ci.yml both run
+      # through it).  setup-uv@v6 installs uv, installs the matrix
+      # Python via uv, and caches the global uv download cache keyed on
+      # uv.lock so re-runs against unchanged deps are near-instant.
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
+          enable-cache: true
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        # --locked: fail loudly if uv.lock drifted from pyproject.toml
+        # (CI should never silently resolve a different graph than what
+        # was committed).  --extra dev pulls in pytest / ruff / mypy /
+        # psycopg.
+        run: uv sync --locked --extra dev
 
       - name: Format check
-        run: ruff format --check cygnet tests
+        run: uv run ruff format --check cygnet tests
 
       - name: Lint
-        run: ruff check cygnet tests
+        run: uv run ruff check cygnet tests
 
       - name: Type check
-        run: mypy cygnet
+        run: uv run mypy cygnet
 
       - name: Unit tests
         run: |
-          pytest tests/ --ignore=tests/integration \
+          uv run pytest tests/ --ignore=tests/integration \
             -v \
             --cov=cygnet \
             --cov-report=xml \
@@ -102,19 +110,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
-          cache: pip
+          enable-cache: true
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: uv sync --locked --extra dev
 
       - name: Integration tests
         env:
           CYGNET_TEST_DSN: postgresql://cygnet:cygnet@localhost:5432/cygnet_test
         run: |
-          pytest tests/integration \
+          uv run pytest tests/integration \
             -v \
             -m integration \
             --cov=cygnet \
@@ -138,16 +146,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
-          cache: pip
+          enable-cache: true
 
-      - name: Install hatch
-        run: pip install hatch
-
+      # `uvx --from hatch hatch build` runs hatch in an ephemeral
+      # isolated environment — no need to install hatch into the
+      # project venv (the build job doesn't need the project's deps).
       - name: Build wheel and sdist
-        run: hatch build
+        run: uvx --from hatch hatch build
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -168,16 +176,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
-          cache: pip
+          enable-cache: true
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
-
-      - name: Install pip-audit
-        run: pip install pip-audit
+        # pip-audit scans the project venv, so it needs to be installed
+        # alongside the project deps (not via uvx, which would isolate
+        # it from what we want to audit).
+        run: |
+          uv sync --locked --extra dev
+          uv pip install pip-audit
 
       - name: Run pip-audit
         # --skip-editable skips the local cygnet-orm editable install (it
@@ -187,7 +197,7 @@ jobs:
         # a dep — which is the point.  The previous `--strict || true`
         # combo was contradictory: --strict failed on the editable skip,
         # and `|| true` swallowed both that AND any real CVE.
-        run: pip-audit --skip-editable
+        run: uv run pip-audit --skip-editable
 
   # ── Benchmarks (advisory) ─────────────────────────────────────────────────
   # Runs the perf suite against a fresh PG instance and uploads the
@@ -223,19 +233,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
-          cache: pip
+          enable-cache: true
 
       - name: Install dependencies
-        run: pip install -e ".[dev,bench]"
+        run: uv sync --locked --extra dev --extra bench
 
       - name: Run benchmarks
         env:
           CYGNET_TEST_DSN: postgresql://cygnet:cygnet@localhost:5432/cygnet_test
         run: |
-          pytest bench/ \
+          uv run pytest bench/ \
             --benchmark-only \
             --benchmark-json=bench-result.json \
             --benchmark-columns=median,min,max,iqr,ops \
@@ -246,7 +256,7 @@ jobs:
         run: |
           if [ -f bench-result.json ]; then
             echo "## Benchmark results" >> $GITHUB_STEP_SUMMARY
-            python -m bench._summary bench-result.json >> $GITHUB_STEP_SUMMARY
+            uv run python -m bench._summary bench-result.json >> $GITHUB_STEP_SUMMARY
           fi
 
       # ── PR-only: pull main's last bench artifact and diff ──────────────
@@ -283,7 +293,7 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "## Δ vs main baseline" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            python -m bench._compare \
+            uv run python -m bench._compare \
               baseline/bench-result.json \
               bench-result.json \
               >> $GITHUB_STEP_SUMMARY

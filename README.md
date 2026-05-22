@@ -941,8 +941,14 @@ needed. See psycopg3's docs for the full list.
 
 ## Development
 
+Development requires [`uv`](https://docs.astral.sh/uv/) as the package
+manager — install it via your platform's package manager (Homebrew /
+apt / `pipx install uv`) before the steps below. `just bootstrap`
+runs `uv sync --extra dev` which honours the checked-in `uv.lock` for
+reproducible installs.
+
 ```
-just bootstrap       # create venv, install dev dependencies
+just bootstrap       # create .venv via uv sync, install dev dependencies (locked)
 just check           # fmt + lint + typecheck + unit tests
 just test-all        # full suite including integration (requires Docker)
 just pg-psql         # open psql against the test container

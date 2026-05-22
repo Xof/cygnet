@@ -429,14 +429,26 @@ audit step — code hasn't changed since the last push, so re-running
 unit/integration/build would be pure CI cost.  CVEs in dev deps now
 surface within a week even when no PRs are pushing.
 
-### S18. `uv.lock` vs pip-based workflow  *[2026-05-22-deepdive packaging]*
+### ~~S18. `uv.lock` vs pip-based workflow~~  *[2026-05-22-deepdive packaging] — CLOSED 2026-05-22*
 
-`uv.lock` is checked in; `pyproject.toml` and the `justfile` use pip
-exclusively. Either uv is canonical (in which case `just bootstrap`
-should `uv sync` and CI's install step should use uv) or pip is
-canonical (in which case the lockfile should be gitignored).
+Closed via **OQ3** (resolved to "uv is canonical"):
 
-**Direction of fix**: Pick one. See **OQ3**.
+- ``justfile``: ``bootstrap`` / ``install`` / ``bootstrap-bench`` now
+  run ``uv sync --extra dev`` (and ``--extra bench`` where relevant).
+  All ``ruff`` / ``mypy`` / ``pytest`` invocations go through
+  ``uv run`` so they pick up lockfile-pinned versions.  ``hatch build``
+  and ``hatch publish`` use ``uvx --from hatch`` for ephemeral isolation.
+- ``.github/workflows/ci.yml``: every job's ``setup-python`` +
+  ``pip install`` pair replaced with ``astral-sh/setup-uv@v6`` +
+  ``uv sync --locked --extra dev`` (``--locked`` fails if uv.lock
+  drifted from pyproject.toml, catching unintended graph changes in
+  CI).  Tool calls go through ``uv run``.
+- ``uv.lock`` regenerated to reflect current ``pyproject.toml``.
+- README's "Development" section now documents ``uv`` as a prereq.
+
+End-user install (``pip install cygnet-orm[psycopg]``) is unaffected:
+the published package stays driver-agnostic and pip-installable.
+Only the dev workflow migrated.
 
 ### ~~S19. CLAUDE.md JOIN family claims missing verbs~~  *[2026-05-22-deepdive docs; comment-run #6] — CLOSED 2026-05-22*
 

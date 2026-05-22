@@ -1,7 +1,16 @@
 set dotenv-load := true
 
-python := "python3"
-pytest := "python3 -m pytest"
+# Pytest invocation flows through `uv run` so the runner picks up the
+# lockfile-pinned pytest from .venv.  All test recipes share this
+# variable for one-place updates.
+pytest := "uv run python -m pytest"
+
+# Cygnet uses uv as the canonical package + venv manager (OQ3 resolved
+# 2026-05-22).  `uv sync` reads uv.lock for reproducible installs and
+# creates `.venv` automatically.  `uv run` invokes a command inside the
+# managed venv without needing explicit activation.  Direct `pytest` /
+# `ruff` / `mypy` calls below all flow through `uv run` so they pick up
+# the lockfile-pinned versions.
 
 # ── Default ───────────────────────────────────────────────────────────────────
 
@@ -10,32 +19,31 @@ default:
 
 # ── Environment ───────────────────────────────────────────────────────────────
 
-# Create venv and install all dev dependencies
+# Create venv and install all dev dependencies (lockfile-pinned).
 bootstrap:
-    {{ python }} -m venv .venv
-    .venv/bin/pip install -e ".[dev]"
+    uv sync --extra dev
     @echo "Run: source .venv/bin/activate"
 
-# Install/sync dependencies into current environment
+# Re-sync dependencies into .venv from pyproject.toml + uv.lock.
 install:
-    pip install -e ".[dev]"
+    uv sync --extra dev
 
 # ── Linting and types ─────────────────────────────────────────────────────────
 
 lint:
-    ruff check cygnet tests
+    uv run ruff check cygnet tests
 
 lint-fix:
-    ruff check --fix cygnet tests
+    uv run ruff check --fix cygnet tests
 
 fmt:
-    ruff format cygnet tests
+    uv run ruff format cygnet tests
 
 fmt-check:
-    ruff format --check cygnet tests
+    uv run ruff format --check cygnet tests
 
 typecheck:
-    mypy cygnet
+    uv run mypy cygnet
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -65,7 +73,7 @@ check: fmt-check lint typecheck test
 
 # Add the bench dependency group to the existing venv.
 bootstrap-bench:
-    .venv/bin/pip install -e ".[bench]"
+    uv sync --extra dev --extra bench
 
 # Render + overhead benchmarks (no DB needed).  Fast (~5s); good for
 # regression-checking Cygnet's hot rendering paths during development.
@@ -117,10 +125,10 @@ pg-psql:
 # ── Build and publish ─────────────────────────────────────────────────────────
 
 build:
-    hatch build
+    uvx --from hatch hatch build
 
 publish-test:
-    hatch publish --repo test
+    uvx --from hatch hatch publish --repo test
 
 publish:
-    hatch publish
+    uvx --from hatch hatch publish
