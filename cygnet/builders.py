@@ -25,7 +25,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass, field, replace
 
 # typing.Literal is needed for the _OnConflictSpec.action annotation; aliased
@@ -605,7 +605,7 @@ class SelectBuilder(_Builder):
         # once (each call re-renders SQL and re-numbers params from $1).
         return await Executor(self._db).run_select(self)
 
-    def stream(self) -> Any:
+    def stream(self) -> AsyncIterator[Any]:
         """Yield results one at a time without materialising the full list.
 
         Use as `async for row in builder.stream()`.  Requires the db

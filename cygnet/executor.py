@@ -44,6 +44,7 @@
 from __future__ import annotations
 
 import weakref
+from collections.abc import AsyncIterator
 from typing import Any
 
 from .annotations import DBKey
@@ -525,7 +526,7 @@ class Executor:
     def _map_select(self, b: Any, rows: list[Any]) -> list[Any]:
         return [self._map_row(b, row) for row in rows]
 
-    async def stream_select(self, b: Any) -> Any:
+    async def stream_select(self, b: Any) -> AsyncIterator[Any]:
         """Async generator yielding mapped objects one at a time.
 
         Avoids materialising the full result set in memory — useful for

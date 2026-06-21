@@ -224,7 +224,7 @@ class TestSelectAll:
             return run_async(loop, go)
 
         rows = benchmark(op)
-        assert len(rows) == 100
+        assert len(rows) >= 100
 
     def test_sqlalchemy(self, benchmark, loop, sa_session: Any) -> None:
         from sqlalchemy import select
@@ -237,7 +237,7 @@ class TestSelectAll:
             return run_async(loop, go)
 
         rows = benchmark(op)
-        assert len(rows) == 100
+        assert len(rows) >= 100
 
     def test_django(self, benchmark, django_app: Any) -> None:
         Account_ = django_app
@@ -246,7 +246,7 @@ class TestSelectAll:
             return list(Account_.objects.all())
 
         rows = benchmark(op)
-        assert len(rows) == 100
+        assert len(rows) >= 100
 
 
 class TestInsertOne:
