@@ -265,3 +265,65 @@ class TestForeignKey:
     def test_foreign_keys_empty_when_none(self):
         meta = TableMeta(Account)
         assert meta.foreign_keys == []
+
+
+# Module-level self- and mutually-referential models (B9).  At module scope so
+# `from __future__ import annotations` forward refs resolve at introspection.
+
+
+@dataclasses.dataclass
+class _TreeNode:
+    id: Annotated[int, DBKey]
+    parent_id: Annotated[int | None, cygnet.ForeignKey(_TreeNode)]
+
+
+@dataclasses.dataclass
+class _MutualA:
+    id: Annotated[int, DBKey]
+    b_id: Annotated[int | None, cygnet.ForeignKey(_MutualB)]
+
+
+@dataclasses.dataclass
+class _MutualB:
+    id: Annotated[int, DBKey]
+    a_id: Annotated[int | None, cygnet.ForeignKey(_MutualA)]
+
+
+@dataclasses.dataclass
+class _BadSelfFK:
+    id: Annotated[int, DBKey]
+    parent_id: Annotated[str, cygnet.ForeignKey(_BadSelfFK)]  # str != int PK
+
+
+class TestSelfReferentialFK:
+    """B9: self- and mutually-referential FK models must introspect without
+    recursing.  Previously `TableMeta.__new__` cached the half-built instance
+    and the reentrant `TableMeta(target)` lookup re-entered `__init__` (the
+    `_initialised` guard is set only after introspection), recursing forever."""
+
+    def test_self_referential_fk_introspects(self):
+        meta = TableMeta(_TreeNode)
+        assert meta.pk is not None
+        assert meta.pk.attr_name == "id"
+        fk = next(f for f in meta.fields if f.attr_name == "parent_id")
+        assert fk.foreign_key is not None
+        assert fk.foreign_key.target is _TreeNode
+
+    def test_mutually_referential_fk_introspects(self):
+        meta_a = TableMeta(_MutualA)
+        meta_b = TableMeta(_MutualB)
+        assert meta_a.pk is not None
+        assert meta_b.pk is not None
+        fk_a = next(f for f in meta_a.fields if f.attr_name == "b_id")
+        assert fk_a.foreign_key is not None
+        assert fk_a.foreign_key.target is _MutualB
+
+    def test_self_fk_type_mismatch_raises_and_evicts(self):
+        """B9 + S26: a self-referential FK that fails pass-2 type validation
+        (after _initialised is set) must still raise AND leave no half-built
+        entry in the cache."""
+        from cygnet.meta import _cache
+
+        with pytest.raises(TypeError, match="type mismatch"):
+            TableMeta(_BadSelfFK)
+        assert _BadSelfFK not in _cache

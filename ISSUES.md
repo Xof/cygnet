@@ -26,6 +26,15 @@ findings below:
 
 Each entry below cross-references its source review in `[brackets]`.
 
+A third fresh-eyes round landed 2026-06-21
+(`docs/reviews/review-20260621-064726.md`, 5 executive findings + 4 open
+questions). It is the first round to surface **live correctness bugs** that
+survived every prior pass. Its findings are the **OPEN** (un-struck) entries
+below, tagged `[2026-06-21-deepdive]`, and are prioritised in the
+**Triage (2026-06-21)** section at the foot of this file. All ~40 items from
+the earlier rounds were re-verified during that review and remain correctly
+fixed — no regressions.
+
 ---
 
 ## Decisions (preserved)
@@ -120,6 +129,99 @@ documented divergence — see **B3** below.
 
 ## Open issues — bugs
 
+### ~~B6. `== None` / `!= None` render as `= $N` / `!= $N` bound to NULL~~  *[2026-06-21-deepdive #1] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21 (OQ7):** `Predicate.render_sql` rewrites a `None` right
+operand (with a renderable left) to `IS NULL` / `IS NOT NULL` — covering
+`col == None`, the reflected `None == col`, and `op(col, "=", None)`; a literal
+`None` on the *left* stays a normal compare. Tests:
+`tests/test_predicate.py::TestNullComparison`; README documents the behaviour.
+Original report below.
+
+`ColumnProxy.__eq__` / `Predicate.__eq__` build `Predicate(self, "=", other)`
+eagerly, and `_render_operand` (`predicate.py:173-177`) treats `None` as a
+plain value: `params.append(None); return "$N"`. So `T.col == None` emits
+`col = $1` bound to `NULL`, which evaluates to `NULL` (never `TRUE`) — the
+query matches **zero rows**; `!= None` excludes every row. `is_null()` /
+`is_not_null()` are the intended path, but nothing rewrites, warns, or
+documents the trap. The dangerous case is `T.col == var` where `var` is `None`
+at runtime — a literal `== None` is caught by linters' E711, a runtime `None`
+is not. Silent wrong results, no error. **See OQ7.**
+
+*Fix direction:* in `__eq__`/`__ne__`, when `other is None`, emit `IS NULL` /
+`IS NOT NULL` (SQLAlchemy/Django behaviour); or raise at construction; at
+minimum add a `## Gotchas` entry.
+
+### ~~B7. Set-op operands leak ORDER BY / LIMIT / OFFSET / FOR UPDATE into the compound~~  *[2026-06-21-deepdive #2] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21 (OQ8):** the executor now wraps each set-op operand in
+parentheses (`{op_kw} ({other_sql})`), so an operand's own ORDER BY / LIMIT /
+OFFSET binds to that operand; the left builder stays unparenthesised as the
+compound-level clause. Also fixes nested-operand grouping
+(`z INTERSECT (x UNION y)`). Tests: `tests/test_set_ops.py` (parenthesised
+operand, operand-with-ORDER-BY, nested grouping). Original report below.
+
+The set-op builder methods (`builders.py:540-563`) only
+`self._set_ops.append((keyword, other))`; the executor renders the operand
+through the full pipeline and splices it unparenthesised
+(`executor.py:366-368`). `_render_select` unconditionally emits the operand's
+own `_order` / `_limit` / `_offset` / `_lock`, so
+`A.UNION(B.ORDER_BY(B.x).LIMIT(5))` produces `… UNION SELECT … ORDER BY x
+LIMIT 5` (binds to the whole compound, not B); a left-side ORDER BY then yields
+a duplicate trailing ORDER BY → syntax error, and an operand `FOR UPDATE`
+inside a set op is a hard PG error. The builder docstring (`builders.py:536-538`)
+documents the very contract this violates. `$N` threading itself is correct.
+**See OQ8.**
+
+*Fix direction:* reject operands carrying `_order`/`_limit`/`_offset`/`_lock`,
+or render operand bodies only (and/or parenthesise operands).
+
+### B8. `transaction.__aexit__` masks the original exception on ROLLBACK failure  *[2026-06-21-deepdive #3] — OPEN*
+
+The outermost exit (`__init__.py:494-501`) wraps `ROLLBACK`/`COMMIT` in
+`try/finally`; the `finally` resets the flags but does nothing for the in-flight
+exception. When the body raised and the `ROLLBACK` *also* raises (dropped
+connection, server-aborted txn), that new exception propagates out of
+`__aexit__` and replaces the user's original `exc_val` — with no `raise … from
+exc_val`, the real error and traceback are lost. The nested-savepoint branch
+(`:481-484`) has the same exposure (and see S33).
+
+*Fix direction:* wrap the ROLLBACK in its own `try/except` and chain
+(`raise … from exc_val`) or swallow/log so the original re-raises naturally.
+
+### ~~B9. Any self-referential FK crashes introspection with RecursionError~~  *[2026-06-21-deepdive #5; mechanism corrected by 2026-06-21 triage repro] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21 (OQ10, option b):** introspection is now two-pass —
+`_introspect_fields` builds fields + PK, `_initialised` flips, then
+`_validate_foreign_keys` validates targets. A self-/mutually-/N-cyclically-
+referential FK's `TableMeta(target)` lookup hits the `_initialised` guard and
+returns the PK-bearing instance instead of recursing. Pass-2 failures still
+evict the cache entry (S26 invariant preserved). Tests:
+`tests/test_meta.py::TestSelfReferentialFK` (self, mutual, type-mismatch-evicts).
+Original report below.
+
+`TableMeta.__new__` (`meta.py:82-83`) caches the half-built instance *before*
+`_introspect` runs, and the `_initialised` guard is set only at `:120` (after
+`_introspect` returns). So when `_introspect` reaches a self-referential FK
+(`target is self.cls`) and calls `TableMeta(self.cls)` at `:207`, `__new__`
+returns the same half-built instance and `__init__` re-enters *without* the
+guard short-circuiting — it re-runs the whole body, re-introspects, hits the
+self-FK again, and recurses → **`RecursionError`** at `Table()` time. Confirmed
+by repro for **both** PK-first and FK-first field ordering, so any
+self-referential model (trees, threaded comments, category parents) cannot be
+introspected at all.
+
+> Supersedes the original diagnosis (a misleading `TypeError` at `:208` gated on
+> FK-before-PK ordering). The repro disproved both halves: the crash is a
+> `RecursionError` that *precedes* `:208`, and it is order-independent. So
+> "defer the `:208` PK check" does **not** fix it — the reentrancy must be
+> broken. **See OQ10.**
+
+*Fix direction:* break the reentrancy — short-circuit the `TableMeta(target)`
+call when `target is self.cls` (eliding the self-FK's PK/type check, since
+`self.pk` is mid-construction), or set the `_initialised`/a sentinel guard
+before `_introspect` runs.
+
 ### ~~B1. `PsycopgDB.column_defaults` lookup ignores schema~~  *[2026-05-22-deepdive #1] — CLOSED 2026-05-22*
 
 Fixed by switching the query from `information_schema.columns` (no
@@ -211,6 +313,141 @@ non-editable portion of the dep tree.
 ---
 
 ## Open issues — smells
+
+### S30. Bulk INSERT assigns PKs assuming RETURNING order == VALUES order  *[2026-06-21-deepdive design] — OPEN*
+
+`run_insert`'s bulk path (`executor.py:856-863`) does `zip(b._bulk_objs, rows)`
+to stamp PKs positionally. PostgreSQL does not document that multi-row
+`VALUES … RETURNING` returns rows in VALUES order; `strict=True` catches a
+count mismatch, not a reordering. Latent, not a present-day bug. **See OQ9.**
+
+*Fix direction:* document the assumption (pragmatic), or correlate rows
+explicitly.
+
+### S31. Outer-join miss-detection heuristic can misfire on a nullable PK  *[2026-06-21-deepdive correctness] — OPEN*
+
+`_object_or_none_if_miss` (`executor.py:418-425`) treats `PK column is NULL` as
+an outer-join miss. Holds for a base-table NOT NULL PK, but a CTE/derived "PK"
+or a FULL JOIN matched row with a genuine NULL there is indistinguishable from a
+miss. The docstring states the assumption as universal.
+
+*Fix direction:* acceptable as a documented heuristic; if precision matters,
+only treat all-columns-NULL as a miss when the PK column is itself nullable.
+
+### S32. `PsycopgDB.stream()` server-side cursor relies on async-generator finalization  *[2026-06-21-deepdive resources] — OPEN*
+
+`stream()` (`psycopg_db.py:116-129`) is an async generator holding an open
+portal inside `async with`. A consumer that `break`s early and never
+`aclose()`s leaves cleanup to `aclose()` / loop `shutdown_asyncgens()`; plain GC
+of an async generator can't run async cleanup, so the portal can linger.
+Mitigated in practice by the `cygnet.transaction(db)` wrapper.
+
+*Fix direction:* document `contextlib.aclosing(...)` for early-break consumers,
+or have the builder own the cursor lifecycle.
+
+### S33. Nested `ROLLBACK TO SAVEPOINT` never paired with `RELEASE`  *[2026-06-21-deepdive exception] — OPEN*
+
+`transaction.__aexit__`'s error path (`__init__.py:482`) issues `ROLLBACK TO
+SAVEPOINT` but no `RELEASE SAVEPOINT`. In PG the savepoint stays defined; if the
+outer code catches the inner exception and continues, savepoints accumulate on
+the stack for the rest of the outer transaction. Usually benign (the outer
+COMMIT/ROLLBACK discards it). Paired with B8's masking exposure.
+
+*Fix direction:* `RELEASE SAVEPOINT` after `ROLLBACK TO SAVEPOINT`.
+
+### S34. `RecursiveCTE.anchor` / `.step` are unchecked public mutables  *[2026-06-21-deepdive mutability] — OPEN*
+
+`cte.py:228-229` exposes `anchor`/`step` as `Any`, validated only at render time
+(None-check). Assigning a non-SelectBuilder (raw string, plain CTE) surfaces as
+an `AttributeError` deep in the executor rather than at the assignment site —
+unlike `exists()`/`JOIN_LATERAL`, which isinstance-check at construction.
+
+*Fix direction:* a validating property setter, or accept the documented
+fail-loud-later stance.
+
+### S35. `ON CONFLICT` action methods silently clobber a prior action  *[2026-06-21-deepdive API] — OPEN*
+
+`DO_UPDATE`/`DO_NOTHING`/`DO_UPDATE_FROM_EXCLUDED` (`builders.py:814-838`) use
+`dataclasses.replace(spec, action=…)` with no guard that an action was already
+set. `.ON_CONFLICT(c).DO_UPDATE(x=1).DO_NOTHING()` silently downgrades
+update→nothing (leaving stale `set_kwargs`); the reverse flips nothing→update.
+Contrast `_set_lock`'s deliberate second-call rejection (`:466-471`).
+
+*Fix direction:* reject re-setting a non-None action, or document as intentional
+clobber.
+
+### S36. `VALUES()` doesn't guard against an established `_select_source`  *[2026-06-21-deepdive API] — OPEN*
+
+`VALUES` (`builders.py:732-744`) checks only `_bulk_objs`, not `_select_source`,
+while `BULK_VALUES`/`SELECT` guard the other directions. So
+`.SELECT(src).VALUES(obj)` sets `_obj` alongside `_select_source`; the executor
+picks `_select_source` first (`executor.py:583`) and silently drops the VALUES
+object. The four-way mutual exclusion the docstring claims has this one hole.
+
+*Fix direction:* add `if self._select_source is not None: raise` to `VALUES`.
+
+### S37. `FOR_UPDATE(of=…)` accepts tables not present in the query  *[2026-06-21-deepdive design] — OPEN*
+
+`_set_lock` (`builders.py:481-485`) type-checks each `of` entry but never
+verifies it's the FROM table or a joined table. `FOR UPDATE OF not_joined_table`
+is a runtime PG error, surfacing only at execution — inconsistent with the
+client-side rejection applied to `nowait`/`skip_locked`.
+
+*Fix direction:* validate each `of` table against `{FROM} ∪ {joins}` at
+`_set_lock` time, or document the gap.
+
+### S38. `meta.fields.index(meta.pk)` recomputed per row of every outer join  *[2026-06-21-deepdive perf] — OPEN*
+
+`_object_or_none_if_miss` (`executor.py:420`) runs a linear `.index()` over
+`meta.fields` once per joined-table chunk per result row to find a constant
+position — O(rows × fields) avoidable work on the hot mapping path.
+
+*Fix direction:* cache the PK index on `TableMeta` (or hoist before the per-row
+loop) and pass it in.
+
+### S39. High-risk SQL constructs validated only by FakeDB string assertions  *[2026-06-21-deepdive tests] — OPEN*
+
+LATERAL, correlated `EXISTS`/`IN`, set-op `ORDER BY`/`LIMIT` scoping,
+`INTERSECT`/`EXCEPT`, `ON CONFLICT ON CONSTRAINT` / `DO_UPDATE_FROM_EXCLUDED`,
+`UPDATE`/`DELETE … RETURNING`, and row locking are unit-tested only against
+FakeDB's captured SQL string — never executed against real PG. A
+plausible-but-invalid emission passes. This is how B6/B7 ship green (the set-op
+scoping unit test asserts substring order and would pass B7's bug).
+
+*Fix direction:* add one round-trip integration test per construct; the harness
+exists.
+
+### S40. Comparison bench `== 100` assertion depends on class-definition order  *[2026-06-21-deepdive tests] — OPEN*
+
+`bench/comparison/test_comparison.py:216` asserts `len(rows) == 100`, but the
+insert benchmarks (`:252`/`:296`) mutate the same module-scoped table with no
+re-seed; it works only because pytest runs classes in definition order. A
+reorder or `pytest-randomly` breaks it.
+
+*Fix direction:* assert `>= 100`, or give the insert benches a throwaway table /
+function-scoped re-seed.
+
+### S41. Comparison bench overstates SA/Cygnet INSERT equivalence  *[2026-06-21-deepdive tests] — OPEN*
+
+`bench/comparison/test_comparison.py:268-279`: SA's InsertOne constructs a fresh
+`AsyncSession` and commits inside the timed op; Cygnet reuses a module-scoped
+autocommit connection. The comment calls these "equivalent," but SA pays
+session-construction + explicit-commit cost Cygnet doesn't. The pool clamp is
+fair; only the comment overstates.
+
+*Fix direction:* soften the comment, or hoist session creation out of the timed
+region.
+
+### S42. `bench._summary` is untested and crashes on malformed JSON  *[2026-06-21-deepdive CI] — OPEN*
+
+`bench/_summary.py:23` does unguarded `data["benchmarks"]` (KeyError on a JSON
+missing the key) and `1 / median` (latent ZeroDivisionError); its sibling
+`bench._compare` is well-tested. Runs in CI to populate `$GITHUB_STEP_SUMMARY`.
+Real risk is low (a genuine pytest-benchmark JSON always has the key and
+non-zero medians), but the asymmetry with the tested sibling is the smell.
+
+*Fix direction:* add a `render` test (incl. missing/empty-`benchmarks`), guard
+the key access.
 
 ### ~~S1. `$N` → `%s` regex blind to string literals~~  *[2026-04-29 #2] — CLOSED 2026-05-22*
 
@@ -581,6 +818,17 @@ branch covers the unhashable-adapter fallback).
 
 ## Open issues — nits
 
+### N8. `SelectBuilder.stream()` annotated `-> Any`  *[2026-06-21-deepdive typing] — OPEN*
+
+`builders.py:608` returns `Any`, erasing the async-iterator contract the
+docstring promises. Annotate `AsyncIterator[…]`.
+
+### N9. Dead `pytest.warns` statement  *[2026-06-21-deepdive tests] — OPEN*
+
+`tests/test_bench_compare.py:142` has a bare `pytest.warns` attribute access on
+its own line — a no-op with a misleading comment about silencing ruff F401.
+Remove it.
+
 ### ~~N1. `_columns` field assigned without annotation~~  *[2026-04-29 typing] — CLOSED 2026-05-22*
 
 Closed: ``self._columns: tuple[SQLRenderable, ...] = columns`` in
@@ -632,6 +880,30 @@ skip-caching fallback.
 ---
 
 ## Open questions
+
+### ~~OQ7. Should `== None` rewrite to `IS NULL`, or is explicit `is_null()` the intended API?~~  *[2026-06-21-deepdive] — RESOLVED 2026-06-21 (rewrite to IS NULL)*
+
+Resolved: `== None` / `!= None` now rewrite to `IS NULL` / `IS NOT NULL`
+(SQLAlchemy/Django behaviour); `is_null` / `is_not_null` remain as explicit
+equivalents. Closed via **B6**.
+
+### ~~OQ8. Should set ops support per-operand ORDER BY / LIMIT?~~  *[2026-06-21-deepdive] — RESOLVED 2026-06-21 (parenthesise operands)*
+
+Resolved: operands are parenthesised, so `(SELECT … LIMIT 5) UNION (SELECT …
+LIMIT 5)` is supported and an operand's tail clauses scope to it. Closed via
+**B7**.
+
+### OQ9. Is the bulk-INSERT RETURNING-order reliance an accepted assumption?  *[2026-06-21-deepdive] — OPEN*
+
+Drives S30. If yes → a one-line comment at `executor.py:856`; if no → a design
+decision on correlating rows.
+
+### ~~OQ10. How should self-referential FK introspection resolve its own not-yet-built PK?~~  *[2026-06-21-deepdive; reframed by 2026-06-21 triage] — RESOLVED 2026-06-21 (option b: two-pass)*
+
+Resolved in favour of option (b): two-pass introspection (build all fields,
+then validate FKs once `self.pk` exists). Chosen over the (a) short-circuit
+because it preserves self-FK type-matching AND fixes mutual/N-cycle recursion,
+not just direct self-reference. Closed via **B9**.
 
 ### ~~OQ1. Is the `run_save` DEFAULT divergence intentional and permanent?~~  *— RESOLVED 2026-05-22*
 
@@ -709,6 +981,75 @@ between comment and code should be surfaced, not papered over.
 
 ---
 
+## Triage (2026-06-21)
+
+Every 2026-06-21 finding was independently re-verified against the code by a
+separate agent instructed to *refute* it (a 38-agent verify→triage pass), then
+assigned a disposition. **Outcome: all 19 findings held up — none refuted** —
+with one mechanism correction (B9, confirmed by repro) and one scope-narrowing
+(S31). No finding was downgraded to WONTFIX or DEFER.
+
+**Disposition summary:** 3 FIX-NOW · 11 FIX-SOON · 5 DOCUMENT · 0 DEFER · 0 WONTFIX.
+
+### FIX-NOW — correctness; fix before the next release
+
+> **Landed 2026-06-21.** All three (B6, B7, B9) are implemented, tested
+> (TDD, + adversarial review), and CLOSED above; OQ7/OQ8/OQ10 resolved. The
+> FIX-SOON and DOCUMENT tiers below remain open.
+
+| ID | Impact / Likelihood | Effort | Fix |
+|----|--------------------|--------|-----|
+| **B6** `== None` → `= NULL` (silent zero rows) | high / occasional | S | When `other is None`, return IS NULL / IS NOT NULL from `__eq__`/`__ne__` (reuse `is_null`/`is_not_null`). Decide **OQ7** first. |
+| **B7** set-op operand clause leak | high / occasional | S | In each set-op method raise `ValueError` if the operand carries `_order`/`_limit`/`_offset`/`_lock`; add an integration test. Decide **OQ8**. |
+| **B9** self-FK → `RecursionError` | medium / occasional | S | Short-circuit the reentrant `TableMeta(target)` when `target is self.cls`. Loud (crash at `Table()`), but blocks an entire common modelling pattern. |
+
+### FIX-SOON — worth a near-term fix; loud or low-impact
+
+| ID | What | Effort | Fix |
+|----|------|--------|-----|
+| **B8** txn exception masking | S | Wrap ROLLBACK in its own try/except; `raise rollback_err from exc_val`. Pairs with S33. |
+| **S33** savepoint never RELEASEd | S | Emit `RELEASE SAVEPOINT` after `ROLLBACK TO SAVEPOINT`. Pairs with B8. |
+| **S35** ON CONFLICT action clobber | S | Raise if `current.action is not None` (mirror `_set_lock`'s second-call rejection). |
+| **S36** VALUES vs SELECT hole | S | Add `if self._select_source is not None: raise` to `VALUES`. |
+| **S37** `FOR_UPDATE(of=)` unjoined table | S | Validate each `of` table against FROM ∪ joins at render time. |
+| **S38** `pk_idx` linear scan per row | S | Precompute `pk_idx` on `TableMeta`; read it in `_object_or_none_if_miss`. |
+| **S39** integration coverage gap | M | Real-PG roundtrip test per high-risk construct. Pairs with B7. |
+| **S40** bench `==100` order dependency | S | Assert `>= 100`, or function-scope-reseed a read table. |
+| **S42** `bench._summary` untested | S | Test `render()`; use `data.get("benchmarks", [])` + guard the ops divisor. |
+| **N8** `stream()` → `Any` | S | Annotate `AsyncIterator[Any]`. |
+| **N9** dead `pytest.warns` line | S | Delete the line + the now-unused `import pytest`. |
+
+### DOCUMENT — behaviour acceptable; needs a doc/comment, not a code change
+
+| ID | What | Note |
+|----|------|------|
+| **S30** bulk RETURNING order | Comment that bulk PK assignment relies on PG's (stable but undocumented) VALUES-order RETURNING. Resolves **OQ9 → LEAVE**; defer explicit row-correlation. |
+| **S31** miss-detection heuristic | **Scope narrowed:** the CTE example does *not* misfire (CTEs set `pk=None` → all-NULL fallback). Only a base-table model with a genuinely nullable PK column on an outer-join nullable side misfires — atypical. Soften the `executor.py:413-416` docstring. |
+| **S32** `stream()` cursor lifecycle | Document `contextlib.aclosing(...)` for early-break consumers (the `transaction()` wrapper already bounds the server-side portal). |
+| **S34** RecursiveCTE mutables | Document the fail-loud-later contract (or add validating `anchor`/`step` setters — optional). |
+| **S41** bench SA/Cygnet comment | Reword: SA additionally pays per-call `AsyncSession` construction + flush; not a like-for-like single-statement equivalence. |
+
+### Correction — B9 mechanism (verified by repro)
+
+The original review diagnosed a misleading `TypeError` at `meta.py:208`,
+triggered by FK-before-PK field ordering. A repro disproved **both** halves:
+`TableMeta.__new__` caches the half-built instance (`:83`) and `_initialised` is
+set only at `:120`, so the reentrant `TableMeta(self.cls)` at `:207` re-enters
+`__init__` without the guard and recurses — a **`RecursionError`** at `Table()`
+time, for both orderings:
+
+```
+PK-first: RecursionError
+FK-first: RecursionError
+```
+
+The crash precedes `:208`, so deferring the PK check does not help; the fix must
+break the reentrancy. B9 and OQ10 above are rewritten accordingly. This is the
+one place adversarial re-verification changed a finding's substance rather than
+just its priority.
+
+---
+
 *Originally a 2026-04-22 fresh-eyes review at `main` @ `4ef08a2`.
 Consolidated 2026-04-24 with `/comment-run` findings (2026-04-22) and
 the deferred enhancement plan (2026-04-06). Phases 1–8 implemented
@@ -716,4 +1057,7 @@ the deferred enhancement plan (2026-04-06). Phases 1–8 implemented
 2026-04-25. DEFAULT-aware INSERT landed 2026-05-17 in `a2156bf`
 (partial fix for Apr 29 #5). Renamed REVIEW.md → ISSUES.md on
 2026-05-22 and merged findings from review-20260429-175335.md,
-comment-run-20260522.md, and review-20260522-084756.md.*
+comment-run-20260522.md, and review-20260522-084756.md.
+2026-06-21 fresh-eyes deep-dive (`review-20260621-064726.md`) added OPEN items
+B6–B9, S30–S42, N8–N9, and OQ7–OQ10 at `main` @ `15bd2b1`; triaged the same
+day (see the Triage section).*

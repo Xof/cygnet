@@ -140,3 +140,43 @@ class TestSetOps:
         right = cygnet.SELECT(db, CityTable.name).FROM(CityTable)
         result = await left.UNION(right)
         assert result == rows
+
+    async def test_plain_operand_is_parenthesised(self):
+        """B7 / OQ8: operands render wrapped in parens."""
+        db = FakeDB(rows=[])
+        left = cygnet.SELECT(db, AccountTable.name).FROM(AccountTable)
+        right = cygnet.SELECT(db, CityTable.name).FROM(CityTable)
+        await left.UNION(right)
+        assert "UNION (SELECT cities.name FROM cities)" in db.last_sql
+
+    async def test_operand_order_by_limit_scoped_by_parens(self):
+        """B7 / OQ8: an operand's own ORDER BY / LIMIT must sit INSIDE its
+        parentheses so it binds to that operand, not leak into the compound
+        (which silently rebound it to the whole UNION, or duplicated the
+        left's compound-level ORDER BY into a syntax error)."""
+        db = FakeDB(rows=[])
+        left = cygnet.SELECT(db, AccountTable.name).FROM(AccountTable)
+        right = (
+            cygnet.SELECT(db, CityTable.name)
+            .FROM(CityTable)
+            .ORDER_BY(CityTable.name)
+            .LIMIT(5)
+        )
+        await left.UNION(right)
+        assert (
+            "UNION (SELECT cities.name FROM cities ORDER BY cities.name ASC LIMIT 5)"
+        ) in db.last_sql
+
+    async def test_nested_operand_set_op_is_grouped(self):
+        """B7: a set-op used AS an operand keeps its own grouping via the
+        operand parens — `z INTERSECT (x UNION y)`, not the flattened
+        `(z INTERSECT x) UNION y` that PG infers from unparenthesised SQL."""
+        db = FakeDB(rows=[])
+        x = cygnet.SELECT(db, AccountTable.name).FROM(AccountTable)
+        y = cygnet.SELECT(db, CityTable.name).FROM(CityTable)
+        z = cygnet.SELECT(db, AccountTable.email).FROM(AccountTable)
+        await z.INTERSECT(x.UNION(y))
+        assert (
+            "INTERSECT (SELECT accounts.name FROM accounts "
+            "UNION (SELECT cities.name FROM cities))"
+        ) in db.last_sql
