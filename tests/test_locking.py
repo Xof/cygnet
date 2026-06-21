@@ -177,3 +177,38 @@ class TestLockingWithExistingFeatures:
         sql = db.last_sql
         assert "INNER JOIN log_entries" in sql
         assert sql.endswith("FOR UPDATE OF log_entries NOWAIT")
+
+
+class TestLockOfValidation:
+    """S37: FOR_UPDATE/FOR_SHARE OF must name the FROM table or a joined
+    table.  An unrelated table was a runtime PG error surfacing only at
+    execution; reject it client-side, consistent with the nowait/skip_locked
+    guard."""
+
+    async def test_of_unjoined_table_raises(self):
+        db = FakeDB(rows=[])
+        with pytest.raises(ValueError, match="not the FROM table or a joined table"):
+            (
+                cygnet.SELECT(db, AccountTable.name)
+                .FROM(AccountTable)
+                .FOR_UPDATE(of=LogTable)
+            ).sql()
+
+    async def test_of_joined_table_ok(self):
+        db = FakeDB(rows=[])
+        sql, _ = (
+            cygnet.SELECT(db, AccountTable.name, LogTable.message)
+            .FROM(AccountTable)
+            .JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+            .FOR_UPDATE(of=LogTable)
+        ).sql()
+        assert "FOR UPDATE OF log_entries" in sql
+
+    async def test_of_from_table_ok(self):
+        db = FakeDB(rows=[])
+        sql, _ = (
+            cygnet.SELECT(db, AccountTable.name)
+            .FROM(AccountTable)
+            .FOR_UPDATE(of=AccountTable)
+        ).sql()
+        assert "FOR UPDATE OF accounts" in sql

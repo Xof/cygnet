@@ -1650,3 +1650,16 @@ class TestFollowSQL:
         acc = Account(id=1, name="Fred", email="fred@example.com")
         with pytest.raises(TypeError, match="Expected Order"):
             await cygnet.follow(db, acc, OrderTable.customer_id)
+
+
+class TestInsertValueSourceExclusion:
+    """S36: VALUES guards against a previously-set SELECT source, completing
+    the four-way mutual exclusion among VALUES / kwargs / BULK_VALUES /
+    INSERT…SELECT (SELECT and BULK_VALUES already guarded their directions)."""
+
+    async def test_select_then_values_raises(self):
+        db = FakeDB(rows=[(1,)])
+        source = cygnet.SELECT(db, AccountTable.name).FROM(AccountTable)
+        b = cygnet.INSERT(db).INTO(AccountTable).SELECT(source)
+        with pytest.raises(ValueError, match="cannot combine VALUES with SELECT"):
+            b.VALUES(Account(id=None, name="Fred", email="f@x.com"))

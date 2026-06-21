@@ -405,6 +405,27 @@ class Executor:
         # params list is threaded for protocol uniformity even though
         # locking takes no parameters.
         if b._lock is not None:
+            # S37: FOR UPDATE OF <table> must name the FROM table or a joined
+            # table.  PG raises "relation ... in FOR UPDATE is not found in the
+            # FROM clause" otherwise, and only at execution — reject it here for
+            # a clear error, consistent with the client-side nowait/skip_locked
+            # guard.  Match on _sql_name (the alias if aliased, else the table
+            # name) — the same reference name OF and column refs emit.
+            if b._lock.of:
+                in_scope: set[str] = set()
+                if b._table is not None:
+                    in_scope.add(b._table._sql_name)
+                for _kind, jt, _on in b._joins:
+                    name = getattr(jt, "_sql_name", None) or getattr(jt, "_name", None)
+                    if name is not None:
+                        in_scope.add(name)
+                for t in b._lock.of:
+                    if t._sql_name not in in_scope:
+                        raise ValueError(
+                            f"FOR_UPDATE/FOR_SHARE OF references {t._sql_name!r}, "
+                            f"which is not the FROM table or a joined table in "
+                            f"this query"
+                        )
             sql += " " + b._lock.render_sql(params)
 
         return sql
@@ -425,7 +446,10 @@ class Executor:
         """
         if can_miss:
             if meta.pk is not None:
-                pk_idx = meta.fields.index(meta.pk)
+                # S38: meta.pk_idx is precomputed at introspection time — this
+                # was an O(len(fields)) .index() scan per joined-table chunk
+                # per result row on the hot mapping path.
+                pk_idx = meta.pk_idx
                 if chunk[pk_idx] is None:
                     return None
             elif all(v is None for v in chunk):

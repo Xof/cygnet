@@ -122,6 +122,12 @@ class TestTableMeta:
     def test_cache_returns_same_instance(self):
         assert TableMeta(Account) is TableMeta(Account)
 
+    def test_pk_idx_matches_field_position(self):
+        """S38: TableMeta caches the PK's index so outer-join miss-detection
+        reads meta.pk_idx instead of re-scanning meta.fields per row."""
+        meta = TableMeta(Account)
+        assert meta.pk_idx == meta.fields.index(meta.pk)
+
     def test_cache_independent_per_class(self):
         assert TableMeta(Account) is not TableMeta(Event)
 
