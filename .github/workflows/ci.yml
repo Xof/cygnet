@@ -1,0 +1,311 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly audit run (S17).  Monday 04:00 UTC is a low-contention slot
+  # — post-weekend, before East-Coast business hours — so CVE findings
+  # land in inboxes before any reviewer is on shift.  The audit job
+  # runs on this trigger; the other jobs are gated below with
+  # `if: github.event_name != 'schedule'` so the cron doesn't burn CI
+  # minutes re-running unit / integration / build / bench against
+  # unchanged code.
+  schedule:
+    - cron: "0 4 * * 1"
+
+# Opt every JS-based action into Node 24 ahead of the September 2026
+# Node 20 removal.  GitHub honours this env var on the runner and
+# applies it to actions/checkout, actions/setup-python, codecov, etc.
+# without us needing to bump each action's major version individually.
+# Once the actions ship Node-24-native versions, this can come out.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+
+  # ── Unit tests (no database) ──────────────────────────────────────────────
+
+  unit:
+    name: Unit tests — Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    # Skip on the weekly schedule (audit-only trigger — see top-level
+    # `on:`).  Code hasn't changed since the last push, so re-running
+    # unit tests would be pure CI cost.
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # OQ3 migration: uv is now canonical (justfile + ci.yml both run
+      # through it).  setup-uv@v6 installs uv, installs the matrix
+      # Python via uv, and caches the global uv download cache keyed on
+      # uv.lock so re-runs against unchanged deps are near-instant.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install dependencies
+        # --locked: fail loudly if uv.lock drifted from pyproject.toml
+        # (CI should never silently resolve a different graph than what
+        # was committed).  --extra dev pulls in pytest / ruff / mypy /
+        # psycopg.
+        run: uv sync --locked --extra dev
+
+      - name: Format check
+        run: uv run ruff format --check cygnet tests
+
+      - name: Lint
+        run: uv run ruff check cygnet tests
+
+      - name: Type check
+        run: uv run mypy cygnet
+
+      - name: Unit tests
+        run: |
+          uv run pytest tests/ --ignore=tests/integration \
+            -v \
+            --cov=cygnet \
+            --cov-report=xml \
+            --cov-report=term-missing
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.12'
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # ── Integration tests (live PostgreSQL via Docker service) ────────────────
+
+  integration:
+    name: Integration tests — PG ${{ matrix.pg-version }}
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        pg-version: ["14", "15", "16", "17", "18"]
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg-version }}-alpine
+        env:
+          POSTGRES_USER: cygnet
+          POSTGRES_PASSWORD: cygnet
+          POSTGRES_DB: cygnet_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cygnet"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Integration tests
+        env:
+          CYGNET_TEST_DSN: postgresql://cygnet:cygnet@localhost:5432/cygnet_test
+        run: |
+          uv run pytest tests/integration \
+            -v \
+            -m integration \
+            --cov=cygnet \
+            --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: matrix.pg-version == '16'
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # ── Build check ───────────────────────────────────────────────────────────
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+    if: github.event_name != 'schedule'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # `uvx --from hatch hatch build` runs hatch in an ephemeral
+      # isolated environment — no need to install hatch into the
+      # project venv (the build job doesn't need the project's deps).
+      - name: Build wheel and sdist
+        run: uvx --from hatch hatch build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # ── Dependency audit ──────────────────────────────────────────────────────
+  # pip-audit scans installed dependencies (psycopg[binary] and dev tools)
+  # against the PyPI Advisory Database.  Runs on every push/PR so a CVE
+  # surface is caught before release.  Non-blocking exit so an advisory
+  # doesn't immediately wedge unrelated PRs — review the job log instead.
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        # pip-audit scans the project venv, so it needs to be installed
+        # alongside the project deps (not via uvx, which would isolate
+        # it from what we want to audit).
+        run: |
+          uv sync --locked --extra dev
+          uv pip install pip-audit
+
+      - name: Run pip-audit
+        # --skip-editable skips the local cygnet-orm editable install (it
+        # isn't on PyPI, so it can't be audited).  Without --strict the
+        # skipped editable is a notice rather than a hard failure, so the
+        # job exits non-zero ONLY when pip-audit actually finds a CVE in
+        # a dep — which is the point.  The previous `--strict || true`
+        # combo was contradictory: --strict failed on the editable skip,
+        # and `|| true` swallowed both that AND any real CVE.
+        run: uv run pip-audit --skip-editable
+
+  # ── Benchmarks (advisory) ─────────────────────────────────────────────────
+  # Runs the perf suite against a fresh PG instance and uploads the
+  # JSON output as an artifact.  Advisory-only: a regression doesn't
+  # block merge — the artifact (and the in-job summary table) are the
+  # signal.  PR comparisons against main's baseline are a separate
+  # follow-up; today the artifact is the source of truth.
+
+  bench:
+    name: Benchmarks (advisory)
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+    if: github.event_name != 'schedule'
+    # Job continues even if benchmarks regress or hit a transient
+    # variance issue; the artifact upload still happens via if: always().
+    continue-on-error: true
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cygnet
+          POSTGRES_PASSWORD: cygnet
+          POSTGRES_DB: cygnet_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cygnet"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev --extra bench
+
+      - name: Run benchmarks
+        env:
+          CYGNET_TEST_DSN: postgresql://cygnet:cygnet@localhost:5432/cygnet_test
+        run: |
+          uv run pytest bench/ \
+            --benchmark-only \
+            --benchmark-json=bench-result.json \
+            --benchmark-columns=median,min,max,iqr,ops \
+            --benchmark-sort=name
+
+      - name: Summary table in job output
+        if: always()
+        run: |
+          if [ -f bench-result.json ]; then
+            echo "## Benchmark results" >> $GITHUB_STEP_SUMMARY
+            uv run python -m bench._summary bench-result.json >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ── PR-only: pull main's last bench artifact and diff ──────────────
+      # On pull_request events, fetch the most recent successful main-branch
+      # bench-results artifact and emit a per-benchmark delta against the
+      # current run.  Graceful when the baseline is missing (first PR after
+      # a fresh repo, retention expired, etc.) — the `|| true` guarantees
+      # the step doesn't fail the job, in keeping with the advisory-only
+      # contract.
+
+      - name: Download main baseline (PR only)
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh run list \
+            --branch main \
+            --workflow CI \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId' || echo "")
+          if [ -n "$LATEST" ]; then
+            mkdir -p baseline
+            gh run download "$LATEST" --name bench-results --dir baseline \
+              --repo "${{ github.repository }}" \
+              || echo "no baseline artifact found"
+          fi
+
+      - name: Compare against baseline (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          if [ -f baseline/bench-result.json ] && [ -f bench-result.json ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## Δ vs main baseline" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            uv run python -m bench._compare \
+              baseline/bench-result.json \
+              bench-result.json \
+              >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "_Bold deltas indicate >15% slower than baseline; CI runner noise typically falls within ±10%._" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No main baseline available for comparison (first run, expired artifact, or upstream missing)._" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload benchmark JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-result.json

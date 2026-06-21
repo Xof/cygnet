@@ -1,0 +1,55 @@
+name: Publish to PyPI
+
+# Trusted publishing (OIDC): no API token is stored anywhere. The job mints a
+# short-lived OIDC identity token that PyPI exchanges for a one-shot upload
+# credential, and PEP 740 Sigstore attestations linking the artifacts to this
+# exact workflow run are generated automatically.
+#
+# Publishing a GitHub Release is the deliberate human gate on an irreversible
+# step: PyPI is append-only, so a given name==version (cygnet-orm==1.0.0) can
+# never be re-uploaded or replaced — only yanked. Creating the release is the
+# trigger; nothing publishes on a plain push.
+on:
+  release:
+    types: [published]
+
+# Match ci.yml: opt JS-based actions into Node 24 ahead of the Node 20 removal.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+
+    # The `pypi` environment must match the one named in the PyPI pending
+    # publisher. Scoping the job to an environment also lets you add required
+    # reviewers / branch rules to gate the publish in repo settings.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/cygnet-orm
+
+    permissions:
+      # REQUIRED for trusted publishing — lets the job request the OIDC token.
+      # Without it there is no credential to exchange and the upload fails.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # Build with the project's own backend (hatchling) via uv, so the release
+      # artifacts are produced exactly like `uv build` locally and the CI build
+      # job — sdist + wheel into dist/.
+      - name: Build sdist + wheel
+        run: uv build
+
+      # The blessed PyPA action consumes dist/ and uploads via trusted
+      # publishing. No `with: password:` — the OIDC token is the credential,
+      # and attestations are on by default.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

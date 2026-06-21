@@ -1,0 +1,98 @@
+[build-system]
+# hatchling >= 1.27 emits core-metadata 2.4 (PEP 639) by default — the SPDX
+# `license` expression and `license-files` glob list used below. (1.26 first
+# understood them; 1.27 made 2.4 the default output.) Pin the floor so a stale
+# cached hatchling can't silently downgrade the metadata or reject the form.
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cygnet-orm"
+version = "1.0.0"
+description = "The littlest ORM — bring your own objects, write real SQL"
+authors = [{ name = "Christophe Pettus", email = "christophe.pettus@pgexperts.com" }]
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["postgresql", "orm", "database", "asyncio"]
+# No "License :: OSI Approved ::" classifier here on purpose: with the SPDX
+# `license` expression above, hatchling errors if a license classifier is also
+# present (PEP 639 bars tools from emitting both). The expression is canonical.
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Framework :: AsyncIO",
+]
+# Cygnet itself is driver-agnostic: the `db` object is duck-typed (see
+# the protocol in README.md / cygnet/psycopg_db.py).  psycopg is only
+# needed if you use the bundled reference adapter — install with the
+# [psycopg] extra below.  Bring-your-own-adapter installs stay
+# psycopg-free.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Xof/cygnet"
+Source = "https://github.com/Xof/cygnet"
+Issues = "https://github.com/Xof/cygnet/issues"
+
+[project.optional-dependencies]
+# Reference adapter dependency.  `pip install cygnet-orm[psycopg]` for
+# users who want PsycopgDB out of the box; bare `pip install cygnet-orm`
+# omits it for projects shipping a custom adapter (asyncpg, a wrapper
+# around an HTTP DB gateway, etc.).
+psycopg = [
+    "psycopg[binary]>=3.1",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    # Reference adapter is needed for integration tests + the FakeDB
+    # protocol parity check.  Pinned to the same floor as the [psycopg]
+    # extra; keep these in sync.
+    "psycopg[binary]>=3.1",
+]
+# Optional: micro/macro benchmarks + cross-ORM comparison.  Heavy
+# dependencies (Django, SQLAlchemy) live here so regular `dev` installs
+# stay light.  Install with `pip install -e ".[bench]"` or the
+# `just bootstrap-bench` target.
+bench = [
+    "pytest-benchmark>=4",
+    "django>=5",
+    # `[asyncio]` pulls in greenlet, which SQLAlchemy's async session
+    # needs even though our async path goes through psycopg3 directly.
+    "sqlalchemy[asyncio]>=2.0",
+    # bench/test_e2e.py wraps a real PG connection with PsycopgDB.
+    "psycopg[binary]>=3.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["cygnet"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Default collection scope.  bench/ is intentionally excluded so a bare
+# `pytest` invocation doesn't trigger the benchmark suite — invoke with
+# `pytest bench/` or `just bench` explicitly.
+testpaths = ["tests"]
+markers = [
+    "integration: requires a live PostgreSQL instance (set CYGNET_TEST_DSN)",
+    "bench: micro/macro benchmark; collected only with --benchmark-only",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

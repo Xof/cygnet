@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+*.egg
+
+# Environment
+.env
+
+# Test / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Mypy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Codebase-memory graph artifacts (ADR notes; graph DB lives in central store)
+.codebase-memory/
+
+# Local working artifacts: code-review outputs and superpowers plans/specs.
+# Design rationale worth keeping has been folded into THEORY.md.
+docs/
