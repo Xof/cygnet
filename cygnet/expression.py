@@ -19,7 +19,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, overload, runtime_checkable
 
-from .predicate import Predicate
+from .predicate import Predicate, _InfixOps
 
 
 # The render_sql contract: mutate `params` in place AND return the SQL
@@ -417,8 +417,8 @@ def not_exists(subquery: Any) -> _Exists:
     return _Exists(op="NOT EXISTS", subquery=subquery)
 
 
-@dataclass(frozen=True)
-class FunctionCall:
+@dataclass(frozen=True, eq=False)
+class FunctionCall(_InfixOps):
     """A SQL function call: `NAME(arg1, arg2, ...)`.
 
     Each arg is either a SQLRenderable (rendered in place) or a plain
@@ -450,68 +450,13 @@ class FunctionCall:
                 rendered.append(f"${len(params)}")
         return f"{self.name}({', '.join(rendered)})"
 
-    # Comparison operators mirror ColumnProxy's so a FunctionCall can be
-    # compared directly: cygnet.fn('count')(T.id) > 10  ->  Predicate.
-    def __eq__(self, other: object) -> Predicate:  # type: ignore[override]
-        return Predicate(self, "=", other)
-
-    def __ne__(self, other: object) -> Predicate:  # type: ignore[override]
-        return Predicate(self, "!=", other)
-
-    def __lt__(self, other: object) -> Predicate:
-        return Predicate(self, "<", other)
-
-    def __gt__(self, other: object) -> Predicate:
-        return Predicate(self, ">", other)
-
-    def __le__(self, other: object) -> Predicate:
-        return Predicate(self, "<=", other)
-
-    def __ge__(self, other: object) -> Predicate:
-        return Predicate(self, ">=", other)
-
-    # Arithmetic.  See ColumnProxy / Predicate for full rationale.
-    # The reflected operators (__radd__, __rsub__, …) are not just mirrors:
-    # they swap operand order so that `1 + fn(...)` renders as `$1 + fn(...)`
-    # rather than `fn(...) + $1`.  This matters for non-commutative SQL ops
-    # like `-` and `/`, where preserving Python source order in the rendered
-    # SQL is the only sensible behaviour.
-    def __add__(self, other: object) -> Predicate:
-        return Predicate(self, "+", other)
-
-    def __radd__(self, other: object) -> Predicate:
-        return Predicate(other, "+", self)
-
-    def __sub__(self, other: object) -> Predicate:
-        return Predicate(self, "-", other)
-
-    def __rsub__(self, other: object) -> Predicate:
-        return Predicate(other, "-", self)
-
-    def __mul__(self, other: object) -> Predicate:
-        return Predicate(self, "*", other)
-
-    def __rmul__(self, other: object) -> Predicate:
-        return Predicate(other, "*", self)
-
-    def __truediv__(self, other: object) -> Predicate:
-        return Predicate(self, "/", other)
-
-    def __rtruediv__(self, other: object) -> Predicate:
-        return Predicate(other, "/", self)
-
-    def __mod__(self, other: object) -> Predicate:
-        return Predicate(self, "%", other)
-
-    def __rmod__(self, other: object) -> Predicate:
-        return Predicate(other, "%", self)
-
-    # Frozen dataclasses get an auto __hash__ from their fields, but we
-    # override __eq__ to return a Predicate (not a bool), so the auto-hash
-    # would be inconsistent with equality semantics.  Setting it to None
-    # makes FunctionCall explicitly unhashable, the same dodge ColumnProxy
-    # uses.  See proxy.ColumnProxy.__hash__ for full rationale.
-    __hash__ = None  # type: ignore[assignment]
+    # Comparison + arithmetic operators and __hash__ = None come from the
+    # shared _InfixOps mixin (see predicate.py).  eq=False on the dataclass is
+    # load-bearing: it stops @dataclass generating a field-based __eq__ that
+    # would shadow the mixin's Predicate-returning one, and (with eq false)
+    # leaves the mixin's __hash__ = None in force so FunctionCall stays
+    # unhashable.  The logical connectives below stay local — a bare function
+    # call gets them too, but __invert__ can reference PrefixOp directly here.
 
     def __and__(self, other: Any) -> Predicate:
         return Predicate(self, "AND", other)
@@ -606,8 +551,8 @@ class WindowSpec:
         return f"OVER ({inside})" if inside else "OVER ()"
 
 
-@dataclass(frozen=True)
-class WindowExpression:
+@dataclass(frozen=True, eq=False)
+class WindowExpression(_InfixOps):
     """`func(...) OVER (...)`: a function call with a window spec.
 
     Implements the SQLRenderable protocol and the same comparison /
@@ -628,59 +573,9 @@ class WindowExpression:
         spec_sql = self.spec.render_sql(params)
         return f"{fn_sql} {spec_sql}"
 
-    # Same operator menu as FunctionCall, so window expressions chain
-    # into comparisons / & / | / ~ / ORDER_BY exactly the same way.
-    def __eq__(self, other: object) -> Predicate:  # type: ignore[override]
-        return Predicate(self, "=", other)
-
-    def __ne__(self, other: object) -> Predicate:  # type: ignore[override]
-        return Predicate(self, "!=", other)
-
-    def __lt__(self, other: object) -> Predicate:
-        return Predicate(self, "<", other)
-
-    def __gt__(self, other: object) -> Predicate:
-        return Predicate(self, ">", other)
-
-    def __le__(self, other: object) -> Predicate:
-        return Predicate(self, "<=", other)
-
-    def __ge__(self, other: object) -> Predicate:
-        return Predicate(self, ">=", other)
-
-    # Arithmetic — same rationale as ColumnProxy / FunctionCall.  A
-    # window expression is a value-producing infix operand.
-    def __add__(self, other: object) -> Predicate:
-        return Predicate(self, "+", other)
-
-    def __radd__(self, other: object) -> Predicate:
-        return Predicate(other, "+", self)
-
-    def __sub__(self, other: object) -> Predicate:
-        return Predicate(self, "-", other)
-
-    def __rsub__(self, other: object) -> Predicate:
-        return Predicate(other, "-", self)
-
-    def __mul__(self, other: object) -> Predicate:
-        return Predicate(self, "*", other)
-
-    def __rmul__(self, other: object) -> Predicate:
-        return Predicate(other, "*", self)
-
-    def __truediv__(self, other: object) -> Predicate:
-        return Predicate(self, "/", other)
-
-    def __rtruediv__(self, other: object) -> Predicate:
-        return Predicate(other, "/", self)
-
-    def __mod__(self, other: object) -> Predicate:
-        return Predicate(self, "%", other)
-
-    def __rmod__(self, other: object) -> Predicate:
-        return Predicate(other, "%", self)
-
-    __hash__ = None  # type: ignore[assignment]
+    # Comparison + arithmetic operators and __hash__ = None come from the
+    # shared _InfixOps mixin (see predicate.py); eq=False keeps that
+    # __eq__/__hash__ rather than letting @dataclass generate field-based ones.
 
     def __and__(self, other: Any) -> Predicate:
         return Predicate(self, "AND", other)

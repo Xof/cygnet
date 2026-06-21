@@ -31,8 +31,87 @@ if TYPE_CHECKING:
     from .expression import PrefixOp
 
 
+class _InfixOps:
+    """Shared comparison + arithmetic operator menu for the SQL-expression
+    types (``ColumnProxy``, ``Predicate``, ``FunctionCall``,
+    ``WindowExpression``).  Each operator builds a ``Predicate`` AST node
+    instead of evaluating to a Python value — the trick that lets
+    ``T.col == val`` read like SQL.
+
+    Consequences every inheritor shares:
+      - an expression is never usable in a boolean context: ``if T.col == v``
+        is always truthy (a Predicate is a non-empty object);
+      - chained comparisons ``0 < T.col < 10`` do NOT work — Python ``and``-joins
+        them and short-circuits.  Use ``(T.col > 0) & (T.col < 10)``.
+    The reflected arithmetic ops (``__radd__`` …) swap operand order so
+    ``1 + c.n`` renders ``$1 + c.n``, preserving source order for the
+    non-commutative ``-`` / ``/``.
+
+    ``__hash__`` is None: since ``__eq__`` returns a Predicate (not a bool), an
+    auto-hash would be inconsistent with equality, so every inheritor is
+    explicitly unhashable — a proxy in a set / dict fails loud instead of
+    comparing nonsensically.  The frozen dataclasses that inherit this set
+    ``eq=False`` so this ``__eq__`` is used (not a generated field-eq), which in
+    turn leaves this ``__hash__`` in force.
+
+    ``Predicate`` is referenced by name (resolved at call time from this
+    module's globals); it is defined just below.
+    """
+
+    # __eq__/__ne__ need the override-ignore: object.__eq__/__ne__ return bool.
+    def __eq__(self, other: object) -> Predicate:  # type: ignore[override]
+        return Predicate(self, "=", other)
+
+    def __ne__(self, other: object) -> Predicate:  # type: ignore[override]
+        return Predicate(self, "!=", other)
+
+    def __lt__(self, other: object) -> Predicate:
+        return Predicate(self, "<", other)
+
+    def __gt__(self, other: object) -> Predicate:
+        return Predicate(self, ">", other)
+
+    def __le__(self, other: object) -> Predicate:
+        return Predicate(self, "<=", other)
+
+    def __ge__(self, other: object) -> Predicate:
+        return Predicate(self, ">=", other)
+
+    def __add__(self, other: object) -> Predicate:
+        return Predicate(self, "+", other)
+
+    def __radd__(self, other: object) -> Predicate:
+        return Predicate(other, "+", self)
+
+    def __sub__(self, other: object) -> Predicate:
+        return Predicate(self, "-", other)
+
+    def __rsub__(self, other: object) -> Predicate:
+        return Predicate(other, "-", self)
+
+    def __mul__(self, other: object) -> Predicate:
+        return Predicate(self, "*", other)
+
+    def __rmul__(self, other: object) -> Predicate:
+        return Predicate(other, "*", self)
+
+    def __truediv__(self, other: object) -> Predicate:
+        return Predicate(self, "/", other)
+
+    def __rtruediv__(self, other: object) -> Predicate:
+        return Predicate(other, "/", self)
+
+    def __mod__(self, other: object) -> Predicate:
+        return Predicate(self, "%", other)
+
+    def __rmod__(self, other: object) -> Predicate:
+        return Predicate(other, "%", self)
+
+    __hash__ = None  # type: ignore[assignment]
+
+
 @dataclass(eq=False)
-class Predicate:
+class Predicate(_InfixOps):
     # `left` and `right` are deliberately typed as Any because they are
     # heterogeneous: either SQLRenderable objects (ColumnProxy, Literal,
     # nested Predicate, PrefixOp, SuffixOp) that render themselves, or
@@ -78,65 +157,11 @@ class Predicate:
 
         return PrefixOp(op="NOT", operand=self)
 
-    # Comparison overloads mirror ColumnProxy / FunctionCall: the result
-    # of any infix expression — including non-boolean ones like `data ->>
-    # 'key'` — can be compared against a value to form another Predicate.
-    # This is what makes (jb.get_text(T.data, 'name') == 'Fred') chainable
-    # into WHERE clauses without intermediate variables.
-    def __eq__(self, other: object) -> Predicate:  # type: ignore[override]
-        return Predicate(self, "=", other)
-
-    def __ne__(self, other: object) -> Predicate:  # type: ignore[override]
-        return Predicate(self, "!=", other)
-
-    def __lt__(self, other: object) -> Predicate:
-        return Predicate(self, "<", other)
-
-    def __gt__(self, other: object) -> Predicate:
-        return Predicate(self, ">", other)
-
-    def __le__(self, other: object) -> Predicate:
-        return Predicate(self, "<=", other)
-
-    def __ge__(self, other: object) -> Predicate:
-        return Predicate(self, ">=", other)
-
-    # Arithmetic infix.  Predicate is really "any infix expression",
-    # not just boolean predicates — chaining `(c.n + 1) * 2` is a
-    # common pattern in recursive CTEs and computed SELECT columns.
-    def __add__(self, other: object) -> Predicate:
-        return Predicate(self, "+", other)
-
-    def __radd__(self, other: object) -> Predicate:
-        return Predicate(other, "+", self)
-
-    def __sub__(self, other: object) -> Predicate:
-        return Predicate(self, "-", other)
-
-    def __rsub__(self, other: object) -> Predicate:
-        return Predicate(other, "-", self)
-
-    def __mul__(self, other: object) -> Predicate:
-        return Predicate(self, "*", other)
-
-    def __rmul__(self, other: object) -> Predicate:
-        return Predicate(other, "*", self)
-
-    def __truediv__(self, other: object) -> Predicate:
-        return Predicate(self, "/", other)
-
-    def __rtruediv__(self, other: object) -> Predicate:
-        return Predicate(other, "/", self)
-
-    def __mod__(self, other: object) -> Predicate:
-        return Predicate(self, "%", other)
-
-    def __rmod__(self, other: object) -> Predicate:
-        return Predicate(other, "%", self)
-
-    # Same dodge ColumnProxy uses: __eq__ no longer returns bool, so
-    # the auto-hash would be inconsistent with our equality semantics.
-    __hash__ = None  # type: ignore[assignment]
+    # Comparison + arithmetic operators (and __hash__ = None) come from the
+    # shared _InfixOps mixin above.  The logical connectives (__and__/__or__/
+    # __invert__) stay here: they're specific to predicate composition and
+    # __invert__ needs the lazy PrefixOp import (expression.py imports this
+    # module).
 
     def render_sql(self, params: list[Any]) -> str:
         # Depth-first, left-before-right walk: the left subtree is fully

@@ -23,10 +23,10 @@ from typing import Any
 
 from .expression import FieldLike, TableSourceProtocol
 from .meta import TableMeta
-from .predicate import Predicate
+from .predicate import _InfixOps
 
 
-class ColumnProxy[FT]:
+class ColumnProxy[FT](_InfixOps):
     """A typed reference to one column of a table proxy.
 
     Generic on FT (the column's Python value type), so explicit
@@ -55,79 +55,10 @@ class ColumnProxy[FT]:
         self._table = table
         self._field = field
 
-    # Python normally auto-generates __hash__ from __eq__, but our __eq__
-    # returns a Predicate, not a bool.  Setting __hash__ = None makes
-    # ColumnProxy explicitly unhashable, which prevents subtle bugs if
-    # someone tries to put a proxy in a set or use it as a dict key:
-    # the natural hash-by-identity would silently "work" but compare using
-    # the Predicate-returning __eq__, producing nonsensical lookups.  Fail
-    # loud at insert time instead.
-    __hash__ = None  # type: ignore[assignment]
-
-    # All comparison operators return Predicates, not booleans.  This is the
-    # core trick that lets `T.col == val` read like SQL: the overload
-    # hijacks Python's comparison semantics to build an AST node instead of
-    # evaluating to True/False.  Consequence: you can never use a ColumnProxy
-    # in a boolean context (if T.col == val: ...) — it will always be truthy
-    # because Predicate is a non-empty object.  Likewise, chained comparisons
-    # `0 < T.col < 10` do NOT do what they look like: Python evaluates them as
-    # `(0 < T.col) and (T.col < 10)` and the `and` short-circuits on the
-    # first (truthy) Predicate, returning only the second comparison.  Use
-    # `(T.col > 0) & (T.col < 10)` instead.
-    # The # type: ignore[override] suppressions are needed because the
-    # signatures don't match object.__eq__'s return type (bool).
-    def __eq__(self, other: object) -> Predicate:  # type: ignore[override]
-        return Predicate(self, "=", other)
-
-    def __ne__(self, other: object) -> Predicate:  # type: ignore[override]
-        return Predicate(self, "!=", other)
-
-    def __lt__(self, other: object) -> Predicate:
-        return Predicate(self, "<", other)
-
-    def __gt__(self, other: object) -> Predicate:
-        return Predicate(self, ">", other)
-
-    def __le__(self, other: object) -> Predicate:
-        return Predicate(self, "<=", other)
-
-    def __ge__(self, other: object) -> Predicate:
-        return Predicate(self, ">=", other)
-
-    # Arithmetic operators return Predicates ("any infix expression"),
-    # which already compose with further comparisons / & / |.  Useful in
-    # SELECT lists, ORDER BY, and recursive CTEs (`c.n + 1`).  R-versions
-    # let plain values appear on the left side: `1 + c.n` works the same
-    # way `c.n + 1` does.
-    def __add__(self, other: object) -> Predicate:
-        return Predicate(self, "+", other)
-
-    def __radd__(self, other: object) -> Predicate:
-        return Predicate(other, "+", self)
-
-    def __sub__(self, other: object) -> Predicate:
-        return Predicate(self, "-", other)
-
-    def __rsub__(self, other: object) -> Predicate:
-        return Predicate(other, "-", self)
-
-    def __mul__(self, other: object) -> Predicate:
-        return Predicate(self, "*", other)
-
-    def __rmul__(self, other: object) -> Predicate:
-        return Predicate(other, "*", self)
-
-    def __truediv__(self, other: object) -> Predicate:
-        return Predicate(self, "/", other)
-
-    def __rtruediv__(self, other: object) -> Predicate:
-        return Predicate(other, "/", self)
-
-    def __mod__(self, other: object) -> Predicate:
-        return Predicate(self, "%", other)
-
-    def __rmod__(self, other: object) -> Predicate:
-        return Predicate(other, "%", self)
+    # Comparison + arithmetic operators and __hash__ = None come from the
+    # shared _InfixOps mixin (see predicate.py).  A bare column carries no
+    # logical connectives (__and__/__or__/__invert__) — it isn't itself a
+    # boolean predicate.
 
     def render_sql(self, params: list[Any]) -> str:
         # Always renders as "table.column" (fully qualified), which avoids
