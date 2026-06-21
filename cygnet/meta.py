@@ -99,6 +99,11 @@ class TableMeta:
         )
         self.fields: list[FieldMeta] = []
         self.pk: FieldMeta | None = None
+        # Position of the PK within self.fields, cached at introspection so the
+        # executor's outer-join miss-detection doesn't re-scan per row (S38).
+        # -1 until a PK is assigned; introspection rejects PK-less models, so a
+        # valid (cached) TableMeta always carries a real index here.
+        self.pk_idx: int = -1
         # __new__ inserts the new instance into _cache BEFORE introspection
         # runs (so a self-referential FK can find it).  Introspection is
         # two-pass (B9, 2026-06-21): pass 1 (_introspect_fields) builds every
@@ -210,6 +215,8 @@ class TableMeta:
             self.fields.append(fm)
             if pk_meta is not None:
                 self.pk = fm
+                # Just appended, so the PK is the last index (S38).
+                self.pk_idx = len(self.fields) - 1
 
         # Enforce "exactly one PK" at introspection time, matching the
         # documented invariant.  Without this, models with zero PKs would

@@ -176,7 +176,13 @@ documents the very contract this violates. `$N` threading itself is correct.
 *Fix direction:* reject operands carrying `_order`/`_limit`/`_offset`/`_lock`,
 or render operand bodies only (and/or parenthesise operands).
 
-### B8. `transaction.__aexit__` masks the original exception on ROLLBACK failure  *[2026-06-21-deepdive #3] — OPEN*
+### ~~B8. `transaction.__aexit__` masks the original exception on ROLLBACK failure~~  *[2026-06-21-deepdive #3] — CLOSED 2026-06-21 (#2)*
+
+**Closed 2026-06-21 (PR #2):** the outermost `ROLLBACK` and the nested
+`ROLLBACK TO SAVEPOINT` each run in their own `try`; on failure
+`raise … from exc_val` chains the original as `__cause__` instead of silently
+replacing it. Flags still reset via the existing `finally`. Tests:
+`tests/test_transaction.py`. Original report below.
 
 The outermost exit (`__init__.py:494-501`) wraps `ROLLBACK`/`COMMIT` in
 `try/finally`; the `finally` resets the flags but does nothing for the in-flight
@@ -345,7 +351,10 @@ Mitigated in practice by the `cygnet.transaction(db)` wrapper.
 *Fix direction:* document `contextlib.aclosing(...)` for early-break consumers,
 or have the builder own the cursor lifecycle.
 
-### S33. Nested `ROLLBACK TO SAVEPOINT` never paired with `RELEASE`  *[2026-06-21-deepdive exception] — OPEN*
+### ~~S33. Nested `ROLLBACK TO SAVEPOINT` never paired with `RELEASE`~~  *[2026-06-21-deepdive exception] — CLOSED 2026-06-21 (#2)*
+
+**Closed 2026-06-21 (PR #2):** the nested error path now issues
+`RELEASE SAVEPOINT` after `ROLLBACK TO SAVEPOINT`. Original report below.
 
 `transaction.__aexit__`'s error path (`__init__.py:482`) issues `ROLLBACK TO
 SAVEPOINT` but no `RELEASE SAVEPOINT`. In PG the savepoint stays defined; if the
@@ -365,7 +374,11 @@ unlike `exists()`/`JOIN_LATERAL`, which isinstance-check at construction.
 *Fix direction:* a validating property setter, or accept the documented
 fail-loud-later stance.
 
-### S35. `ON CONFLICT` action methods silently clobber a prior action  *[2026-06-21-deepdive API] — OPEN*
+### ~~S35. `ON CONFLICT` action methods silently clobber a prior action~~  *[2026-06-21-deepdive API] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21:** `_require_no_action` rejects a second action (mirrors
+`_set_lock`'s second-call rejection), called from all four action methods.
+Tests: `TestOnConflictActionClobber`. Original report below.
 
 `DO_UPDATE`/`DO_NOTHING`/`DO_UPDATE_FROM_EXCLUDED` (`builders.py:814-838`) use
 `dataclasses.replace(spec, action=…)` with no guard that an action was already
@@ -376,7 +389,11 @@ Contrast `_set_lock`'s deliberate second-call rejection (`:466-471`).
 *Fix direction:* reject re-setting a non-None action, or document as intentional
 clobber.
 
-### S36. `VALUES()` doesn't guard against an established `_select_source`  *[2026-06-21-deepdive API] — OPEN*
+### ~~S36. `VALUES()` doesn't guard against an established `_select_source`~~  *[2026-06-21-deepdive API] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21:** `VALUES` now raises if `_select_source` is set,
+completing the four-way value-source mutual exclusion. Test:
+`TestInsertValueSourceExclusion`. Original report below.
 
 `VALUES` (`builders.py:732-744`) checks only `_bulk_objs`, not `_select_source`,
 while `BULK_VALUES`/`SELECT` guard the other directions. So
@@ -386,7 +403,11 @@ object. The four-way mutual exclusion the docstring claims has this one hole.
 
 *Fix direction:* add `if self._select_source is not None: raise` to `VALUES`.
 
-### S37. `FOR_UPDATE(of=…)` accepts tables not present in the query  *[2026-06-21-deepdive design] — OPEN*
+### ~~S37. `FOR_UPDATE(of=…)` accepts tables not present in the query~~  *[2026-06-21-deepdive design] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21:** the executor validates each `of` table against the FROM
+table ∪ joins at render time (matching on `_sql_name`), raising a clear
+`ValueError`. Tests: `TestLockOfValidation`. Original report below.
 
 `_set_lock` (`builders.py:481-485`) type-checks each `of` entry but never
 verifies it's the FROM table or a joined table. `FOR UPDATE OF not_joined_table`
@@ -396,7 +417,11 @@ client-side rejection applied to `nowait`/`skip_locked`.
 *Fix direction:* validate each `of` table against `{FROM} ∪ {joins}` at
 `_set_lock` time, or document the gap.
 
-### S38. `meta.fields.index(meta.pk)` recomputed per row of every outer join  *[2026-06-21-deepdive perf] — OPEN*
+### ~~S38. `meta.fields.index(meta.pk)` recomputed per row of every outer join~~  *[2026-06-21-deepdive perf] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21:** `TableMeta.pk_idx` is precomputed at introspection;
+`_object_or_none_if_miss` reads it instead of `.index()` per row. Test:
+`test_pk_idx_matches_field_position`. Original report below.
 
 `_object_or_none_if_miss` (`executor.py:420`) runs a linear `.index()` over
 `meta.fields` once per joined-table chunk per result row to find a constant
@@ -1004,6 +1029,10 @@ with one mechanism correction (B9, confirmed by repro) and one scope-narrowing
 | **B9** self-FK → `RecursionError` | medium / occasional | S | Short-circuit the reentrant `TableMeta(target)` when `target is self.cls`. Loud (crash at `Table()`), but blocks an entire common modelling pattern. |
 
 ### FIX-SOON — worth a near-term fix; loud or low-impact
+
+> **Landed 2026-06-21.** B8/S33 shipped in PR #2; S35/S36/S37/S38 in the
+> follow-up PR — all CLOSED above. Remaining FIX-SOON: S39 (integration
+> coverage), S40/S42 (bench hygiene), N8/N9 (nits).
 
 | ID | What | Effort | Fix |
 |----|------|--------|-----|

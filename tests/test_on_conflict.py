@@ -225,3 +225,43 @@ class TestOnConflictRuntime:
         )
         assert "ON CONFLICT (id) DO NOTHING" in db.last_sql
         assert "RETURNING" not in db.last_sql
+
+
+class TestOnConflictActionClobber:
+    """S35: re-setting the ON CONFLICT action is rejected, mirroring the
+    second-call rejection on FOR_UPDATE/FOR_SHARE.  Chaining two terminal
+    actions previously clobbered the first silently."""
+
+    async def test_do_update_then_do_nothing_raises(self):
+        b = (
+            cygnet.INSERT(FakeDB(rows=[(1,)]))
+            .INTO(AccountTable)
+            .VALUES(Account(id=None, name="Fred", email="f@x.com"))
+            .ON_CONFLICT(AccountTable.email)
+            .DO_UPDATE(name="x")
+        )
+        with pytest.raises(ValueError, match="action already set"):
+            b.DO_NOTHING()
+
+    async def test_do_nothing_then_do_update_raises(self):
+        b = (
+            cygnet.INSERT(FakeDB(rows=[(1,)]))
+            .INTO(AccountTable)
+            .VALUES(Account(id=None, name="Fred", email="f@x.com"))
+            .ON_CONFLICT_DO_NOTHING()
+        )
+        with pytest.raises(ValueError, match="action already set"):
+            b.DO_UPDATE(name="x")
+
+    async def test_single_action_still_works(self):
+        """Sanity: a single action is fine — the guard fires only on a
+        second one."""
+        db = FakeDB(rows=[(1,)])
+        await (
+            cygnet.INSERT(db)
+            .INTO(AccountTable)
+            .VALUES(Account(id=None, name="Fred", email="f@x.com"))
+            .ON_CONFLICT(AccountTable.email)
+            .DO_NOTHING()
+        )
+        assert "ON CONFLICT (email) DO NOTHING" in db.last_sql

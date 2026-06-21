@@ -739,6 +739,12 @@ class InsertBuilder(_Builder):
             raise ValueError("VALUES accepts either an object or kwargs, not both")
         if self._bulk_objs is not None:
             raise ValueError("INSERT cannot combine VALUES with BULK_VALUES")
+        # S36: complete the four-way mutual exclusion.  BULK_VALUES and SELECT
+        # already guard their directions; without this, .SELECT(src).VALUES(obj)
+        # set _obj alongside _select_source and the executor (which checks
+        # _select_source first) silently dropped the VALUES object.
+        if self._select_source is not None:
+            raise ValueError("INSERT cannot combine VALUES with SELECT")
         self._obj = obj
         self._kwargs = kwargs
         return self
@@ -811,15 +817,31 @@ class InsertBuilder(_Builder):
         self._on_conflict = replace(current, constraint=name)
         return self
 
+    def _require_no_action(self) -> None:
+        # S35: the conflict action is terminal — DO_NOTHING / DO_UPDATE /
+        # DO_UPDATE_FROM_EXCLUDED each set it, and chaining a second one
+        # previously clobbered the first silently (last-call-wins, with the
+        # stale set_kwargs left inert in the spec).  Reject re-setting it,
+        # mirroring _set_lock's deliberate second-call rejection.  ON_CONFLICT
+        # / ON_CONFLICT_CONSTRAINT set only the target, never the action, so
+        # they remain freely chainable before the single action call.
+        if self._on_conflict is not None and self._on_conflict.action is not None:
+            raise ValueError(
+                "ON CONFLICT action already set — DO_NOTHING / DO_UPDATE / "
+                "DO_UPDATE_FROM_EXCLUDED is terminal; chain only one"
+            )
+
     def ON_CONFLICT_DO_NOTHING(self) -> InsertBuilder:  # noqa: N802
         """`ON CONFLICT DO NOTHING` with no target — silently skip any
         conflict on any unique index or exclusion constraint."""
+        self._require_no_action()
         current = self._on_conflict or _OnConflictSpec()
         self._on_conflict = replace(current, action="nothing")
         return self
 
     def DO_NOTHING(self) -> InsertBuilder:  # noqa: N802
         """Pair with a preceding ON_CONFLICT(*cols) or ON_CONFLICT_CONSTRAINT."""
+        self._require_no_action()
         # Chain-time invariant: this is the post-target form, so a
         # preceding ON_CONFLICT or ON_CONFLICT_CONSTRAINT must already be
         # in the spec.  The spec's __post_init__ legitimately allows
@@ -843,6 +865,7 @@ class InsertBuilder(_Builder):
         For "use the value the new row tried to insert" semantics
         (i.e. SET col = EXCLUDED.col), use DO_UPDATE_FROM_EXCLUDED.
         """
+        self._require_no_action()
         # "Not empty" is method-specific input validation; the
         # action+target coherence checks live in _OnConflictSpec.
         if not fields:
@@ -858,6 +881,7 @@ class InsertBuilder(_Builder):
         attempted to add; this mirrors save()'s upsert semantics where
         every non-PK field gets clobbered with the new value.
         """
+        self._require_no_action()
         if not cols:
             raise ValueError("DO_UPDATE_FROM_EXCLUDED requires at least one column")
         current = self._on_conflict or _OnConflictSpec()
