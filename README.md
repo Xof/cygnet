@@ -14,6 +14,14 @@ savepoint-aware transactions, full mypy strictness, and an expression
 protocol that lets `cygnet.op()` / `cygnet.ops()` / `cygnet.lit()`
 extend the query API without touching internals.
 
+## Documentation
+
+This README covers installation and usage. For the internals:
+
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — module map, load-bearing invariants, and landmines. The fast orientation for picking up the code cold.
+- **[THEORY.md](THEORY.md)** — the theory of operation: why Cygnet is built the way it is, the rejected alternatives, and the tradeoffs.
+- **[ISSUES.md](ISSUES.md)** — open issues and deferred features.
+
 ## Installation
 
 ```
@@ -964,11 +972,11 @@ needed. See psycopg3's docs for the full list.
 
 ## Design principles
 
-- SQL keywords are uppercase method names: `.FROM()`, `.WHERE()`, `.JOIN()`.
-- Python utilities are lowercase: `cygnet.get()`, `cygnet.save()`, `cygnet.table()`.
-- No magic. No metaclasses. No implicit queries. You call it, it runs.
-- PostgreSQL-specific features (`RETURNING`, `ON CONFLICT`) are used directly.
-- Bring your own connection and transaction lifecycle.
+No magic — no base class, no metaclass, no implicit queries; you call it, it
+runs. SQL keywords are uppercase methods, Python utilities are lowercase,
+PostgreSQL-specific features are used directly, and you bring your own
+connection and transaction lifecycle. The reasoning behind each of these — and
+the alternatives that were rejected — is in **[THEORY.md](THEORY.md)**.
 
 ## Development
 
