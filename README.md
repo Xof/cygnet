@@ -563,6 +563,11 @@ fragments, `cygnet.lit("...")`. **Operator and function names are
 trusted strings** — never pass user input as an operator or function
 name.
 
+Comparing a column to `None` is NULL-safe: `T.col == None` renders
+`col IS NULL` and `T.col != None` renders `col IS NOT NULL` — so a value that
+is `None` at runtime does the right thing instead of silently matching no rows.
+`cygnet.is_null(col)` / `cygnet.is_not_null(col)` are the explicit equivalents.
+
 `cygnet.op` has three arities:
 
 ```python

@@ -153,6 +153,30 @@ class Predicate:
             left_sql = f"({self.left.render_sql(params)})"
             right_sql = f"({self.right.render_sql(params)})"
         else:
+            # NULL-safety for the (in)equality operators (B6 / OQ7, 2026-06-21).
+            # SQL has no value-equality with NULL: `x = NULL` / `x != NULL` are
+            # always UNKNOWN (never TRUE), so `T.col == None` silently matched
+            # zero rows and `!= None` matched none — a silent wrong-result trap,
+            # invisible to a linter when the operand is a runtime variable that
+            # happens to be None.  Rewrite to IS [NOT] NULL (the same surface
+            # cygnet.is_null / is_not_null produce).
+            #
+            # Fire ONLY for the idiom: a renderable expression on the left and
+            # None on the right.  That is exactly what the comparison overloads
+            # build — `col == None` directly, and the reflected `None == col`,
+            # which Python turns into `col.__eq__(None)` (column on the left).
+            # We deliberately do NOT rewrite a literal None on the *left* (only
+            # reachable via an explicit op(None, "=", x)): picking the
+            # right-hand operand as "the column" there would misattribute a
+            # value as the thing being null-tested, so it stays a literal
+            # compare and the value is parameterised normally.
+            if (
+                self.right is None
+                and self.op in ("=", "!=", "<>")
+                and hasattr(self.left, "render_sql")
+            ):
+                keyword = "IS NULL" if self.op == "=" else "IS NOT NULL"
+                return f"{self.left.render_sql(params)} {keyword}"
             left_sql = self._render_operand(self.left, params)
             right_sql = self._render_operand(self.right, params)
 

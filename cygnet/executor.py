@@ -363,9 +363,17 @@ class Executor:
         # left SELECT's body and before any compound-level ORDER BY /
         # LIMIT / OFFSET.  Each operand is rendered into the same params
         # list so $N numbering stays monotonic across the chain.
+        #
+        # Each operand is wrapped in parentheses (B7 / OQ8, 2026-06-21) so its
+        # own ORDER BY / LIMIT / OFFSET / locking clause binds to THAT operand.
+        # Without the parens those trailing clauses leaked into the compound —
+        # silently rebinding to the whole UNION, or duplicating the left
+        # builder's compound-level ORDER BY into a syntax error.  The left
+        # builder stays unparenthesised: its trailing clauses are the
+        # compound-level ones, emitted just below, per the documented contract.
         for op_kw, other in b._set_ops:
             other_sql = self._render_select(other, params)
-            sql += f" {op_kw} {other_sql}"
+            sql += f" {op_kw} ({other_sql})"
 
         if b._order:
             order_parts: list[str] = []

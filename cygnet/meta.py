@@ -99,27 +99,34 @@ class TableMeta:
         )
         self.fields: list[FieldMeta] = []
         self.pk: FieldMeta | None = None
-        # S26 (2026-05-22): __new__ inserts the new instance into _cache
-        # BEFORE _introspect runs.  If introspection raises, the
-        # half-built entry would linger — subsequent TableMeta(cls)
-        # calls would short-circuit through __new__'s cache hit and
-        # re-enter __init__ (where _initialised is missing, so this body
-        # would run again with the same data and re-raise), but the
-        # cache invariant "every entry is a fully-initialised TableMeta"
-        # would be silently violated for any code that pokes _cache
-        # directly.  Evicting on failure keeps the invariant strict.
+        # __new__ inserts the new instance into _cache BEFORE introspection
+        # runs (so a self-referential FK can find it).  Introspection is
+        # two-pass (B9, 2026-06-21): pass 1 (_introspect_fields) builds every
+        # FieldMeta and assigns self.pk without touching FK targets; then we
+        # flip _initialised BEFORE pass 2 (_validate_foreign_keys), so a self-
+        # or mutually-referential FK's TableMeta(target) lookup re-enters
+        # __init__, hits the guard at the top, and returns this now-PK-bearing
+        # instance instead of recursing forever.
         try:
-            self._introspect()
+            self._introspect_fields()
+            self._initialised = True
+            self._validate_foreign_keys()
         except Exception:
+            # S26: evict half-built (pass-1 failure: no/duplicate PK,
+            # frozen+DBKey) AND FK-invalid (pass-2 failure: bad target/type)
+            # entries, so the "every cached entry is fully initialised"
+            # invariant holds for any code that pokes _cache directly.  After
+            # we re-raise, the instance is unreferenced, so a stale
+            # _initialised flag set before a pass-2 failure is moot.
             _cache.pop(target_cls, None)
             raise
-        # _initialised is set ONLY after a successful _introspect so that a
-        # class which fails introspection (no PK, duplicate PK, etc.) doesn't
-        # leave a "fully initialised" empty TableMeta in the cache that
-        # subsequent lookups would treat as valid.
-        self._initialised = True
 
-    def _introspect(self) -> None:
+    def _introspect_fields(self) -> None:
+        # Pass 1 (B9): discover fields, column names, and the single PK WITHOUT
+        # recursing into FK targets.  Structural checks that need no target
+        # (duplicate PK, frozen+DBKey, multiple ForeignKey, PK-vs-FK conflict,
+        # exactly-one-PK) live here; target-aware FK validation is pass 2
+        # (_validate_foreign_keys).
         if not dataclasses.is_dataclass(self.cls):
             raise TypeError(
                 f"{self.cls.__name__} is not a dataclass — "
@@ -186,38 +193,15 @@ class TableMeta:
                         f"after INSERT. Use AppKey or remove frozen=True."
                     )
 
-            # FK validation: catch misconfigurations at introspection time
-            # rather than letting them surface as confusing SQL errors later.
-            if fk_meta is not None:
-                if pk_meta is not None:
-                    raise TypeError(
-                        f"{self.cls.__name__}.{attr}: a field cannot be both "
-                        f"a primary key and a foreign key"
-                    )
-                # Introspect the target to validate it's a valid FK target.
-                # This triggers the target's own introspection if not cached,
-                # which will raise if the target isn't a dataclass.
-                # Note: this recursion terminates because TableMeta.__new__
-                # returns the cached instance on a second entry for the same
-                # class.  Mutually-recursive models work as long as at least
-                # one side is introspected first without a back-reference cycle
-                # in the Annotated metadata itself (ForeignKey targets are
-                # already-defined classes, so Python import order provides
-                # that guarantee).
-                target_meta = TableMeta(fk_meta.target)
-                if target_meta.pk is None:
-                    raise TypeError(
-                        f"{self.cls.__name__}.{attr}: foreign key target "
-                        f"{fk_meta.target.__name__} has no primary key"
-                    )
-                # Unwrap Optional for nullable FKs: int | None should
-                # match an int PK. The None case is handled at query time.
-                base_type = _unwrap_optional(py_type)
-                if base_type != target_meta.pk.python_type:
-                    raise TypeError(
-                        f"{self.cls.__name__}.{attr}: foreign key type mismatch — "
-                        f"{base_type.__name__} != {target_meta.pk.python_type.__name__}"
-                    )
+            # A field can't be both PK and FK.  This is structural (needs no
+            # target), so it's enforced in pass 1; target-aware FK checks are
+            # deferred to _validate_foreign_keys so self-/mutually-referential
+            # targets don't recurse during construction (B9).
+            if fk_meta is not None and pk_meta is not None:
+                raise TypeError(
+                    f"{self.cls.__name__}.{attr}: a field cannot be both "
+                    f"a primary key and a foreign key"
+                )
 
             fm = FieldMeta(attr, col_name, py_type, pk_meta, fk_meta)
             # self.fields mirrors declaration order — do not sort or reorder.
@@ -237,6 +221,31 @@ class TableMeta:
                 f"{self.cls.__name__} has no primary key — "
                 f"every CYGNET model must have exactly one DBKey or AppKey field"
             )
+
+    def _validate_foreign_keys(self) -> None:
+        # Pass 2 (B9): validate each FK against its target.  Runs AFTER
+        # self._initialised is set, so a self- or mutually-referential target
+        # resolves to an already-built meta (PK present) via the __init__ guard
+        # instead of recursing.  Introspecting the target also validates it is a
+        # dataclass with a PK; both raise here if not.
+        for fm in self.fields:
+            fk_meta = fm.foreign_key
+            if fk_meta is None:
+                continue
+            target_meta = TableMeta(fk_meta.target)
+            if target_meta.pk is None:
+                raise TypeError(
+                    f"{self.cls.__name__}.{fm.attr_name}: foreign key target "
+                    f"{fk_meta.target.__name__} has no primary key"
+                )
+            # Unwrap Optional for nullable FKs: int | None should match an int
+            # PK.  The None case is handled at query time.
+            base_type = _unwrap_optional(fm.python_type)
+            if base_type != target_meta.pk.python_type:
+                raise TypeError(
+                    f"{self.cls.__name__}.{fm.attr_name}: foreign key type mismatch — "
+                    f"{base_type.__name__} != {target_meta.pk.python_type.__name__}"
+                )
 
     @property
     def foreign_keys(self) -> list[FieldMeta]:

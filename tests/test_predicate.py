@@ -109,3 +109,58 @@ class TestPredicate:
         sql = (~~(AccountTable.id == 1)).render_sql(params)
         assert sql == "NOT (NOT (accounts.id = $1))"
         assert params == [1]
+
+
+class TestNullComparison:
+    """B6 / OQ7: `== None` / `!= None` must render as `IS [NOT] NULL`, never a
+    NULL-bound `= $N` — SQL's `x = NULL` is always UNKNOWN, silently matching
+    zero rows."""
+
+    def test_eq_none_renders_is_null(self):
+        params: list = []
+        sql = (AccountTable.name == None).render_sql(params)  # noqa: E711
+        assert sql == "accounts.name IS NULL"
+        assert params == []
+
+    def test_ne_none_renders_is_not_null(self):
+        params: list = []
+        sql = (AccountTable.name != None).render_sql(params)  # noqa: E711
+        assert sql == "accounts.name IS NOT NULL"
+        assert params == []
+
+    def test_eq_none_via_runtime_variable(self):
+        """The real-world trap: a variable that is None at runtime (invisible
+        to a linter's E711)."""
+        value = None
+        params: list = []
+        sql = (AccountTable.email == value).render_sql(params)
+        assert sql == "accounts.email IS NULL"
+        assert params == []
+
+    def test_non_none_value_still_parameterised(self):
+        """Guard against over-rewriting: a real value still binds a param."""
+        params: list = []
+        sql = (AccountTable.name == "Fred").render_sql(params)
+        assert sql == "accounts.name = $1"
+        assert params == ["Fred"]
+
+    def test_none_in_compound_predicate(self):
+        params: list = []
+        pred = (AccountTable.name == None) & (AccountTable.id > 5)  # noqa: E711
+        sql = pred.render_sql(params)
+        assert sql == "(accounts.name IS NULL) AND (accounts.id > $1)"
+        assert params == [5]
+
+    def test_none_on_left_with_value_not_rewritten(self):
+        """B6 edge: only a renderable-left / None-right pair is the
+        `col IS NULL` idiom (what the comparison overloads produce, including
+        the reflected `None == col`).  A literal None on the LEFT — reachable
+        only via an explicit op()/Predicate — must NOT misattribute the
+        right-hand value as the null-tested column; it stays an honest (if
+        useless) literal compare."""
+        from cygnet.predicate import Predicate
+
+        params: list = []
+        sql = Predicate(None, "=", 5).render_sql(params)
+        assert sql == "$1 = $2"
+        assert params == [None, 5]
