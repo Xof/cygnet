@@ -430,7 +430,15 @@ position — O(rows × fields) avoidable work on the hot mapping path.
 *Fix direction:* cache the PK index on `TableMeta` (or hoist before the per-row
 loop) and pass it in.
 
-### S39. High-risk SQL constructs validated only by FakeDB string assertions  *[2026-06-21-deepdive tests] — OPEN*
+### ~~S39. High-risk SQL constructs validated only by FakeDB string assertions~~  *[2026-06-21-deepdive tests] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21:** `tests/integration/test_advanced_queries.py` adds real-PG
+round-trip coverage for LATERAL, correlated `EXISTS`/`NOT EXISTS`/`IN`,
+`INTERSECT`/`EXCEPT`, compound set-op `ORDER BY`/`LIMIT` scoping, a set-op
+operand carrying its own `ORDER BY`/`LIMIT` (the B7 case, end-to-end),
+`ON_CONFLICT_CONSTRAINT` / `DO_UPDATE_FROM_EXCLUDED`, `UPDATE`/`DELETE …
+RETURNING`, and `FOR UPDATE` / `SKIP LOCKED`. 12 tests, green against PG 14–18.
+Original report below.
 
 LATERAL, correlated `EXISTS`/`IN`, set-op `ORDER BY`/`LIMIT` scoping,
 `INTERSECT`/`EXCEPT`, `ON CONFLICT ON CONSTRAINT` / `DO_UPDATE_FROM_EXCLUDED`,
@@ -1044,8 +1052,8 @@ with one mechanism correction (B9, confirmed by repro) and one scope-narrowing
 
 ### FIX-SOON — worth a near-term fix; loud or low-impact
 
-> **Landed 2026-06-21.** B8/S33 (PR #2), S35/S36/S37/S38, and S40/S42/N8/N9 are
-> all CLOSED above. **Remaining FIX-SOON: S39 (integration coverage) only.**
+> **Landed 2026-06-21.** B8/S33 (PR #2), S35/S36/S37/S38, S40/S42/N8/N9, and
+> S39 are all CLOSED above. **The entire FIX-SOON tier is done.**
 
 | ID | What | Effort | Fix |
 |----|------|--------|-----|
