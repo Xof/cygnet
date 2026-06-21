@@ -12,9 +12,8 @@ composition/testing entries `F1`–`T4`, the "Trade-offs explicitly deferred" li
 and the open questions `OQ1`–`OQ4` — so the narrative stays self-contained. (That
 record, the project's Architecture Decision Record, is maintained as a local
 internal artifact and is not checked into the repo; nothing here depends on having
-it.) Per-feature design notes *are* in the repo at
-[`docs/superpowers/specs/`](docs/superpowers/specs/), and the running issue list is
-[ISSUES.md](ISSUES.md).
+it.) The per-feature design rationale worth preserving has been folded into the
+sections below; the running issue list is [ISSUES.md](ISSUES.md).
 
 ## Orientation
 
@@ -69,7 +68,13 @@ not duplicated per class — they are collected in the **`_InfixOps`** mixin
 `WindowExpression`, so the same `col + 1`, `a == b`, `x >= y` work uniformly
 wherever they appear in the tree. (`_InfixOps` was extracted from the previously
 scattered per-class overloads; the consolidation is recent — commit "extract shared
-infix-operator menu into `_InfixOps` mixin".)
+infix-operator menu into `_InfixOps` mixin".) The edge between these two modules is
+one-directional at module load: `expression.py` imports `Predicate` from
+`predicate.py`, never the reverse — which is what lets the operator wrapper nodes
+(`PrefixOp`/`SuffixOp`) build compound `Predicate` trees for `&`/`|` without an
+import cycle. The one place the reverse is needed — `Predicate.__invert__` building a
+`PrefixOp` for `~` — is a *deferred* import inside the method, kept lazy precisely to
+preserve that one-way edge.
 
 **`expression.py`** owns the `SQLRenderable` protocol itself and the open-ended
 expression nodes; **`functions.py`**, **`jsonb.py`**, **`arrays.py`**, and
@@ -221,6 +226,13 @@ The honest section — sharp edges, intentional-looking-bugs, and real debt.
   adapter's `$N`→`%s` regex, so a literal containing `$1` or `%` gets rewritten
   underneath you (ADR `P1` footgun; `OQ3`). Window-frame strings share the
   "interpolated verbatim, trusted" property.
+- **`ORDER_BY` appends `ASC`/`DESC` unless the renderable opts out.** The executor
+  checks a `_renders_own_direction` flag and skips the suffix when it's set; `Literal`
+  sets it (so `lit("created_at DESC")` controls its own direction), while `ColumnProxy`,
+  `op()` results, and `SuffixOp` all take the suffix. The earlier "only `ColumnProxy`
+  gets the suffix" rule silently dropped `DESC` from `op()` expressions — so the flag
+  is the fix, and a new direction-bearing renderable in `ORDER_BY` must set it or it
+  gets a spurious trailing `ASC`.
 - **`save()` doesn't refresh on upsert.** The `ON CONFLICT DO UPDATE` path emits no
   `RETURNING`, so triggers / generated columns / `DEFAULT` on update leave the
   in-memory object stale — while the fresh-INSERT path *does* refresh. This
@@ -234,6 +246,14 @@ The honest section — sharp edges, intentional-looking-bugs, and real debt.
   `TableSourceProtocol` (`OQ4`); until then the `type: ignore`s are the tell that
   the surface is informal, and changing what the executor reads from a table source
   means changing both `proxy.py` and `cte.py` in lockstep.
+- **Foreign keys are validated eagerly at introspection time, and only ever target a
+  PK.** When `meta` sees a `ForeignKey` it enforces three rules — the target is a
+  dataclass with a Cygnet PK, no field is both PK and FK, and the FK field's Python
+  type equals the target PK's type — the FK analogue of the `S1`–`S4` fail-loud rails.
+  Because a FK always points at the referenced class's primary key (never an arbitrary
+  column), `follow()` and the auto-generated `FOLLOW` ON-condition can assume a single
+  PK attribute; FK-to-non-PK-column and composite FKs are out of scope by construction,
+  not omission.
 - **The `$N`→`%s` translation assumes ordered consumption.** psycopg consumes params
   in list order, which matches the order Cygnet appends them; a hypothetical
   out-of-order render (`$2` before `$1`) would break it. The left-to-right invariant
@@ -257,7 +277,10 @@ Grounded in the real structure (signatures are in the code — this is the *shap
   executor.
 - **Change row→object hydration.** `executor.py` mapping path only. Remember the
   multi-source JOIN contract: a tuple per row, `None` on a side meaning an
-  outer-join miss (detected via the PK column, falling back to all-NULL).
+  outer-join miss (detected via the PK column, falling back to all-NULL). `FOLLOW`/
+  `LEFT_FOLLOW` ride this same path — they generate the ON-condition from FK metadata
+  and delegate to `JOIN`/`LEFT_JOIN`, adding no executor or row-mapping code of their
+  own, so a change here affects them too.
 - **Add a `db` adapter.** Satisfy the four-method protocol (ARCHITECTURE §Invariants);
   copy `psycopg_db.py` as the template. If you support `stream`, return an async
   iterator over a server-side cursor.

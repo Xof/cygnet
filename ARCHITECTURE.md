@@ -12,11 +12,13 @@ features are tracked in [ISSUES.md](ISSUES.md).
 
 ## Component map
 
-Authoritative module enumeration. Dependency direction is strictly downward:
-`__init__` → `builders` → `executor` → `proxy`/`cte`/`predicate`/`expression` →
-`meta` → `annotations`. No cycles. The single deferred import is
-`from .builders import …` inside `executor.run_save` (breaks an otherwise-circular
-save→builder edge).
+Authoritative module enumeration. Dependency direction is strictly downward at
+module load: `__init__` → `builders` → `executor` →
+`proxy`/`cte`/`predicate`/`expression` → `meta` → `annotations`, with no cycles.
+Would-be cycles are broken by *deferred* (in-function) imports instead of
+module-load ones — notably `executor.run_save` → `builders` (the save→builder
+edge) and `predicate.__invert__` → `expression.PrefixOp` (the reverse of
+`expression`'s module-load import of `Predicate`, needed only for `~`).
 
 | Module | Responsibility | Key symbols |
 |---|---|---|
