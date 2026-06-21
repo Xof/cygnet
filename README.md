@@ -688,6 +688,12 @@ adapter must implement an async `stream(sql, params)` method;
 psycopg's `cursor.stream()` is the reference implementation — see
 `cygnet/psycopg_db.py`.
 
+If you `break` out of the `async for` early, wrap the loop in
+`contextlib.aclosing(...)` (or rely on the enclosing `cygnet.transaction(db)`
+block, whose commit/rollback drops the server-side portal) so the cursor
+closes deterministically — a bare `break` leaves cleanup to garbage
+collection, which can't run an async close.
+
 ### Window functions
 
 ```python

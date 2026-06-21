@@ -440,10 +440,14 @@ class Executor:
         JOIN left-side, and FULL JOIN either side; False for INNER and
         for the FROM table when no outer join makes it nullable.
 
-        Miss-detection prefers the PK column when present — a real PG
-        row never returns NULL for a non-null PK column from a matched
-        row, so PK=None is unambiguous.  Falls back to all-NULL only
-        when the table has no PK at all (CTEs, etc.).
+        Miss-detection prefers the PK column when present: for a base-table
+        PK (NOT NULL by definition) a matched row never carries a NULL there,
+        so PK=None unambiguously means "outer-join miss".  This is a heuristic,
+        not a universal truth — a model whose PK maps to a genuinely *nullable*
+        column on the nullable side of an outer join could be misread as a miss
+        (S31).  That's atypical, since PKs are NOT NULL; and CTEs / derived
+        sources carry no PK (``meta.pk is None``), so they take the all-NULL
+        fallback below rather than this path.
         """
         if can_miss:
             if meta.pk is not None:
@@ -891,6 +895,14 @@ class Executor:
                         f"BULK_VALUES expected {len(b._bulk_objs)} RETURNING "
                         f"rows for {meta.cls.__name__}, got {len(rows)}"
                     )
+                # S30: PKs are assigned positionally, which relies on
+                # PostgreSQL returning multi-row `VALUES … RETURNING` rows in
+                # VALUES (insertion) order.  PG does this for a single-table
+                # multi-row INSERT in every current version, but it is not a
+                # documented guarantee — `strict=True` catches a count mismatch,
+                # not a reorder.  OQ9 resolved to LEAVE (document the assumption,
+                # don't redesign); explicit row-correlation would be the fix if
+                # PG's behaviour ever changed.
                 for o, row in zip(b._bulk_objs, rows, strict=True):
                     setattr(o, meta.pk.attr_name, row[0])
                 return [row[0] for row in rows]

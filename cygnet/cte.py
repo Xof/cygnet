@@ -212,6 +212,13 @@ class RecursiveCTE:
 
     Recursive CTEs share the TableProxy-shaped duck-type surface with
     CTE so they can sit in FROM / JOIN / outer-WHERE the same way.
+
+    `anchor` and `step` are plain assignable attributes, validated at render
+    time, not at assignment (S34): the forward-declaration pattern above needs
+    them mutable, so assigning a non-SelectBuilder surfaces as an
+    ``AttributeError`` deep in the executor rather than at the assignment site.
+    The render-time None-check catches the common "forgot to set one" mistake
+    with a clear error; supplying the wrong *type* is the fail-loud-later case.
     """
 
     def __init__(self, name: str, columns: list[str]) -> None:

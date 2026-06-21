@@ -270,8 +270,12 @@ class TestInsertOne:
 
         def op() -> Any:
             async def go() -> Any:
-                # Fresh session per call so commit cost is included
-                # — equivalent to Cygnet's single-statement autocommit.
+                # Fresh session per call: this measures SA's session-per-write
+                # idiom, which additionally pays AsyncSession construction + a
+                # unit-of-work flush that Cygnet's reused autocommit connection
+                # does not (S41).  The libpq commit itself is comparable —
+                # Cygnet autocommits too — but the session/UoW overhead is not,
+                # so this is not a like-for-like single-statement equivalence.
                 async with AsyncSession(sa_engine, expire_on_commit=False) as s:
                     acc = SAAccount(name="Bench User", email="bench@example.com")
                     s.add(acc)
