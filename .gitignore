@@ -30,3 +30,6 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+# Codebase-memory graph artifacts (ADR notes; graph DB lives in central store)
+.codebase-memory/
