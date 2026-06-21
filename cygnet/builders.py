@@ -613,6 +613,13 @@ class SelectBuilder(_Builder):
         (psycopg's portal-cursor approach is the reference).  PG portal
         cursors must run inside a transaction, so typical usage wraps
         this in `async with cygnet.transaction(db)`.
+
+        Early exit (S32): this is an async generator holding a server-side
+        cursor.  If you `break` out of the loop before exhausting it, wrap the
+        loop in `contextlib.aclosing(...)` — or keep it inside the
+        `cygnet.transaction(db)` block, whose commit/rollback drops the portal
+        — so the cursor closes deterministically.  A bare `break` otherwise
+        leaves cleanup to garbage collection, which cannot run an async close.
         """
         return Executor(self._db).stream_select(self)
 

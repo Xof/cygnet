@@ -320,7 +320,11 @@ non-editable portion of the dep tree.
 
 ## Open issues — smells
 
-### S30. Bulk INSERT assigns PKs assuming RETURNING order == VALUES order  *[2026-06-21-deepdive design] — OPEN*
+### ~~S30. Bulk INSERT assigns PKs assuming RETURNING order == VALUES order~~  *[2026-06-21-deepdive design] — CLOSED 2026-06-21 (DOCUMENT)*
+
+**Closed 2026-06-21:** a comment at the bulk PK-assignment loop documents the
+reliance on PG's (stable but undocumented) VALUES-order `RETURNING`; OQ9
+resolved → LEAVE (explicit row-correlation deferred). Original report below.
 
 `run_insert`'s bulk path (`executor.py:856-863`) does `zip(b._bulk_objs, rows)`
 to stamp PKs positionally. PostgreSQL does not document that multi-row
@@ -330,7 +334,11 @@ count mismatch, not a reordering. Latent, not a present-day bug. **See OQ9.**
 *Fix direction:* document the assumption (pragmatic), or correlate rows
 explicitly.
 
-### S31. Outer-join miss-detection heuristic can misfire on a nullable PK  *[2026-06-21-deepdive correctness] — OPEN*
+### ~~S31. Outer-join miss-detection heuristic can misfire on a nullable PK~~  *[2026-06-21-deepdive correctness] — CLOSED 2026-06-21 (DOCUMENT)*
+
+**Closed 2026-06-21:** the `_object_or_none_if_miss` docstring now states the
+NOT-NULL-PK assumption and the nullable-PK edge case explicitly (triage narrowed
+it — CTEs carry no PK and take the all-NULL fallback). Original report below.
 
 `_object_or_none_if_miss` (`executor.py:418-425`) treats `PK column is NULL` as
 an outer-join miss. Holds for a base-table NOT NULL PK, but a CTE/derived "PK"
@@ -340,7 +348,12 @@ miss. The docstring states the assumption as universal.
 *Fix direction:* acceptable as a documented heuristic; if precision matters,
 only treat all-columns-NULL as a miss when the PK column is itself nullable.
 
-### S32. `PsycopgDB.stream()` server-side cursor relies on async-generator finalization  *[2026-06-21-deepdive resources] — OPEN*
+### ~~S32. `PsycopgDB.stream()` server-side cursor relies on async-generator finalization~~  *[2026-06-21-deepdive resources] — CLOSED 2026-06-21 (DOCUMENT)*
+
+**Closed 2026-06-21:** the `SelectBuilder.stream()` docstring and the README
+streaming section document wrapping early-break loops in
+`contextlib.aclosing(...)` (or relying on the `transaction()` block, whose
+commit/rollback drops the portal). Original report below.
 
 `stream()` (`psycopg_db.py:116-129`) is an async generator holding an open
 portal inside `async with`. A consumer that `break`s early and never
@@ -364,7 +377,12 @@ COMMIT/ROLLBACK discards it). Paired with B8's masking exposure.
 
 *Fix direction:* `RELEASE SAVEPOINT` after `ROLLBACK TO SAVEPOINT`.
 
-### S34. `RecursiveCTE.anchor` / `.step` are unchecked public mutables  *[2026-06-21-deepdive mutability] — OPEN*
+### ~~S34. `RecursiveCTE.anchor` / `.step` are unchecked public mutables~~  *[2026-06-21-deepdive mutability] — CLOSED 2026-06-21 (DOCUMENT)*
+
+**Closed 2026-06-21:** the `RecursiveCTE` docstring documents the deliberate
+fail-loud-later contract — bodies are validated at render time (clear None-check
+error), with a wrong-type assignment surfacing later, by design. Original report
+below.
 
 `cte.py:228-229` exposes `anchor`/`step` as `Any`, validated only at render time
 (None-check). Assigning a non-SelectBuilder (raw string, plain CTE) surfaces as
@@ -464,7 +482,12 @@ reorder or `pytest-randomly` breaks it.
 *Fix direction:* assert `>= 100`, or give the insert benches a throwaway table /
 function-scoped re-seed.
 
-### S41. Comparison bench overstates SA/Cygnet INSERT equivalence  *[2026-06-21-deepdive tests] — OPEN*
+### ~~S41. Comparison bench overstates SA/Cygnet INSERT equivalence~~  *[2026-06-21-deepdive tests] — CLOSED 2026-06-21 (DOCUMENT)*
+
+**Closed 2026-06-21:** the SA `InsertOne` comment is reworded — it measures SA's
+session-per-write idiom (extra `AsyncSession` construction + UoW flush), not a
+like-for-like single-statement equivalence with Cygnet's autocommit. Original
+report below.
 
 `bench/comparison/test_comparison.py:268-279`: SA's InsertOne constructs a fresh
 `AsyncSession` and commits inside the timed op; Cygnet reuses a module-scoped
@@ -940,10 +963,11 @@ Resolved: operands are parenthesised, so `(SELECT … LIMIT 5) UNION (SELECT …
 LIMIT 5)` is supported and an operand's tail clauses scope to it. Closed via
 **B7**.
 
-### OQ9. Is the bulk-INSERT RETURNING-order reliance an accepted assumption?  *[2026-06-21-deepdive] — OPEN*
+### ~~OQ9. Is the bulk-INSERT RETURNING-order reliance an accepted assumption?~~  *[2026-06-21-deepdive] — RESOLVED 2026-06-21 (yes — LEAVE)*
 
-Drives S30. If yes → a one-line comment at `executor.py:856`; if no → a design
-decision on correlating rows.
+Resolved: yes, accepted and documented. A comment at the bulk PK-assignment loop
+names the reliance on PG's VALUES-order `RETURNING`; explicit row-correlation is
+deferred unless PG's behaviour changes. Closed via **S30**.
 
 ### ~~OQ10. How should self-referential FK introspection resolve its own not-yet-built PK?~~  *[2026-06-21-deepdive; reframed by 2026-06-21 triage] — RESOLVED 2026-06-21 (option b: two-pass)*
 
@@ -1070,6 +1094,10 @@ with one mechanism correction (B9, confirmed by repro) and one scope-narrowing
 | **N9** dead `pytest.warns` line | S | Delete the line + the now-unused `import pytest`. |
 
 ### DOCUMENT — behaviour acceptable; needs a doc/comment, not a code change
+
+> **Landed 2026-06-21.** All five (S30/S31/S32/S34/S41) are documented and
+> CLOSED above; OQ9 resolved (LEAVE). Every 2026-06-21 review finding is now
+> resolved.
 
 | ID | What | Note |
 |----|------|------|
