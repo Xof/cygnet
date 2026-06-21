@@ -9,8 +9,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from bench._compare import NOISE_THRESHOLD_PCT, render
 
 
@@ -139,4 +137,3 @@ def test_invocable_via_module_dash_m(tmp_path: Path) -> None:
         check=True,
     )
     assert "| benchmark | baseline (µs) | current (µs) | Δ |" in result.stdout
-    pytest.warns  # silence ruff F401 if any test imports above bypass linting

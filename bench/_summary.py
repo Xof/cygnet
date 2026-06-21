@@ -20,11 +20,16 @@ def render(json_path: str) -> str:
         "| benchmark | median (µs) | min (µs) | ops/s |",
         "|---|---:|---:|---:|",
     ]
-    for b in data["benchmarks"]:
-        med = b["stats"]["median"] * 1e6
+    # .get with a default: a malformed/empty JSON (no "benchmarks" key) renders
+    # a header-only table rather than raising KeyError in the advisory CI step.
+    for b in data.get("benchmarks", []):
+        med_s = b["stats"]["median"]
+        med = med_s * 1e6
         mn = b["stats"]["min"] * 1e6
-        ops = 1 / b["stats"]["median"]
-        lines.append(f"| {b['name']} | {med:,.2f} | {mn:,.2f} | {ops:,.0f} |")
+        # Guard the divisor: a real pytest-benchmark median is never 0, but a
+        # hand-built / malformed JSON could be — emit a dash, not a crash.
+        ops = f"{1 / med_s:,.0f}" if med_s else "—"
+        lines.append(f"| {b['name']} | {med:,.2f} | {mn:,.2f} | {ops} |")
     return "\n".join(lines)
 
 

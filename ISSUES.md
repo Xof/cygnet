@@ -442,7 +442,11 @@ scoping unit test asserts substring order and would pass B7's bug).
 *Fix direction:* add one round-trip integration test per construct; the harness
 exists.
 
-### S40. Comparison bench `== 100` assertion depends on class-definition order  *[2026-06-21-deepdive tests] — OPEN*
+### ~~S40. Comparison bench `== 100` assertion depends on class-definition order~~  *[2026-06-21-deepdive tests] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21:** the three `TestSelectAll` assertions now use `>= 100`, so
+they no longer depend on pytest's class-collection order against the shared,
+insert-mutated table. Original report below.
 
 `bench/comparison/test_comparison.py:216` asserts `len(rows) == 100`, but the
 insert benchmarks (`:252`/`:296`) mutate the same module-scoped table with no
@@ -463,7 +467,11 @@ fair; only the comment overstates.
 *Fix direction:* soften the comment, or hoist session creation out of the timed
 region.
 
-### S42. `bench._summary` is untested and crashes on malformed JSON  *[2026-06-21-deepdive CI] — OPEN*
+### ~~S42. `bench._summary` is untested and crashes on malformed JSON~~  *[2026-06-21-deepdive CI] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21:** `render` uses `data.get("benchmarks", [])` and guards the
+ops divisor (emits `—` on a zero median); new `tests/test_bench_summary.py`
+covers normal / empty / missing-key / zero-median inputs. Original report below.
 
 `bench/_summary.py:23` does unguarded `data["benchmarks"]` (KeyError on a JSON
 missing the key) and `1 / median` (latent ZeroDivisionError); its sibling
@@ -843,12 +851,18 @@ branch covers the unhashable-adapter fallback).
 
 ## Open issues — nits
 
-### N8. `SelectBuilder.stream()` annotated `-> Any`  *[2026-06-21-deepdive typing] — OPEN*
+### ~~N8. `SelectBuilder.stream()` annotated `-> Any`~~  *[2026-06-21-deepdive typing] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21:** `SelectBuilder.stream()` and `Executor.stream_select`
+are both annotated `-> AsyncIterator[Any]`. Original report below.
 
 `builders.py:608` returns `Any`, erasing the async-iterator contract the
 docstring promises. Annotate `AsyncIterator[…]`.
 
-### N9. Dead `pytest.warns` statement  *[2026-06-21-deepdive tests] — OPEN*
+### ~~N9. Dead `pytest.warns` statement~~  *[2026-06-21-deepdive tests] — CLOSED 2026-06-21*
+
+**Closed 2026-06-21:** the dead `pytest.warns` line and the now-unused
+`import pytest` are removed. Original report below.
 
 `tests/test_bench_compare.py:142` has a bare `pytest.warns` attribute access on
 its own line — a no-op with a misleading comment about silencing ruff F401.
@@ -1030,9 +1044,8 @@ with one mechanism correction (B9, confirmed by repro) and one scope-narrowing
 
 ### FIX-SOON — worth a near-term fix; loud or low-impact
 
-> **Landed 2026-06-21.** B8/S33 shipped in PR #2; S35/S36/S37/S38 in the
-> follow-up PR — all CLOSED above. Remaining FIX-SOON: S39 (integration
-> coverage), S40/S42 (bench hygiene), N8/N9 (nits).
+> **Landed 2026-06-21.** B8/S33 (PR #2), S35/S36/S37/S38, and S40/S42/N8/N9 are
+> all CLOSED above. **Remaining FIX-SOON: S39 (integration coverage) only.**
 
 | ID | What | Effort | Fix |
 |----|------|--------|-----|
