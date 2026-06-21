@@ -475,11 +475,24 @@ class transaction:
         # while a nested transaction is active, so it can't distinguish them.
         if self._savepoint:
             # Nested layer: leave _in_transaction alone — the outermost
-            # context manager owns it.  Note: we do NOT swallow exc_type;
-            # returning None (implicit) re-raises it after the savepoint
-            # is rolled back, which is the standard CM contract.
+            # context manager owns it.  We do NOT swallow exc_type; returning
+            # None re-raises it after the savepoint is dealt with.
             if exc_type:
-                await self._db.execute(f"ROLLBACK TO SAVEPOINT {self._savepoint}")
+                # Roll the savepoint back, then RELEASE it (S33).  ROLLBACK TO
+                # SAVEPOINT leaves the savepoint defined in PostgreSQL, so
+                # without the RELEASE it lingers on the savepoint stack for the
+                # rest of the outer transaction whenever the outer block
+                # catches the inner exception and continues.  Both run inside a
+                # try so a failing savepoint command chains the original
+                # exception (B8) rather than silently replacing it: with no
+                # explicit `from`, the new error would propagate with only an
+                # implicit __context__, losing the user's real error as the
+                # __cause__ that tooling and `raise ... from` semantics expect.
+                try:
+                    await self._db.execute(f"ROLLBACK TO SAVEPOINT {self._savepoint}")
+                    await self._db.execute(f"RELEASE SAVEPOINT {self._savepoint}")
+                except Exception as savepoint_err:
+                    raise savepoint_err from exc_val
             else:
                 await self._db.execute(f"RELEASE SAVEPOINT {self._savepoint}")
         else:
@@ -493,7 +506,14 @@ class transaction:
             # gone, not just _in_transaction.
             try:
                 if exc_type:
-                    await self._db.execute("ROLLBACK")
+                    # On the error path, a failing ROLLBACK must not silently
+                    # replace the user's original exception (B8): chain it so
+                    # the real error survives as __cause__.  When ROLLBACK
+                    # succeeds, returning None re-raises exc_val normally.
+                    try:
+                        await self._db.execute("ROLLBACK")
+                    except Exception as rollback_err:
+                        raise rollback_err from exc_val
                 else:
                     await self._db.execute("COMMIT")
             finally:

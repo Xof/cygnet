@@ -196,3 +196,60 @@ class TestTransaction:
         async with cygnet.transaction(db):
             pass
         assert db.log[-2:] == ["BEGIN", "COMMIT"]
+
+    async def test_nested_rollback_releases_savepoint(self):
+        """S33: a savepoint rolled back on the error path is also RELEASEd, so
+        it doesn't linger on the transaction's savepoint stack when the outer
+        block catches the inner exception and continues."""
+        db = FakeTransactionalDB()
+        async with cygnet.transaction(db) as tx:
+            try:
+                async with cygnet.transaction(tx):
+                    raise ValueError("inner boom")
+            except ValueError:
+                pass
+        rollback_to = next(s for s in db.log if s.startswith("ROLLBACK TO SAVEPOINT"))
+        sp = rollback_to.removeprefix("ROLLBACK TO SAVEPOINT ")
+        release = f"RELEASE SAVEPOINT {sp}"
+        assert release in db.log
+        # RELEASE comes after the matching ROLLBACK TO SAVEPOINT.
+        assert db.log.index(release) > db.log.index(rollback_to)
+
+    async def test_rollback_failure_chains_original_exception(self):
+        """B8: if the body raises and the outer ROLLBACK then also fails, the
+        rollback error must not silently replace the original — the real error
+        is preserved as __cause__ (and the flags still reset)."""
+
+        class RollbackFailsDB(FakeTransactionalDB):
+            async def execute(self, sql: str, params: list | None = None) -> list:
+                self.log.append(sql)
+                if sql == "ROLLBACK":
+                    raise RuntimeError("rollback failed")
+                return []
+
+        db = RollbackFailsDB()
+        with pytest.raises(RuntimeError, match="rollback failed") as exc_info:
+            async with cygnet.transaction(db):
+                raise ValueError("original boom")
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert str(exc_info.value.__cause__) == "original boom"
+        assert db._in_transaction is False
+
+    async def test_nested_savepoint_rollback_failure_chains_original(self):
+        """B8 (nested): a failing ROLLBACK TO SAVEPOINT must likewise chain the
+        original exception rather than silently replacing it."""
+
+        class SavepointRollbackFailsDB(FakeTransactionalDB):
+            async def execute(self, sql: str, params: list | None = None) -> list:
+                self.log.append(sql)
+                if sql.startswith("ROLLBACK TO SAVEPOINT"):
+                    raise RuntimeError("savepoint rollback failed")
+                return []
+
+        db = SavepointRollbackFailsDB()
+        with pytest.raises(RuntimeError, match="savepoint rollback failed") as exc:
+            async with cygnet.transaction(db) as tx:
+                async with cygnet.transaction(tx):
+                    raise ValueError("inner boom")
+        assert isinstance(exc.value.__cause__, ValueError)
+        assert str(exc.value.__cause__) == "inner boom"
