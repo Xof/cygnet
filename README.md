@@ -1033,9 +1033,10 @@ after a fresh repo, expired retention, etc.).
 
 `bench/comparison/test_comparison.py` runs the same operations
 through Cygnet, SQLAlchemy 2 (async session), and Django (sync ORM)
-against the same PG schema. Four operation classes × three ORMs =
-twelve side-by-side benchmarks: SELECT-by-PK, SELECT-all-100, INSERT
-one, bulk INSERT 50.
+against the same PG schema. Five operation classes × three ORMs =
+fifteen side-by-side benchmarks: SELECT-by-PK, SELECT-all-100, a
+1000-row JOIN (Cygnet `FOLLOW` / SQLAlchemy join / Django
+`select_related`), INSERT one, and bulk INSERT 50.
 
 Each ORM is benchmarked in its idiomatic mode — Cygnet and SA in
 async, Django in sync — so the numbers reflect what real applications
@@ -1044,11 +1045,46 @@ see. SA's connection pool is clamped to a single connection
 Django's per-request connection, so the deltas measure ORM overhead
 rather than connection management.
 
-Skipped automatically when `CYGNET_TEST_DSN` is unset; runs
-inside `just bench-all` or directly via:
+#### Informal results
+
+A single run on an Apple M3 Max (Python 3.13, psycopg3, a local
+Dockerised PostgreSQL 16 with `fsync=off`). **These are informal,
+laptop-grade numbers — read them as orders of magnitude, not a
+benchmark league table.** Median time per operation; the `×` is
+relative to the fastest cell in each row.
+
+| Operation | Cygnet | SQLAlchemy 2 | Django |
+|---|---|---|---|
+| SELECT by primary key (1 row)   | **305 µs (1.0×)**   | 419 µs (1.4×)   | 547 µs (1.8×)   |
+| SELECT all (100 rows)           | **334 µs (1.0×)**   | 522 µs (1.6×)   | 402 µs (1.2×)   |
+| JOIN posts→accounts (1000 rows) | **5,280 µs (1.0×)** | 7,390 µs (1.4×) | 7,550 µs (1.4×) |
+| INSERT one row                  | **240 µs (1.0×)**   | 907 µs (3.8×)   | 265 µs (1.1×)   |
+| Bulk INSERT (50 rows)           | **515 µs (1.0×)**   | 1,950 µs (3.8×) | 1,224 µs (2.4×) |
+
+The honest reading is "Cygnet's overhead is small," not "Cygnet is
+fastest." A thin SQL builder *should* sit close to the driver —
+there's little between your call and the wire. The caveats matter as
+much as the numbers:
+
+- **The database is deliberately fast.** `fsync=off` on localhost
+  makes commits nearly free, which *maximises* the visible share of
+  ORM overhead. Against a real, durable, networked database the
+  per-call gaps here shrink to a sliver of total query latency.
+- **One connection, no pooling** — these are ORM-overhead numbers, not
+  a connection-management comparison.
+- **SQLAlchemy's INSERT rows aren't strictly like-for-like.** Those
+  cases open a fresh `AsyncSession` and run a unit-of-work flush per
+  call (SA's session-per-write idiom); the ~3.8× is session/UoW
+  machinery, not raw statement cost.
+- **Your hardware will disagree.** Re-run it and see.
+
+Skipped automatically when `CYGNET_TEST_DSN` is unset; reproduce with:
 
 ```bash
-pytest bench/comparison/ --benchmark-only
+just bootstrap-bench      # one-time: Django + SQLAlchemy + pytest-benchmark
+just bench-all            # spins up a throwaway Docker PG, runs everything
+# …or point it at your own database:
+CYGNET_TEST_DSN=postgresql://… pytest bench/comparison/ --benchmark-only
 ```
 
 ## License
