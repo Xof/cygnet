@@ -38,6 +38,7 @@ import cygnet  # noqa: E402
 from ..conftest import (  # noqa: E402
     Account,
     AccountTable,
+    PostTable,
     run_async,
 )
 
@@ -350,3 +351,61 @@ class TestBulkInsert:
 
         n = benchmark(op)
         assert n == 50
+
+
+class TestJoinFollow:
+    """Fetch every post joined to its account, both sides materialised as
+    objects in one round-trip — ~1000 rows (100 accounts × 10 posts).
+
+    Each ORM uses its idiomatic eager-join form, so the deltas reflect
+    join + dual-object hydration cost, not a hand-rolled SQL string:
+      - Cygnet: FOLLOW walks the declared FK and returns (Post, Account) tuples
+      - SA:     explicit two-entity join, returns Row(Post, Account) — the
+                closest like-for-like to FOLLOW without adding a relationship()
+      - Django: select_related eager-loads .account in the same query
+    """
+
+    def test_cygnet(self, benchmark, loop, populated_db: Any) -> None:
+        def op() -> list:
+            async def go() -> list:
+                return await (
+                    cygnet.SELECT(populated_db)
+                    .FROM(PostTable)
+                    .FOLLOW(PostTable.account_id)
+                )
+
+            return run_async(loop, go)
+
+        rows = benchmark(op)
+        assert len(rows) >= 1000
+
+    def test_sqlalchemy(self, benchmark, loop, sa_session: Any) -> None:
+        from sqlalchemy import select
+
+        def op() -> list:
+            async def go() -> list:
+                result = await sa_session.execute(
+                    select(SAPost, SAAccount).join(
+                        SAAccount, SAPost.account_id == SAAccount.id
+                    )
+                )
+                return list(result.all())
+
+            return run_async(loop, go)
+
+        rows = benchmark(op)
+        assert len(rows) >= 1000
+
+    def test_django(self, benchmark, django_app: Any) -> None:
+        # django_app param is taken for its side effect: it triggers Django
+        # settings.configure()/setup() before we touch the ORM.  The model
+        # itself comes from .models since this op is post-centric.
+        from .models import DjangoPost
+
+        def op() -> list:
+            return [
+                (p, p.account) for p in DjangoPost.objects.select_related("account")
+            ]
+
+        rows = benchmark(op)
+        assert len(rows) >= 1000
