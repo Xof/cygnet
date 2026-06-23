@@ -81,11 +81,10 @@ def _make_row_builder(
     the constructor accepts exactly these fields, in this order, positionally.
     ``fields`` is dataclass declaration order and ``_render_select`` emits
     columns in that order, so the row aligns with the signature precisely when
-    the check below holds.  ``kw_only`` fields (KEYWORD_ONLY) and ``init=False``
-    fields (absent from the signature) break the alignment and route to the
-    kwargs fallback.  (``InitVar`` aligns in both the signature and ``fields``
-    — get_type_hints surfaces it — so it stays on the positional path, which is
-    harmless: both builders construct equal objects.)
+    the check below holds.  ``kw_only`` fields (KEYWORD_ONLY), ``init=False``
+    fields (absent from the signature), and ``InitVar`` (in the constructor
+    signature but filtered out of ``fields`` by _introspect_fields, since it is
+    not a column) all break the alignment and route to the kwargs fallback.
 
     Note: for positional-eligible models an arity mismatch raises ``TypeError``
     from ``cls(*row)`` rather than a ``ValueError`` — this only fires on an
@@ -189,6 +188,15 @@ class TableMeta:
                 f"CYGNET requires dataclasses as model objects"
             )
 
+        # Only genuine dataclass instance fields are columns.  get_type_hints
+        # (below) also surfaces ClassVar, InitVar, and the KW_ONLY sentinel,
+        # which are NOT columns — left unfiltered they leak in as phantom
+        # SELECT columns that don't exist in the table.  dataclasses.fields()
+        # excludes exactly those, so its names are the column allow-list; we
+        # still resolve each surviving field's Annotated metadata via
+        # get_type_hints.
+        column_names = {f.name for f in dataclasses.fields(self.cls)}
+
         # include_extras=True is essential: without it, get_type_hints strips
         # Annotated wrappers and we lose our DBKey/AppKey/Column metadata.
         # Iteration order of the returned dict follows the dataclass field
@@ -197,6 +205,10 @@ class TableMeta:
         # and _render_select's column emission in fields-order).
         hints = get_type_hints(self.cls, include_extras=True)
         for attr, hint in hints.items():
+            if attr not in column_names:
+                # ClassVar / InitVar / KW_ONLY sentinel: surfaced by
+                # get_type_hints but not a real column — skip.
+                continue
             pk_meta: _PrimaryKey | None = None
             fk_meta: _ForeignKey | None = None
             col_name = attr
