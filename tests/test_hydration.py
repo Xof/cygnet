@@ -3,14 +3,21 @@
 import dataclasses
 from typing import Annotated
 
+import pytest
+
 import cygnet
 from cygnet.annotations import DBKey
 from tests.conftest import (
     Account,
     AccountTable,
+    Doc,
+    DocTable,
+    Event,
+    EventTable,
     FakeDB,
     LogEntry,
     LogTable,
+    TaggedAccount,
     TaggedTable,
 )
 
@@ -42,6 +49,23 @@ def test_init_false_field_falls_back_to_kwargs():
 
     # Not constructible on either path; we only assert the gate picks fallback.
     assert cygnet.Table(HasInitFalse)._meta.row_builder.__name__ == "_build_kwargs"
+
+
+@pytest.mark.parametrize(
+    "table, row, expected",
+    [
+        (AccountTable, (1, "Ann", "a@e.co"), Account(1, "Ann", "a@e.co")),
+        (LogTable, (2, 1, "msg"), LogEntry(2, 1, "msg")),
+        (EventTable, ("evt-1", "launch"), Event("evt-1", "launch")),
+        (TaggedTable, (5, "vip"), TaggedAccount(5, "vip")),
+        (DocTable, (3, ["a", "b"], {"x": 1}), Doc(3, ["a", "b"], {"x": 1})),
+    ],
+)
+def test_row_builder_parity_across_conftest_models(table, row, expected):
+    # Golden parity for every shipped test model (the spec's full-model list):
+    # the chosen builder round-trips a positional row to an object equal to
+    # direct construction — for both positional and rename (TaggedAccount) shapes.
+    assert table._meta.row_builder(row) == expected
 
 
 def test_positional_builder_constructs_correctly():

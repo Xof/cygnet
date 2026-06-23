@@ -81,10 +81,11 @@ def _make_row_builder(
     the constructor accepts exactly these fields, in this order, positionally.
     ``fields`` is dataclass declaration order and ``_render_select`` emits
     columns in that order, so the row aligns with the signature precisely when
-    the check below holds.  ``kw_only`` fields (KEYWORD_ONLY), ``init=False``
-    fields (absent from the signature), and ``InitVar`` (a constructor param
-    with no matching field) all break the alignment and route to the kwargs
-    fallback.
+    the check below holds.  ``kw_only`` fields (KEYWORD_ONLY) and ``init=False``
+    fields (absent from the signature) break the alignment and route to the
+    kwargs fallback.  (``InitVar`` aligns in both the signature and ``fields``
+    — get_type_hints surfaces it — so it stays on the positional path, which is
+    harmless: both builders construct equal objects.)
 
     Note: for positional-eligible models an arity mismatch raises ``TypeError``
     from ``cls(*row)`` rather than a ``ValueError`` — this only fires on an
