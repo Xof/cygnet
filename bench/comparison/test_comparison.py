@@ -10,6 +10,26 @@
 #                 pytest-benchmark.  Numbers reflect what real Django
 #                 users see; we don't artificially async-wrap them.
 #
+# Fairness disclosures — we measure each ORM in its native, idiomatic mode and
+# DISCLOSE the asymmetries rather than engineering artificial parity.  These
+# are costs/behaviours a real application actually encounters, so correcting
+# for them would put a thumb on the scale.  Read the ratios with these in mind:
+#   - ASYNC TAX: Cygnet and SA pay one loop.run_until_complete PER op() call
+#     (an event-loop entry per measured op); Django's sync path pays none.  A
+#     real async app amortises one loop across many awaits, so this per-call
+#     cost inflates the async ORMs' ABSOLUTE numbers relative to Django — most
+#     visibly on cheap ops (e.g. insert-one, where Django can read as faster
+#     despite issuing the same INSERT … RETURNING).
+#   - SA IDENTITY MAP on reads: sa_session is reused across rounds and the read
+#     ops never commit/expire, so Session.get(pk) serves from the identity map
+#     WITHOUT SQL after round 1, and execute(select(...)) skips re-hydration of
+#     already-loaded rows.  See the per-test notes on TestSelectByPk /
+#     TestSelectAll.  This is genuine SQLAlchemy behaviour (the identity map is
+#     a feature real apps benefit from); Cygnet has no identity map by design.
+#   - SA WRITES additionally pay AsyncSession construction + a unit-of-work
+#     flush + BEGIN/COMMIT (the "S41" note on TestInsertOne) vs Cygnet's single
+#     autocommit statement.
+#
 # Skipped automatically when CYGNET_TEST_DSN is unset, or when Django /
 # SQLAlchemy aren't installed (pytest.importorskip at module load).
 #
@@ -110,8 +130,12 @@ def django_app(parsed_dsn: Any) -> Any:
                     "NAME": parsed_dsn.path.lstrip("/"),
                     "USER": parsed_dsn.username,
                     "PASSWORD": parsed_dsn.password,
-                    "HOST": parsed_dsn.hostname,
-                    "PORT": str(parsed_dsn.port),
+                    # Tolerate socket DSNs (postgresql:///db): urlparse yields
+                    # hostname=None/port=None there, and str(None) -> "None"
+                    # made psycopg reject the port. Fall back to "" so Django
+                    # uses libpq defaults (local socket / default port).
+                    "HOST": parsed_dsn.hostname or "",
+                    "PORT": str(parsed_dsn.port) if parsed_dsn.port else "",
                 }
             },
             INSTALLED_APPS=[
@@ -194,6 +218,13 @@ class TestSelectByPk:
         assert result is not None
 
     def test_sqlalchemy(self, benchmark, loop, sa_session: Any) -> None:
+        # DISCLOSURE (not corrected — see module header): sa_session is reused
+        # across all rounds and op never commits/expires, so after round 1
+        # Session.get(42) returns from the identity map WITHOUT issuing SQL.
+        # Rounds 2..N (the measured median) are cache hits, not round-trips,
+        # whereas Cygnet and Django round-trip every call. Genuine SQLAlchemy
+        # behaviour a real app benefits from; read the SA select-by-pk ratio
+        # knowing it is not a like-for-like round-trip measurement.
         def op() -> Any:
             async def go() -> Any:
                 return await sa_session.get(SAAccount, 42)
@@ -229,6 +260,12 @@ class TestSelectAll:
     def test_sqlalchemy(self, benchmark, loop, sa_session: Any) -> None:
         from sqlalchemy import select
 
+        # DISCLOSURE (not corrected — see module header): the reused sa_session
+        # issues the SELECT every round, but returns already-loaded identity-map
+        # instances for known PKs, skipping the per-row hydration Cygnet performs
+        # on all 100 rows each round. So this compares Cygnet's full hydration
+        # against SA's near-zero re-hydration — native SQLAlchemy behaviour,
+        # disclosed rather than forced to re-materialise.
         def op() -> list:
             async def go() -> list:
                 result = await sa_session.execute(select(SAAccount))
