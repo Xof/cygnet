@@ -49,11 +49,13 @@ import pytest
 # Skip the whole module if optional [bench] deps aren't installed.
 django = pytest.importorskip("django")
 sa = pytest.importorskip("sqlalchemy")
+asyncpg = pytest.importorskip("asyncpg")
 
 from sqlalchemy import ForeignKey, String, Text  # noqa: E402
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column  # noqa: E402
 
 import cygnet  # noqa: E402
+from cygnet.asyncpg_db import AsyncpgDB  # noqa: E402
 
 from ..conftest import (  # noqa: E402
     Account,
@@ -188,6 +190,44 @@ def sa_session(loop: Any, sa_engine: Any) -> Any:
     loop.run_until_complete(session.close())
 
 
+@pytest.fixture(scope="module")
+def ag_conn(loop: Any, parsed_dsn: Any) -> Any:
+    """One asyncpg connection for the module, opened on the bench loop."""
+    conn = loop.run_until_complete(asyncpg.connect(DSN))
+    yield conn
+    loop.run_until_complete(conn.close())
+
+
+@pytest.fixture
+def cygnet_asyncpg_db(populated_db: Any, ag_conn: Any) -> Any:
+    """Cygnet driven by asyncpg, reading populated_db's seeded tables.
+    Depends on populated_db so the psycopg-side seeding has run."""
+    return AsyncpgDB(ag_conn)
+
+
+@pytest.fixture(scope="session")
+def sa_engine_asyncpg(parsed_dsn: Any) -> Any:
+    """SQLAlchemy async engine on the asyncpg driver (vs sa_engine's psycopg).
+    Single-connection clamp matches the others."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    sa_dsn = DSN.replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sa_dsn, pool_size=1, max_overflow=0)
+    yield engine
+    import asyncio
+
+    asyncio.new_event_loop().run_until_complete(engine.dispose())
+
+
+@pytest.fixture
+def sa_session_asyncpg(loop: Any, sa_engine_asyncpg: Any) -> Any:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    session = AsyncSession(sa_engine_asyncpg, expire_on_commit=False)
+    yield session
+    loop.run_until_complete(session.close())
+
+
 # ── Schema fixture: ensure the populated_db tables exist ─────────────────
 # The cross-ORM benchmarks all read from the schema Cygnet's
 # `populated_db` fixture creates, but populated_db is module-scoped and
@@ -234,6 +274,24 @@ class TestSelectByPk:
         result = benchmark(op)
         assert result is not None
 
+    def test_cygnet_asyncpg(self, benchmark, loop, cygnet_asyncpg_db: Any) -> None:
+        def op() -> Any:
+            async def go() -> Any:
+                return await cygnet.get(cygnet_asyncpg_db, AccountTable, id=42)
+
+            return run_async(loop, go)
+
+        assert benchmark(op) is not None
+
+    def test_sqlalchemy_asyncpg(self, benchmark, loop, sa_session_asyncpg: Any) -> None:
+        def op() -> Any:
+            async def go() -> Any:
+                return await sa_session_asyncpg.get(SAAccount, 42)
+
+            return run_async(loop, go)
+
+        assert benchmark(op) is not None
+
     def test_django(self, benchmark, django_app: Any) -> None:
         Account_ = django_app
 
@@ -275,6 +333,27 @@ class TestSelectAll:
 
         rows = benchmark(op)
         assert len(rows) >= 100
+
+    def test_cygnet_asyncpg(self, benchmark, loop, cygnet_asyncpg_db: Any) -> None:
+        def op() -> list:
+            async def go() -> list:
+                return await cygnet.SELECT(cygnet_asyncpg_db).FROM(AccountTable)
+
+            return run_async(loop, go)
+
+        assert len(benchmark(op)) >= 100
+
+    def test_sqlalchemy_asyncpg(self, benchmark, loop, sa_session_asyncpg: Any) -> None:
+        from sqlalchemy import select
+
+        def op() -> list:
+            async def go() -> list:
+                result = await sa_session_asyncpg.execute(select(SAAccount))
+                return list(result.scalars())
+
+            return run_async(loop, go)
+
+        assert len(benchmark(op)) >= 100
 
     def test_django(self, benchmark, django_app: Any) -> None:
         Account_ = django_app
@@ -323,6 +402,33 @@ class TestInsertOne:
 
         result = benchmark(op)
         assert result is not None
+
+    def test_cygnet_asyncpg(self, benchmark, loop, cygnet_asyncpg_db: Any) -> None:
+        def op() -> Account:
+            acc = Account(id=None, name="Bench User", email="bench@example.com")
+
+            async def go() -> Account:
+                await cygnet.INSERT(cygnet_asyncpg_db).INTO(AccountTable).VALUES(acc)
+                return acc
+
+            return run_async(loop, go)
+
+        assert benchmark(op).id is not None
+
+    def test_sqlalchemy_asyncpg(self, benchmark, loop, sa_engine_asyncpg: Any) -> None:
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        def op() -> Any:
+            async def go() -> Any:
+                async with AsyncSession(sa_engine_asyncpg, expire_on_commit=False) as s:
+                    acc = SAAccount(name="Bench User", email="bench@example.com")
+                    s.add(acc)
+                    await s.commit()
+                    return acc.id
+
+            return run_async(loop, go)
+
+        assert benchmark(op) is not None
 
     def test_django(self, benchmark, django_app: Any) -> None:
         Account_ = django_app
@@ -374,6 +480,41 @@ class TestBulkInsert:
 
         n = benchmark(op)
         assert n == 50
+
+    def test_cygnet_asyncpg(self, benchmark, loop, cygnet_asyncpg_db: Any) -> None:
+        def op() -> list:
+            accs = [
+                Account(id=None, name=f"Bulk {i}", email=f"b{i}@example.com")
+                for i in range(50)
+            ]
+
+            async def go() -> list:
+                return await (
+                    cygnet.INSERT(cygnet_asyncpg_db).INTO(AccountTable).BULK_VALUES(accs)
+                )
+
+            return run_async(loop, go)
+
+        assert len(benchmark(op)) == 50
+
+    def test_sqlalchemy_asyncpg(self, benchmark, loop, sa_engine_asyncpg: Any) -> None:
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        def op() -> int:
+            objs = [
+                SAAccount(name=f"Bulk {i}", email=f"b{i}@example.com")
+                for i in range(50)
+            ]
+
+            async def go() -> int:
+                async with AsyncSession(sa_engine_asyncpg, expire_on_commit=False) as s:
+                    s.add_all(objs)
+                    await s.commit()
+                    return len(objs)
+
+            return run_async(loop, go)
+
+        assert benchmark(op) == 50
 
     def test_django(self, benchmark, django_app: Any) -> None:
         Account_ = django_app
