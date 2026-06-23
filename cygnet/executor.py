@@ -15,7 +15,7 @@
 # all have exactly one place to live and be reasoned about.
 #
 # Row mapping (the inverse direction — rows back to objects) also lives
-# here, in _map_row / _row_to_obj.  Keeping both directions in one file
+# here, in _row_mapper / _row_to_obj.  Keeping both directions in one file
 # means the "column order matches meta.fields order" invariant — set up
 # by the SELECT renderer and consumed by the row mapper — never has to
 # cross a module boundary.
@@ -277,12 +277,12 @@ class Executor:
             # has_from must be True here (caught above when both are missing).
             #
             # This is the load-bearing invariant for the row mapper:
-            # _map_row / _row_to_obj rely on result[i] corresponding to
+            # _row_mapper / _row_to_obj rely on result[i] corresponding to
             # meta.fields[i].  Emitting columns in meta.fields order here
             # is what makes that work.  Joins extend the same convention:
             # left table's fields first (length = len(left.fields)), then
             # each right table's fields (length = len(jt.fields)) in
-            # b._joins order — which is exactly what _map_row's offset
+            # b._joins order — which is exactly what _row_mapper's offset
             # arithmetic assumes.
             assert b._table is not None
             table = b._table._meta
@@ -479,7 +479,8 @@ class Executor:
         # 2. JOINs → (left_obj, right_obj, ...).  Slices and nullability are
         #    fixed by query shape, so precompute them once.  left_can_miss:
         #    RIGHT/FULL make the FROM side nullable.  Per join, LEFT/FULL make
-        #    that join's right side nullable.
+        #    that join's right side nullable (RIGHT and INNER guarantee it
+        #    present — RIGHT preserves the right side, INNER requires the match).
         if b._joins:
             left_meta = b._table._meta
             left_n = len(left_meta.fields)
@@ -503,15 +504,11 @@ class Executor:
 
             return map_join
 
-        # 3. Simple query → dataclass instance via the table's row_builder.
-        build = b._table._meta.row_builder
-        return lambda row: build(row)
-
-    def _map_row(self, b: Any, row: Any) -> Any:
-        """Map a single row.  Builds the mapper fresh, so callers mapping many
-        rows should use _row_mapper directly (as _map_select and stream_select
-        do) rather than calling this in a loop."""
-        return self._row_mapper(b)(row)
+        # 3. Simple query → dataclass instance via the table's row_builder,
+        #    returned directly (no wrapper frame on the hottest mapping path).
+        #    The annotation pins the Any-typed attribute to the declared return.
+        build: Callable[[Any], Any] = b._table._meta.row_builder
+        return build
 
     def _map_select(self, b: Any, rows: list[Any]) -> list[Any]:
         map_one = self._row_mapper(b)
@@ -545,7 +542,7 @@ class Executor:
         sql, params = self.render_select(b)
         # Yield-per-row; mapping is done lazily so the row buffer never
         # has to materialise the whole result set.  Each yielded object
-        # is a fresh dataclass instance (or tuple, per _map_row's mode).
+        # is a fresh dataclass instance (or tuple, per _row_mapper's mode).
         mapper = self._row_mapper(b)
         async for row in self._db.stream(sql, params):
             yield mapper(row)

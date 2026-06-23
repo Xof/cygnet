@@ -88,6 +88,22 @@ async def test_right_join_left_side_miss_yields_none():
     assert log == LogEntry(id=5, account_id=99, message="orphan log")
 
 
+async def test_left_join_right_side_miss_yields_none():
+    # LEFT JOIN: the log (right) side is NULL when an account has no matching
+    # log → right object None, left object present.  Locks the per-join cm=True
+    # (LEFT/FULL) branch the row mapper restructured into its plan.
+    rows = [(1, "Ann", "ann@example.com", None, None, None)]
+    db = FakeDB(rows=rows)
+    result = await (
+        cygnet.SELECT(db)
+        .FROM(AccountTable)
+        .LEFT_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+    )
+    (acct, log), = result
+    assert acct == Account(id=1, name="Ann", email="ann@example.com")
+    assert log is None
+
+
 async def test_inner_join_maps_both_sides():
     rows = [(1, "Ann", "ann@example.com", 7, 1, "hello")]
     db = FakeDB(rows=rows)

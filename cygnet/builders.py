@@ -176,7 +176,7 @@ class SelectBuilder(_Builder):
         # executor emits joins in insertion order, so JOIN A then LEFT_JOIN B
         # produces `... JOIN A ON ... LEFT JOIN B ON ...` and the right-hand-
         # side column visibility cascades accordingly.  The miss-detection
-        # in _map_row branches on kind to decide whether the left side
+        # in _row_mapper branches on kind to decide whether the left side
         # (RIGHT, FULL), the right side (LEFT, FULL), or neither
         # (INNER) can be NULL for a given join.
         self._joins: list[tuple[str, TableSource, Predicate]] = []
