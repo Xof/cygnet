@@ -47,6 +47,12 @@ Issues = "https://github.com/Xof/cygnet/issues"
 psycopg = [
     "psycopg[binary]>=3.1",
 ]
+# asyncpg adapter dependency.  `pip install cygnet-orm[asyncpg]` for users who
+# want AsyncpgDB (the native asyncpg adapter) out of the box.  asyncpg speaks
+# libpq's $N placeholders directly — no DB-API %s translation needed.
+asyncpg = [
+    "asyncpg>=0.29",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -57,6 +63,8 @@ dev = [
     # protocol parity check.  Pinned to the same floor as the [psycopg]
     # extra; keep these in sync.
     "psycopg[binary]>=3.1",
+    # asyncpg adapter + its integration tests (tests/integration/test_asyncpg_adapter).
+    "asyncpg>=0.29",
 ]
 # Optional: micro/macro benchmarks + cross-ORM comparison.  Heavy
 # dependencies (Django, SQLAlchemy) live here so regular `dev` installs
@@ -70,6 +78,8 @@ bench = [
     "sqlalchemy[asyncio]>=2.0",
     # bench/test_e2e.py wraps a real PG connection with PsycopgDB.
     "psycopg[binary]>=3.1",
+    # asyncpg powers the cygnet/asyncpg and SQLAlchemy/asyncpg comparison columns.
+    "asyncpg>=0.29",
 ]
 
 [tool.hatch.build.targets.wheel]
