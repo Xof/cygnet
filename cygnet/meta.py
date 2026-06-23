@@ -82,13 +82,15 @@ def _make_row_builder(
     ``fields`` is dataclass declaration order and ``_render_select`` emits
     columns in that order, so the row aligns with the signature precisely when
     the check below holds.  ``kw_only`` fields (KEYWORD_ONLY), ``init=False``
-    fields (absent from the signature), and ``InitVar`` (extra/renamed param)
-    all break the alignment and route to the kwargs fallback.
+    fields (absent from the signature), and ``InitVar`` (a constructor param
+    with no matching field) all break the alignment and route to the kwargs
+    fallback.
 
     Note: for positional-eligible models an arity mismatch raises ``TypeError``
     from ``cls(*row)`` rather than a ``ValueError`` — this only fires on an
     adapter returning the wrong column count (a driver bug), since the renderer
-    guarantees arity for the implicit-column SELECTs that reach hydration.
+    guarantees arity for the implicit-column SELECTs that reach hydration.  The
+    kwargs fallback keeps the historical ``ValueError`` via ``strict=True``.
     """
     attr_names = [f.attr_name for f in fields]
     params = list(inspect.signature(cls).parameters.values())
@@ -104,7 +106,10 @@ def _make_row_builder(
         return _build_positional
 
     def _build_kwargs(row: Sequence[Any]) -> Any:
-        return cls(**dict(zip(attr_names, row)))
+        # strict=True preserves the historical _row_to_obj arity guarantee: a
+        # row/field count mismatch surfaces as ValueError at this seam rather
+        # than silently truncating to the shorter side.
+        return cls(**dict(zip(attr_names, row, strict=True)))
 
     return _build_kwargs
 
