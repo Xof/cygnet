@@ -55,6 +55,8 @@ def test_kwargs_fallback_constructs_correctly():
 async def test_row_to_obj_delegates_to_row_builder(monkeypatch):
     # White-box: hydration must go through meta.row_builder, not a private
     # kwargs path.  Swapping the builder for a sentinel proves the delegation.
+    # AccountTable._meta is a shared singleton; monkeypatch's function scope
+    # reverts the swap after this test (so other tests see the real builder).
     sentinel = object()
     monkeypatch.setattr(
         AccountTable._meta, "row_builder", lambda row: sentinel

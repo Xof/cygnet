@@ -1418,10 +1418,11 @@ class Executor:
 
         Construction is delegated to ``meta.row_builder`` (chosen once at
         introspection).  A row whose length differs from ``meta.fields`` raises
-        at this seam — ``TypeError`` for positional-eligible models
-        (``cls(*row)``), ``ValueError`` for the kwargs fallback
-        (``strict=True``).  The implicit-column SELECTs the executor emits
-        guarantee ``len(row) == len(meta.fields)``, so this only surfaces on a
+        when the builder is called — ``TypeError`` for positional-eligible
+        models (``cls(*row)``), ``ValueError`` for the kwargs fallback
+        (``strict=True``); both originate in ``meta._make_row_builder``.  The
+        implicit-column SELECTs the executor emits guarantee
+        ``len(row) == len(meta.fields)``, so this only surfaces on a
         misbehaving adapter.
         """
         # Every row produces a NEW dataclass instance — no caching, no
@@ -1430,7 +1431,4 @@ class Executor:
         # deliberate simplification compared to richer ORMs (no session,
         # no unit-of-work) and is the reason "stale instance" hazards
         # don't exist in Cygnet.
-        # Construction strategy was chosen once at Table() introspection time
-        # (see meta._make_row_builder): positional cls(*row) for plain
-        # dataclasses, kwargs fallback otherwise.
         return meta.row_builder(row)
