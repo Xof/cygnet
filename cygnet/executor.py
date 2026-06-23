@@ -1416,21 +1416,13 @@ class Executor:
         so the result columns always align with the dataclass fields
         regardless of the physical column order (attnum) in PostgreSQL.
 
-        Uses ``zip(..., strict=True)`` (S2): a length mismatch between
-        the row and ``meta.fields`` is now a ValueError at this seam
-        rather than a downstream surprise.  Pre-strict, a too-short row
-        produced a dataclass missing fields (constructor raised
-        TypeError far from the cause), and a too-long row silently
-        dropped the tail.  Both are renderer/adapter bugs that we'd
-        rather surface immediately.  The implicit-column SELECTs the
-        executor emits guarantee ``len(row) == len(meta.fields)``;
-        only hand-written ``lit()`` projections or custom-adapter row
-        shapes can trip the strict check.
-
-        Construction uses meta.cls(**kwargs) with positional→name mapping,
-        which means the dataclass must accept every field by keyword.  A
-        dataclass that declares init=False on any field, or uses __init__
-        with positional-only parameters, will not be hydratable this way.
+        Construction is delegated to ``meta.row_builder`` (chosen once at
+        introspection).  A row whose length differs from ``meta.fields`` raises
+        at this seam — ``TypeError`` for positional-eligible models
+        (``cls(*row)``), ``ValueError`` for the kwargs fallback
+        (``strict=True``).  The implicit-column SELECTs the executor emits
+        guarantee ``len(row) == len(meta.fields)``, so this only surfaces on a
+        misbehaving adapter.
         """
         # Every row produces a NEW dataclass instance — no caching, no
         # identity map, no de-duplication.  Two SELECTs that return the
@@ -1438,5 +1430,7 @@ class Executor:
         # deliberate simplification compared to richer ORMs (no session,
         # no unit-of-work) and is the reason "stale instance" hazards
         # don't exist in Cygnet.
-        kwargs = {f.attr_name: val for f, val in zip(meta.fields, row, strict=True)}
-        return meta.cls(**kwargs)
+        # Construction strategy was chosen once at Table() introspection time
+        # (see meta._make_row_builder): positional cls(*row) for plain
+        # dataclasses, kwargs fallback otherwise.
+        return meta.row_builder(row)

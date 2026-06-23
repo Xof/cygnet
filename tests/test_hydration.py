@@ -5,7 +5,7 @@ from typing import Annotated
 
 import cygnet
 from cygnet.annotations import DBKey
-from tests.conftest import Account, AccountTable, TaggedTable
+from tests.conftest import Account, AccountTable, FakeDB, TaggedTable
 
 
 def test_standard_dataclass_uses_positional_builder():
@@ -50,3 +50,15 @@ def test_kwargs_fallback_constructs_correctly():
 
     obj = cygnet.Table(KwOnly)._meta.row_builder((1, "hi"))
     assert obj == KwOnly(id=1, label="hi")
+
+
+async def test_row_to_obj_delegates_to_row_builder(monkeypatch):
+    # White-box: hydration must go through meta.row_builder, not a private
+    # kwargs path.  Swapping the builder for a sentinel proves the delegation.
+    sentinel = object()
+    monkeypatch.setattr(
+        AccountTable._meta, "row_builder", lambda row: sentinel
+    )
+    db = FakeDB(rows=[(1, "a", "a@example.com")])
+    result = await cygnet.SELECT(db).FROM(AccountTable)
+    assert result == [sentinel]
