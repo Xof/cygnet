@@ -10,10 +10,12 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import types
 import typing
 import weakref
-from typing import Annotated, Union, get_args, get_origin, get_type_hints
+from collections.abc import Callable, Sequence
+from typing import Annotated, Any, Union, get_args, get_origin, get_type_hints
 
 from .annotations import DBKey, _Column, _ForeignKey, _PrimaryKey
 
@@ -69,6 +71,44 @@ class FieldMeta:
 _cache: weakref.WeakValueDictionary[type, TableMeta] = weakref.WeakValueDictionary()
 
 
+def _make_row_builder(
+    cls: type, fields: list[FieldMeta]
+) -> Callable[[Sequence[Any]], Any]:
+    """Pick the row→object constructor once per table.
+
+    Positional construction (``cls(*row)``) is ~5x cheaper than building a
+    per-row kwargs dict and calling ``cls(**kwargs)``, but is only valid when
+    the constructor accepts exactly these fields, in this order, positionally.
+    ``fields`` is dataclass declaration order and ``_render_select`` emits
+    columns in that order, so the row aligns with the signature precisely when
+    the check below holds.  ``kw_only`` fields (KEYWORD_ONLY), ``init=False``
+    fields (absent from the signature), and ``InitVar`` (extra/renamed param)
+    all break the alignment and route to the kwargs fallback.
+
+    Note: for positional-eligible models an arity mismatch raises ``TypeError``
+    from ``cls(*row)`` rather than a ``ValueError`` — this only fires on an
+    adapter returning the wrong column count (a driver bug), since the renderer
+    guarantees arity for the implicit-column SELECTs that reach hydration.
+    """
+    attr_names = [f.attr_name for f in fields]
+    params = list(inspect.signature(cls).parameters.values())
+    positional = len(params) == len(attr_names) and all(
+        p.name == a and p.kind in (p.POSITIONAL_OR_KEYWORD, p.POSITIONAL_ONLY)
+        for p, a in zip(params, attr_names)
+    )
+    if positional:
+
+        def _build_positional(row: Sequence[Any]) -> Any:
+            return cls(*row)
+
+        return _build_positional
+
+    def _build_kwargs(row: Sequence[Any]) -> Any:
+        return cls(**dict(zip(attr_names, row)))
+
+    return _build_kwargs
+
+
 class TableMeta:
     # __new__ + _initialised guard implements a manual singleton-per-class
     # pattern.  We can't use __init_subclass__ or a metaclass because
@@ -116,6 +156,11 @@ class TableMeta:
             self._introspect_fields()
             self._initialised = True
             self._validate_foreign_keys()
+            # Constructor strategy is decided once here, now that self.fields is
+            # final — reused on every hydrated row.  See _make_row_builder.
+            self.row_builder: Callable[[Sequence[Any]], Any] = _make_row_builder(
+                self.cls, self.fields
+            )
         except Exception:
             # S26: evict half-built (pass-1 failure: no/duplicate PK,
             # frozen+DBKey) AND FK-invalid (pass-2 failure: bad target/type)
