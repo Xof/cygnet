@@ -81,7 +81,9 @@ class TestAsyncpgAdapter:
                 await cygnet.INSERT(db).INTO(GizmoTable).VALUES(g)
                 raise RuntimeError("boom")
         # The row must not have persisted.
-        matches = await cygnet.SELECT(db).FROM(GizmoTable).WHERE(
-            GizmoTable.name == "RolledBack"
+        matches = (
+            await cygnet.SELECT(db)
+            .FROM(GizmoTable)
+            .WHERE(GizmoTable.name == "RolledBack")
         )
         assert matches == []
