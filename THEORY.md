@@ -57,7 +57,8 @@ At the bottom, **`annotations.py`** defines passive marker objects (`DBKey`,
 `AppKey`, `Column`, `ForeignKey`) that do nothing but sit inside `Annotated[]`.
 **`meta.py`** is the one place that reads them, turning a dataclass into a
 `TableMeta` (a list of `FieldMeta`). Everything upward treats `TableMeta` as the
-description of a table.
+description of a table. `TableMeta` also computes, once per class, the `row_builder`
+that turns a result row back into an instance — see "Hydration is positional" below.
 
 **`proxy.py`** is the bridge from Python syntax to the AST. `Table(MyModel)` returns
 a `TableProxy`; attribute access (`T.col`) returns a `ColumnProxy`. The proxies are
@@ -96,9 +97,11 @@ executing, because rendering is a separate, stateless pass owned by the executor
 (`_sql_name`, `_meta`, `_alias`, plus stamped `ColumnProxy` attributes) that the
 executor renders them through the same `FROM`/`JOIN` paths as a real table.
 
-**`psycopg_db.py`** sits outside the core entirely — it is the reference adapter and
-the sole importer of psycopg, kept behind an optional extra so the core install
-pulls no driver.
+**`psycopg_db.py`** and **`asyncpg_db.py`** sit outside the core entirely — they are
+the two reference adapters (psycopg3 and asyncpg), each the sole importer of its own
+driver, each behind an optional extra so the core install pulls no driver. The formal
+contract they satisfy — the `@runtime_checkable` `DBAdapter` Protocol — is defined in
+`expression.py`, alongside the `SQLRenderable` protocol.
 
 ## Core ideas
 
@@ -129,12 +132,20 @@ subqueries: once a builder renders like any other node, every expression context
 to parenthesise — and it is exactly why `_Exists` is a dedicated node rather than a
 reuse of `PrefixOp` (which would add a *second* pair of parens; ADR `CO2`).
 
-**The duck-typed `db`.** Cygnet's core never imports a driver. The `db` argument
-just has to provide `execute`, `execute_one`, an optional `stream`, and an
-`_in_transaction` flag (ADR `D1`). Connection management, pooling, and retry are the
-caller's concern because they vary by deployment and are not the ORM's problem. This
-is also what makes the unit suite possible: `FakeDB` is a full, legitimate adapter
-that happens to record SQL instead of talking to Postgres.
+**The duck-typed `db`.** Cygnet's core never imports a driver (ADR `D1`). What began
+as an informal four-method convention is now a formal `@runtime_checkable` `DBAdapter`
+Protocol (`expression.py`): an adapter must provide `execute`, `execute_one`, and the
+`_in_transaction` / `_transaction_task` flags, and *may* provide `stream` (incremental
+reads) and `column_defaults` (DEFAULT-aware INSERT codegen). The two optional methods
+are deliberately kept *out* of the Protocol body and probed with `hasattr` at the call
+sites, so an adapter that omits them is still a conforming `DBAdapter` — it just gets
+the historical behaviour (no streaming; INSERTs emit every field, NULLs included).
+`@runtime_checkable` lets an adapter author sanity-check shape with
+`isinstance(adapter, DBAdapter)`. Connection management, pooling, and retry stay the
+caller's concern because they vary by deployment. This is also what makes the unit
+suite possible: `FakeDB` is a full, legitimate adapter that happens to record SQL
+instead of talking to Postgres — and the reference drivers come in two flavours,
+`PsycopgDB` and the recent `AsyncpgDB` (ADR `D2`).
 
 **Singleton proxies with identity semantics.** `TableMeta` and `TableProxy` are
 cached per class in a `WeakValueDictionary` so that `Table(M)` is `Table(M)` — the
@@ -143,6 +154,26 @@ executor relies on `b._table is X` identity in places (ADR `C1`). The cache is
 `.AS()` is the deliberate exception: self-joins need two distinct proxies for one
 table, so aliased proxies are constructed fresh and bypass the cache, leaving the
 canonical singleton untouched (ADR `C2`).
+
+**Hydration is positional, and the strategy is chosen once per table.** Turning a
+result row back into a dataclass was, by profiling, the single largest cost on the
+read path — `_row_to_obj` measured ~35% of runtime over 2M mapped rows. The expense
+was not constructing the object; it was the per-row kwargs dict and the `**` call
+convention. Because `meta.fields` is declaration order and `_render_select` emits
+columns in that same order, the Nth row element already lines up with the Nth
+constructor parameter — so for a standard dataclass, `cls(*row)` is correct and ~5.5×
+faster than `cls(**dict(...))` (`docs/specs/2026-06-22-positional-hydration-design.md`).
+`TableMeta.__init__` decides this *once*: `_make_row_builder` compares the
+constructor's signature against `meta.fields` and stores a `row_builder` that is
+either the positional `cls(*row)` or a kwargs fallback. The fallback exists for the
+shapes positional construction can't serve — `kw_only=True` fields (keyword-only
+parameters) and `field(init=False)` (absent from the signature) — detected from the
+signature, never guessed. Its one prerequisite is that `meta.fields` hold *exactly*
+the constructor's parameters: a sibling fix made `_introspect_fields` exclude
+`ClassVar`, `InitVar`, and the bare `KW_ONLY` sentinel, which otherwise leaked into
+`fields` and would have shifted the positional map by a column. Hydration is the only
+place that exact alignment is load-bearing, which is why the field-filter and the
+row-builder are part of the same story.
 
 ## Design decisions and tradeoffs
 
@@ -172,9 +203,26 @@ to chase for detail.
   unifying principle: a *silent no-op is the dangerous kind of safety rail* because
   it masks bugs. Every rail here converts a likely mistake into an exception. The
   `WHERE(cygnet.all)` opt-out exists so "all rows" is a deliberate two-word act.
-- **psycopg is an optional extra (`D2`).** Since core never imports psycopg outside
-  `psycopg_db.py`, forcing it into the base install would contradict `D1`. The extra
-  keeps the core driver-free.
+- **Drivers are optional extras (`D2`).** Since core never imports a driver outside
+  the adapter modules, forcing one into the base install would contradict `D1`. Each
+  reference adapter has its own extra — `[psycopg]` and `[asyncpg]` — so the core
+  install stays driver-free and a project pulls only the driver it uses.
+- **The asyncpg adapter, and "Approach A" (recent; postdates the original ADR).**
+  asyncpg is not DB-API 2.0, but it speaks libpq's native `$N` placeholders — exactly
+  what Cygnet emits — so `AsyncpgDB` does *no* `$N`→`%s` translation (the psycopg
+  adapter's one edge cost simply disappears). The open design question was asyncpg's
+  `Record` rows, which are not plain tuples. **Approach A** converts each
+  `Record`→`tuple` at the adapter boundary, so the positional `row_builder` above runs
+  unchanged; the rejected **Approach B** would be a `Record`-consuming codegen builder
+  that skips the conversion entirely. The conversion is a fixed per-row tax, and the
+  measured shape is exactly what that predicts: asyncpg wins on writes and single-row
+  reads (nothing per-row to tax), goes flat around 100 rows, and turns into a *net
+  loss* on a 1000-row, two-objects-per-row JOIN. So asyncpg shipped as a first cut —
+  faster where it's faster, honest about where it isn't — with Approach B left as the
+  data-justified next step for multi-row-read-heavy workloads
+  (`docs/specs/2026-06-23-asyncpg-adapter-design.md`, `…-results.md`). It also omits
+  both optional protocol methods (`stream`, `column_defaults`); see "Where the bodies
+  are buried".
 - **Transactions are an async context manager, not a session object (`D3`).**
   `async with transaction(db)` issues `BEGIN`/`COMMIT`; nested uses promote to
   `SAVEPOINT`/`RELEASE` by checking `_in_transaction` at runtime. No new "unit of
@@ -258,7 +306,18 @@ The honest section — sharp edges, intentional-looking-bugs, and real debt.
 - **The `$N`→`%s` translation assumes ordered consumption.** psycopg consumes params
   in list order, which matches the order Cygnet appends them; a hypothetical
   out-of-order render (`$2` before `$1`) would break it. The left-to-right invariant
-  is what keeps this safe — the translator has no SQL awareness of its own.
+  is what keeps this safe — the translator has no SQL awareness of its own. (asyncpg
+  sidesteps this entirely: it takes `$N` natively, so `AsyncpgDB` does no translation.)
+- **The asyncpg adapter is a deliberate first cut.** It implements only the two
+  required protocol methods. No `stream`, so `AsyncpgDB` can't back
+  `SelectBuilder.stream()`. No `column_defaults`, which has a concrete consequence: a
+  `None`-valued *non-PK* column with a schema-side `DEFAULT` is inserted as an explicit
+  `NULL` rather than letting the DEFAULT fire (and a `NOT NULL DEFAULT` column then
+  errors). A SERIAL/`DBKey` PK is unaffected — it is omitted unconditionally and read
+  back via `RETURNING`. Don't reach for `AsyncpgDB` on a schema that leans on non-PK
+  DEFAULTs without first implementing `column_defaults` (copy psycopg's). The per-row
+  `Record`→`tuple` conversion (Approach A, above) is the other thing to keep in mind:
+  it is a net loss on large multi-row reads.
 
 ## Making common changes
 
@@ -276,15 +335,19 @@ Grounded in the real structure (signatures are in the code — this is the *shap
   the relevant builder in `builders.py` (store intent, return `self`) and a render
   branch in `executor.py`. Keep the builder ignorant of SQL; put the SQL in the
   executor.
-- **Change row→object hydration.** `executor.py` mapping path only. Remember the
-  multi-source JOIN contract: a tuple per row, `None` on a side meaning an
-  outer-join miss (detected via the PK column, falling back to all-NULL). `FOLLOW`/
-  `LEFT_FOLLOW` ride this same path — they generate the ON-condition from FK metadata
-  and delegate to `JOIN`/`LEFT_JOIN`, adding no executor or row-mapping code of their
-  own, so a change here affects them too.
-- **Add a `db` adapter.** Satisfy the four-method protocol (ARCHITECTURE §Invariants);
-  copy `psycopg_db.py` as the template. If you support `stream`, return an async
-  iterator over a server-side cursor.
+- **Change row→object hydration.** Two seams now: the construction *strategy*
+  (positional vs kwargs) is chosen once per table in `meta.py` (`_make_row_builder`);
+  the per-query *mapping* (single-source vs columnar-tuple vs JOIN) lives in
+  `executor.py`. Remember the multi-source JOIN contract: a tuple per row, `None` on a
+  side meaning an outer-join miss (detected via the PK column, falling back to
+  all-NULL). `FOLLOW`/`LEFT_FOLLOW` ride this same path — they generate the
+  ON-condition from FK metadata and delegate to `JOIN`/`LEFT_JOIN`, adding no executor
+  or row-mapping code of their own, so a change here affects them too.
+- **Add a `db` adapter.** Satisfy the `DBAdapter` Protocol (ARCHITECTURE §Invariants);
+  copy `psycopg_db.py` or `asyncpg_db.py` as the template, and use
+  `isinstance(adapter, DBAdapter)` to check shape. The two optional methods are
+  opt-in: implement `stream` to back `SelectBuilder.stream()` (return an async iterator
+  over a server-side cursor), and `column_defaults` to enable DEFAULT-aware INSERTs.
 - **Add PK/FK/column semantics.** A passive marker in `annotations.py` plus the
   `isinstance` branch that reads it in `meta._introspect`. Keep markers passive —
   they must not mutate the dataclass.

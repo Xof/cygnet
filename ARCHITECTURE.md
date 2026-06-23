@@ -24,16 +24,17 @@ edge) and `predicate.__invert__` → `expression.PrefixOp` (the reverse of
 |---|---|---|
 | `__init__.py` | Public API surface; query-verb factories | `Table`, `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`, `get`/`save`/`create`/`follow`, `lit`/`op`/`ops`/`exists`, `transaction`, `cte`/`recursive_cte`/`lateral` |
 | `annotations.py` | Passive metadata markers, introspected by `meta` | `DBKey`, `AppKey`, `Column`, `ForeignKey`, `@table` |
-| `meta.py` | Dataclass → `TableMeta`/`FieldMeta` introspection | `TableMeta` (WeakValueDict-cached per class) |
+| `meta.py` | Dataclass → `TableMeta`/`FieldMeta` introspection; picks the per-class `row_builder` (positional vs kwargs) | `TableMeta` (WeakValueDict-cached per class; `.fields` excludes ClassVar/InitVar/KW_ONLY; `.row_builder`) |
 | `proxy.py` | Attribute access → predicate AST | `TableProxy[T]`, `ColumnProxy[FT]` (per-class singletons; `.AS()` bypasses cache) |
 | `predicate.py` | Comparison/predicate AST + the operator-overload menu | `Predicate`, `Literal`, `_All`, **`_InfixOps`** mixin |
-| `expression.py` | `SQLRenderable` protocol + expression nodes | `SQLRenderable`, `op`/`ops`, `PrefixOp`/`SuffixOp`, `FunctionCall`, `WindowExpression`, `_Exists`, `exists`/`not_exists` |
+| `expression.py` | `SQLRenderable` + `DBAdapter` protocols + expression nodes | `SQLRenderable`, **`DBAdapter`** (`@runtime_checkable`), `op`/`ops`, `PrefixOp`/`SuffixOp`, `FunctionCall`, `WindowExpression`, `_Exists`, `exists`/`not_exists` |
 | `builders.py` | Fluent, awaitable query builders | `SelectBuilder`, `InsertBuilder`, `UpdateBuilder`, `DeleteBuilder`, `_LockClause` |
 | `executor.py` | Render + execute each verb; row→object mapping | `render_*`/`run_*` per verb, hydration |
 | `cte.py` | WITH-clause / lateral sources that duck-type `TableProxy` | `CTE`, `RecursiveCTE`, `Lateral` |
 | `functions.py` | Curated PG function wrappers | `count`, `sum`, `coalesce`, `row_number`, `lag`/`lead`, … + `fn(name)` escape hatch |
 | `jsonb.py` / `arrays.py` / `fts.py` | Operator/function helpers for JSONB, arrays, full-text | `->`/`->>`/`@>`, `&&`/`ANY`/`ALL`, `to_tsvector`/`@@`/`ts_rank` |
-| `psycopg_db.py` | Reference psycopg3 adapter | `PsycopgDB` (the **only** module that imports psycopg; gated behind `[psycopg]` extra) |
+| `psycopg_db.py` | Reference psycopg3 adapter | `PsycopgDB` (imports psycopg; `$N`→`%s` translation; gated behind `[psycopg]` extra) |
+| `asyncpg_db.py` | Reference asyncpg adapter | `AsyncpgDB` (imports asyncpg; native `$N`, no translation; gated behind `[asyncpg]` extra; first cut — no `stream`/`column_defaults`) |
 | `stubs.py` | `python -m cygnet.stubs` codegen for IDE autocomplete | — |
 | `py.typed` | PEP 561 typed-library marker | — |
 
@@ -54,8 +55,9 @@ this is the enumeration.
 - **Exactly one `DBKey` or `AppKey` field per model.** Breaks: `meta._introspect` raises; composite PKs are unsupported by design.
 - **`DBKey` + `frozen=True` is rejected at introspection time.** Breaks: post-INSERT the executor `setattr`s the generated PK; a frozen instance would raise `FrozenInstanceError` deep in insert — caught early so the error names the model.
 - **`AppKey` + `None` at INSERT raises; empty `UPDATE … SET` raises; unknown `SET`/INSERT/`DO UPDATE` kwargs raise.** Breaks: these are anti-silent-no-op rails — a typo'd field name must fail loudly, not emit a no-op.
-- **The `db` object satisfies a duck-typed protocol — `execute`, `execute_one`, optional `stream`, and a `_in_transaction: bool` flag — and is per-task.** Breaks: `_in_transaction` is per-`db`-instance, not task-local; sharing one connection across `asyncio` tasks corrupts SAVEPOINT nesting.
-- **Core never imports a driver; only `psycopg_db.py` imports psycopg.** Breaks: pulling psycopg into core contradicts the bring-your-own-adapter design and the driver-free core install.
+- **Row hydration is positional by column order: the Nth element of a result row maps to the Nth `meta.fields` entry.** Declaration order = SELECT-emission order = positional `__init__` order, which is what lets `meta.row_builder` construct via `cls(*row)`. Breaks: reordering a model's fields relative to the emitted column order silently mis-hydrates (right type, wrong attribute — no error). Models whose constructor isn't positionally bindable (`kw_only`, `field(init=False)`) are detected once per class and fall back to kwargs construction; `.fields` excluding ClassVar/InitVar/KW_ONLY is what keeps the alignment honest.
+- **The `db` object satisfies the `@runtime_checkable DBAdapter` Protocol (`expression.py`): required `execute`, `execute_one`, `_in_transaction: bool`, `_transaction_task`; optional (probed by `hasattr`, *not* in the Protocol) `stream` and `column_defaults`. It is per-task.** Breaks: `_in_transaction`/`_transaction_task` are per-`db`-instance, not task-local; sharing one connection across `asyncio` tasks corrupts SAVEPOINT nesting and the task-locality guard. A missing optional method silently disables its feature (no `stream` → `SelectBuilder.stream()` raises; no `column_defaults` → INSERTs emit every field including explicit NULLs).
+- **Core never imports a driver; each reference adapter imports exactly its own driver (`psycopg_db.py`→psycopg, `asyncpg_db.py`→asyncpg), both behind optional extras.** Breaks: pulling a driver into core contradicts the bring-your-own-adapter design and the driver-free core install.
 
 ## Landmines
 
@@ -68,6 +70,7 @@ Non-obvious things a cold worker gets wrong. Each prevents a specific wrong acti
 - **Window-frame strings are interpolated verbatim** (e.g. `ROWS BETWEEN …`) — trusted, not parameterised. Another injection surface.
 - **`CTE`/`Lateral` duck-type `TableProxy`** by stamping `ColumnProxy` attrs on themselves with `# type: ignore`; they are not yet a formal `TableSourceProtocol` (OQ4). Treat `_sql_name`/`_meta`/`_alias` as the surface the executor reads.
 - **`_Exists` is dedicated, not `PrefixOp("EXISTS", …)`** — because `SelectBuilder.render_sql` already wraps itself in parens, reusing `PrefixOp` would emit `EXISTS ((SELECT …))`. `~exists(b)` toggles `EXISTS ↔ NOT EXISTS` rather than wrapping in `NOT (…)`.
+- **`AsyncpgDB` is a first cut: no `stream`, no `column_defaults`.** Without `column_defaults`, a `None`-valued *non-PK* column carrying a schema `DEFAULT` is inserted as an explicit NULL — the DEFAULT does not fire (a `NOT NULL DEFAULT` column then raises); a SERIAL/`DBKey` PK is unaffected (omitted unconditionally, read back via `RETURNING`). It uses **Approach A**: convert each asyncpg `Record`→`tuple` at the adapter boundary so hydration stays on the positional fast path. That per-row conversion is a fixed tax — asyncpg wins on writes/single-row but is a *net loss* on large multi-row reads (THEORY covers the Approach-A tradeoff).
 
 ## Flow
 
@@ -75,7 +78,8 @@ Non-obvious things a cold worker gets wrong. Each prevents a specific wrong acti
 `JOIN`, `ORDER_BY`, …) mutate it and return `self`. The terminal action is
 `await builder` → `__await__` → `_execute()` → `Executor.render_<verb>(b, params)`
 (single pass, document order) → `db.execute(sql, params)` → row tuples →
-`Executor` maps rows back to dataclass instances (single-source) or
+`Executor` maps rows back to dataclass instances via `meta.row_builder`
+(positional `cls(*row)` fast path, kwargs fallback; single-source) or
 `(left, right, …)` tuples (multi-source JOIN; `None` on a side signals an
 outer-join miss). `.sql()` renders without executing; `.stream()` async-iterates a
 server-side portal cursor instead of buffering. A `SelectBuilder` is itself a
@@ -87,10 +91,10 @@ wrapper.
 - **Add a curated PG function** → `functions.py` (or reach `fn("name")` at call site).
 - **Add a JSONB / array / FTS operator** → `jsonb.py` / `arrays.py` / `fts.py`.
 - **Add or alter a SQL verb / clause** → fluent method in `builders.py` + render branch in `executor.py`.
-- **Change row→object hydration** → `executor.py` mapping path.
+- **Change row→object hydration** → construction strategy in `meta.py` (`_make_row_builder`); per-query mapping in `executor.py`.
 - **Add a new expression node** → implement `render_sql(self, params)`; it composes everywhere automatically (the operator-overload menu is the `_InfixOps` mixin in `predicate.py`).
 - **Add PK/FK/column semantics** → marker in `annotations.py` + introspection in `meta.py`.
-- **Add a `db` adapter** → satisfy the four-method protocol; `psycopg_db.py` is the reference.
+- **Add a `db` adapter** → satisfy the `DBAdapter` Protocol (`expression.py`); `psycopg_db.py` / `asyncpg_db.py` are the two references (`isinstance(adapter, DBAdapter)` checks shape).
 
 ---
 

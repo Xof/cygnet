@@ -27,6 +27,7 @@ This README covers installation and usage. For the internals:
 ```
 pip install cygnet-orm                # core only — bring your own db adapter
 pip install 'cygnet-orm[psycopg]'     # + reference psycopg3 adapter
+pip install 'cygnet-orm[asyncpg]'     # + reference asyncpg adapter
 ```
 
 Cygnet itself doesn't depend on a particular database driver: the `db`
@@ -894,6 +895,29 @@ clear `ImportError` pointing at the install command — Cygnet's core
 itself stays driver-free, so a project shipping a custom adapter
 never pulls psycopg.
 
+### Reference asyncpg adapter
+
+Install with the `[asyncpg]` extra (see [Installation](#installation)),
+then:
+
+```python
+import asyncpg
+from cygnet.asyncpg_db import AsyncpgDB
+
+conn = await asyncpg.connect("postgresql://...")
+db = AsyncpgDB(conn)
+accounts = await cygnet.SELECT(db).FROM(AccountTable)
+```
+
+`AsyncpgDB` satisfies the same `DBAdapter` protocol as `PsycopgDB`.
+asyncpg speaks libpq's native `$N` placeholders — exactly what Cygnet
+emits — so there's no `$N`→`%s` translation. This is a first cut: it
+implements the two required methods but neither optional one (`stream()`
+nor `column_defaults()`), so a `None`-valued non-PK column with a schema
+`DEFAULT` is inserted as an explicit NULL rather than letting the
+`DEFAULT` fire — a SERIAL/`DBKey` primary key is unaffected. The
+rationale is in **[THEORY.md](THEORY.md)**.
+
 ### Connection pooling
 
 ```python
@@ -1032,50 +1056,96 @@ after a fresh repo, expired retention, etc.).
 ### Cross-ORM comparison
 
 `bench/comparison/test_comparison.py` runs the same operations
-through Cygnet, SQLAlchemy 2 (async session), and Django (sync ORM)
-against the same PG schema. Five operation classes × three ORMs =
-fifteen side-by-side benchmarks: SELECT-by-PK, SELECT-all-100, a
-1000-row JOIN (Cygnet `FOLLOW` / SQLAlchemy join / Django
+against the same PG schema through five columns: Cygnet and
+SQLAlchemy 2 (async session) each on **both** psycopg and asyncpg,
+plus Django (sync ORM). Five operation classes × five columns =
+twenty-five side-by-side benchmarks — isolating two axes at once, ORM
+overhead (Cygnet vs SA vs Django) and driver overhead (psycopg vs
+asyncpg) within an ORM. The operations: SELECT-by-PK, SELECT-all-100,
+a 1000-row JOIN (Cygnet `FOLLOW` / SQLAlchemy join / Django
 `select_related`), INSERT one, and bulk INSERT 50.
 
 Each ORM is benchmarked in its idiomatic mode — Cygnet and SA in
 async, Django in sync — so the numbers reflect what real applications
 see. SA's connection pool is clamped to a single connection
-(`pool_size=1, max_overflow=0`) to match Cygnet's PsycopgDB and
-Django's per-request connection, so the deltas measure ORM overhead
-rather than connection management.
+(`pool_size=1, max_overflow=0`) to match Cygnet's single connection
+and Django's per-request connection, so the deltas measure ORM
+overhead rather than connection management.
 
 #### Informal results
 
-A single run on an Apple M3 Max (Python 3.13, psycopg3, a local
-Dockerised PostgreSQL 16 with `fsync=off`). **These are informal,
-laptop-grade numbers — read them as orders of magnitude, not a
-benchmark league table.** Median time per operation; the `×` is
-relative to the fastest cell in each row.
+A single internally-consistent run on an Apple M3 Max (Python 3.13, a
+local Dockerised PostgreSQL 16 started with `fsync=off
+synchronous_commit=off full_page_writes=off`, single connection, no
+pooling). **These are informal, laptop-grade, single-run numbers —
+read them as orders of magnitude, not a benchmark league table.**
+Median µs per operation; **bold** marks the fastest cell in each row.
 
-| Operation | Cygnet | SQLAlchemy 2 | Django |
-|---|---|---|---|
-| SELECT by primary key (1 row)   | **305 µs (1.0×)**   | 419 µs (1.4×)   | 547 µs (1.8×)   |
-| SELECT all (100 rows)           | **334 µs (1.0×)**   | 522 µs (1.6×)   | 402 µs (1.2×)   |
-| JOIN posts→accounts (1000 rows) | **5,280 µs (1.0×)** | 7,390 µs (1.4×) | 7,550 µs (1.4×) |
-| INSERT one row                  | **240 µs (1.0×)**   | 907 µs (3.8×)   | 265 µs (1.1×)   |
-| Bulk INSERT (50 rows)           | **515 µs (1.0×)**   | 1,950 µs (3.8×) | 1,224 µs (2.4×) |
+| Operation | Cygnet/psycopg | Cygnet/asyncpg | SA/psycopg | SA/asyncpg | Django |
+|---|---|---|---|---|---|
+| SELECT by primary key (1 row)   | 757   | 566   | 859   | 1,023 | 963   |
+| SELECT all (100 rows)           | 569   | **559** | 893   | 869   | 644   |
+| JOIN posts→accounts (1000 rows) | **3,456** | 3,511 | 6,069 | 5,919 | 6,015 |
+| INSERT one row                  | 535   | 501   | 2,318 | 1,080 | **220** |
+| Bulk INSERT (50 rows)           | 469   | **394** | 1,934 | 1,633 | 705   |
+
+The SELECT-by-PK row is left **unbolded on purpose** — it is within
+noise (see the first caveat below), so picking a "winner" there would
+over-read the spread.
 
 The honest reading is "Cygnet's overhead is small," not "Cygnet is
 fastest." A thin SQL builder *should* sit close to the driver —
-there's little between your call and the wire. The caveats matter as
+there's little between your call and the wire. Cygnet (on either
+driver) is fastest-or-tied on the reads and the JOIN; on writes the
+only ORM that reads faster is Django on INSERT-one, and that bold cell
+is an artifact — see the async-tax caveat below. The caveats matter as
 much as the numbers:
 
-- **The database is deliberately fast.** `fsync=off` on localhost
-  makes commits nearly free, which *maximises* the visible share of
-  ORM overhead. Against a real, durable, networked database the
-  per-call gaps here shrink to a sliver of total query latency.
+- **The single-row read row is noisy.** SELECT-by-PK has wide spread
+  (IQR ~560 µs on the Cygnet/psycopg cell, ~416 µs on SA/psycopg). The
+  lean cells in that row — both Cygnet drivers and Django — are within
+  run-to-run noise of one another; don't read fine-grained ordering
+  into them, and in particular don't read Cygnet/psycopg as
+  meaningfully slower than Cygnet/asyncpg here.
+- **The database is deliberately fast.** `fsync=off`,
+  `synchronous_commit=off`, and `full_page_writes=off` on a localhost
+  Docker PG make commits nearly free, which *maximises* the visible
+  share of ORM overhead. Against a real, durable, networked database
+  these per-call gaps shrink to a sliver of total query latency.
 - **One connection, no pooling** — these are ORM-overhead numbers, not
   a connection-management comparison.
-- **SQLAlchemy's INSERT rows aren't strictly like-for-like.** Those
-  cases open a fresh `AsyncSession` and run a unit-of-work flush per
-  call (SA's session-per-write idiom); the ~3.8× is session/UoW
-  machinery, not raw statement cost.
+- **The async tax favors Django (a harness artifact).** Cygnet and SA
+  each pay one event-loop entry (`loop.run_until_complete`) *per
+  measured op*; Django's sync path pays none. This inflates the async
+  ORMs' *absolute* numbers on cheap ops — it's why Django reads as
+  fastest on INSERT-one (220 µs) despite issuing the same
+  `INSERT … RETURNING`. Django is **not** faster at the actual insert;
+  strip the loop spin and Cygnet is at or below it. A real async app
+  amortises one loop across many awaits.
+- **SA's read columns understate Cygnet's lead.** The SA session is
+  reused across rounds and the read ops never commit/expire, so
+  `Session.get(pk)` serves from the identity map *without SQL* after
+  round 1, and `select()` execution skips re-hydrating already-loaded
+  rows. SA is doing strictly less work on the read rows. The identity
+  map is a real SQLAlchemy feature; Cygnet has no identity map by
+  design.
+- **SA's writes aren't strictly like-for-like.** Those cases pay
+  `AsyncSession` construction + a unit-of-work flush + BEGIN/COMMIT vs
+  Cygnet's single autocommit statement; the large SA insert ratios are
+  session/UoW idiom, not raw statement cost.
+- **The driver axis (asyncpg vs psycopg) crosses over by result-set
+  shape.** Within Cygnet, asyncpg wins on writes and single-row reads,
+  is roughly flat at 100 rows, and is a touch *slower* on the 1000-row
+  JOIN. That crossover is the asyncpg adapter's Approach A: it converts
+  each asyncpg `Record` to a tuple at the boundary (keeping hydration
+  on Cygnet's fast positional path), a fixed per-row cost that only
+  pays off where there's little per-row hydration. See `THEORY.md` for
+  the rationale. The SA driver swap is mixed/neutral — its ORM
+  machinery dominates the driver.
+- **Object richness is a real trade-off, not a measurement error.**
+  Cygnet returns inert dataclasses; SA and Django return
+  change-tracked instances. Cheaper objects are part of why Cygnet is
+  faster.
 - **Your hardware will disagree.** Re-run it and see.
 
 Skipped automatically when `CYGNET_TEST_DSN` is unset; reproduce with:
