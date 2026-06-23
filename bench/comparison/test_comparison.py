@@ -3,6 +3,11 @@
 # (single connection per run, no pooling) so the deltas measure ORM
 # overhead and not connection management.
 #
+# Cygnet and SQLAlchemy each run on BOTH drivers (psycopg and asyncpg) — the
+# *_asyncpg columns — so the matrix isolates two axes at once: ORM overhead
+# (Cygnet vs SA vs Django) and driver overhead (psycopg vs asyncpg) within an
+# ORM.  Django is psycopg/sync only (one column).
+#
 # Async strategy:
 #   - Cygnet:     async-native; benchmark wraps loop.run_until_complete
 #   - SA:         async session via create_async_engine; same wrapping
@@ -192,7 +197,13 @@ def sa_session(loop: Any, sa_engine: Any) -> Any:
 
 @pytest.fixture(scope="module")
 def ag_conn(loop: Any, parsed_dsn: Any) -> Any:
-    """One asyncpg connection for the module, opened on the bench loop."""
+    """One asyncpg connection for the module, opened on the bench loop.
+
+    Opened/closed via loop.run_until_complete so the connection is bound to the
+    shared bench loop (asyncpg binds to the running loop at connect time).
+    parsed_dsn is accepted only as a skip-guard (it pytest.skip()s when
+    CYGNET_TEST_DSN is unset); asyncpg.connect() takes the raw DSN directly.
+    """
     conn = loop.run_until_complete(asyncpg.connect(DSN))
     yield conn
     loop.run_until_complete(conn.close())
@@ -208,7 +219,12 @@ def cygnet_asyncpg_db(populated_db: Any, ag_conn: Any) -> Any:
 @pytest.fixture(scope="session")
 def sa_engine_asyncpg(parsed_dsn: Any) -> Any:
     """SQLAlchemy async engine on the asyncpg driver (vs sa_engine's psycopg).
-    Single-connection clamp matches the others."""
+
+    pool_size=1, max_overflow=0 mirrors sa_engine's single-connection clamp so
+    SA isn't given extra warmed connections the other ORMs don't get.
+    parsed_dsn is accepted only as a skip-guard; the engine is built from the
+    raw DSN, rewritten to the +asyncpg dialect.
+    """
     from sqlalchemy.ext.asyncio import create_async_engine
 
     sa_dsn = DSN.replace("postgresql://", "postgresql+asyncpg://", 1)
@@ -284,6 +300,11 @@ class TestSelectByPk:
         assert benchmark(op) is not None
 
     def test_sqlalchemy_asyncpg(self, benchmark, loop, sa_session_asyncpg: Any) -> None:
+        # DISCLOSURE: same identity-map cache as test_sqlalchemy above —
+        # sa_session_asyncpg is reused across rounds, so after round 1
+        # Session.get(42) is served from the identity map without SQL. Not a
+        # round-trip, so the asyncpg-vs-psycopg driver swap is not even
+        # exercised on the cached rounds. See the module header.
         def op() -> Any:
             async def go() -> Any:
                 return await sa_session_asyncpg.get(SAAccount, 42)
@@ -344,6 +365,10 @@ class TestSelectAll:
         assert len(benchmark(op)) >= 100
 
     def test_sqlalchemy_asyncpg(self, benchmark, loop, sa_session_asyncpg: Any) -> None:
+        # DISCLOSURE: same as test_sqlalchemy above — the reused
+        # sa_session_asyncpg issues the SELECT each round but returns cached
+        # identity-map instances for known PKs, skipping per-row re-hydration.
+        # See the module header.
         from sqlalchemy import select
 
         def op() -> list:
