@@ -78,6 +78,48 @@ class TestJsonb:
         sql = jb.path_match(DocumentTable.payload, "$.x > 1").render_sql(params)
         assert sql == "documents.payload @@ $1"
 
+    def test_get_path_text_renders_hash_double_arrow(self):
+        params: list = []
+        sql = jb.get_path_text(DocumentTable.payload, ["a", "b"]).render_sql(params)
+        assert sql == "documents.payload #>> $1"
+        assert params == [["a", "b"]]
+
+    def test_contained_by_renders_left_at(self):
+        params: list = []
+        sql = jb.contained_by(DocumentTable.payload, '{"x": 1}').render_sql(params)
+        assert sql == "documents.payload <@ $1"
+        assert params == ['{"x": 1}']
+
+    def test_has_any_key_renders_question_pipe(self):
+        params: list = []
+        sql = jb.has_any_key(DocumentTable.payload, ["a", "b"]).render_sql(params)
+        assert sql == "documents.payload ?| $1"
+        assert params == [["a", "b"]]
+
+    def test_has_all_keys_renders_question_amp(self):
+        params: list = []
+        sql = jb.has_all_keys(DocumentTable.payload, ["a", "b"]).render_sql(params)
+        assert sql == "documents.payload ?& $1"
+        assert params == [["a", "b"]]
+
+    def test_concat_renders_double_pipe(self):
+        params: list = []
+        sql = jb.concat(DocumentTable.payload, '{"y": 2}').render_sql(params)
+        assert sql == "documents.payload || $1"
+        assert params == ['{"y": 2}']
+
+    def test_delete_key_renders_minus(self):
+        params: list = []
+        sql = jb.delete_key(DocumentTable.payload, "stale").render_sql(params)
+        assert sql == "documents.payload - $1"
+        assert params == ["stale"]
+
+    def test_path_exists_renders_at_question(self):
+        params: list = []
+        sql = jb.path_exists(DocumentTable.payload, "$.x").render_sql(params)
+        assert sql == "documents.payload @? $1"
+        assert params == ["$.x"]
+
     async def test_jsonb_in_full_query(self):
         """End-to-end through SelectBuilder + FakeDB."""
         db = FakeDB(rows=[])
@@ -133,6 +175,28 @@ class TestArrays:
         sql = arr.cardinality(DocumentTable.tags).render_sql(params)
         assert sql == "cardinality(documents.tags)"
 
+    def test_contained_by_renders_left_at(self):
+        params: list = []
+        sql = arr.contained_by(DocumentTable.tags, ["a", "b"]).render_sql(params)
+        assert sql == "documents.tags <@ $1"
+        assert params == [["a", "b"]]
+
+    def test_concat_renders_double_pipe(self):
+        params: list = []
+        sql = arr.concat(DocumentTable.tags, ["c"]).render_sql(params)
+        assert sql == "documents.tags || $1"
+        assert params == [["c"]]
+
+    def test_unnest(self):
+        params: list = []
+        sql = arr.unnest(DocumentTable.tags).render_sql(params)
+        assert sql == "unnest(documents.tags)"
+
+    def test_array_agg(self):
+        params: list = []
+        sql = arr.array_agg(DocumentTable.tags).render_sql(params)
+        assert sql == "array_agg(documents.tags)"
+
     async def test_arrays_in_where(self):
         db = FakeDB(rows=[])
         await (
@@ -179,6 +243,43 @@ class TestFts:
         ).render_sql(params)
         assert sql.startswith("ts_rank(to_tsvector(")
         assert "websearch_to_tsquery" in sql
+
+    def test_to_tsquery_config_first(self):
+        params: list = []
+        sql = fts.to_tsquery("a & b").render_sql(params)
+        assert sql == "to_tsquery($1, $2)"
+        assert params == ["english", "a & b"]
+
+    def test_plain_query_renders_plainto(self):
+        params: list = []
+        sql = fts.plain_query("fierce orm").render_sql(params)
+        assert sql == "plainto_tsquery($1, $2)"
+        assert params == ["english", "fierce orm"]
+
+    def test_phrase_query_renders_phraseto(self):
+        params: list = []
+        sql = fts.phrase_query("fierce small orm").render_sql(params)
+        assert sql == "phraseto_tsquery($1, $2)"
+        assert params == ["english", "fierce small orm"]
+
+    def test_rank_cd_renders_cover_density(self):
+        params: list = []
+        sql = fts.rank_cd(
+            fts.to_tsvector(DocumentTable.body),
+            fts.web_query("fierce"),
+        ).render_sql(params)
+        assert sql.startswith("ts_rank_cd(to_tsvector(")
+        assert "websearch_to_tsquery" in sql
+
+    def test_headline_config_first(self):
+        params: list = []
+        sql = fts.headline(
+            DocumentTable.body,
+            fts.web_query("fierce"),
+        ).render_sql(params)
+        # config is the first arg, document second, query third.
+        assert sql == "ts_headline($1, documents.body, websearch_to_tsquery($2, $3))"
+        assert params == ["english", "english", "fierce"]
 
     async def test_fts_in_full_query(self):
         db = FakeDB(rows=[])

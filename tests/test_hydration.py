@@ -83,15 +83,33 @@ def test_kwargs_fallback_constructs_correctly():
     assert obj == KwOnly(id=1, label="hi")
 
 
+@pytest.mark.parametrize("row", [(1,), (1, "hi", "extra")])
+def test_kwargs_fallback_rejects_arity_mismatch(row):
+    # Pins the zip(..., strict=True) guard in _build_kwargs: a row whose length
+    # doesn't match the field count (too short OR too long) must raise
+    # ValueError at the build seam rather than silently truncating to the
+    # shorter side.  KwOnly has exactly two fields, so neither a 1- nor a
+    # 3-element row aligns.  If strict=True were removed, zip would truncate
+    # and cls(**...) would build a partial/wrong object without raising —
+    # this test fails in that case.
+    @dataclasses.dataclass
+    class KwOnly:
+        id: Annotated[int, DBKey]
+        label: str = dataclasses.field(kw_only=True)
+
+    builder = cygnet.Table(KwOnly)._meta.row_builder
+    assert builder.__name__ == "_build_kwargs"
+    with pytest.raises(ValueError):
+        builder(row)
+
+
 async def test_row_to_obj_delegates_to_row_builder(monkeypatch):
     # White-box: hydration must go through meta.row_builder, not a private
     # kwargs path.  Swapping the builder for a sentinel proves the delegation.
     # AccountTable._meta is a shared singleton; monkeypatch's function scope
     # reverts the swap after this test (so other tests see the real builder).
     sentinel = object()
-    monkeypatch.setattr(
-        AccountTable._meta, "row_builder", lambda row: sentinel
-    )
+    monkeypatch.setattr(AccountTable._meta, "row_builder", lambda row: sentinel)
     db = FakeDB(rows=[(1, "a", "a@example.com")])
     result = await cygnet.SELECT(db).FROM(AccountTable)
     assert result == [sentinel]
@@ -107,7 +125,7 @@ async def test_right_join_left_side_miss_yields_none():
         .FROM(AccountTable)
         .RIGHT_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
     )
-    (acct, log), = result
+    ((acct, log),) = result
     assert acct is None
     assert log == LogEntry(id=5, account_id=99, message="orphan log")
 
@@ -123,7 +141,7 @@ async def test_left_join_right_side_miss_yields_none():
         .FROM(AccountTable)
         .LEFT_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
     )
-    (acct, log), = result
+    ((acct, log),) = result
     assert acct == Account(id=1, name="Ann", email="ann@example.com")
     assert log is None
 
@@ -136,7 +154,7 @@ async def test_inner_join_maps_both_sides():
         .FROM(AccountTable)
         .JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
     )
-    (acct, log), = result
+    ((acct, log),) = result
     assert acct == Account(id=1, name="Ann", email="ann@example.com")
     assert log == LogEntry(id=7, account_id=1, message="hello")
 

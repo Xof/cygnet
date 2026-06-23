@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tests.conftest import AccountTable, LogTable
 
 
@@ -109,6 +111,43 @@ class TestPredicate:
         sql = (~~(AccountTable.id == 1)).render_sql(params)
         assert sql == "NOT (NOT (accounts.id = $1))"
         assert params == [1]
+
+
+class TestArithmeticOperators:
+    """Forward and reflected arithmetic overloads on the _InfixOps mixin.
+
+    The reflected ops (__radd__/__rsub__/__rmul__/__rtruediv__/__rmod__) fire
+    when a plain Python value sits on the LEFT (`10 - col`): Python can't use
+    the int's __sub__, so it calls col.__rsub__(10).  For the non-commutative
+    `-` / `/` / `%`, operand ORDER is load-bearing — `10 - col` must render the
+    literal placeholder FIRST then the column ($1 - accounts.id), NOT swapped.
+    These assertions pin that order so a copy-paste slip can't silently invert
+    a result.
+    """
+
+    @pytest.mark.parametrize(
+        ("expr", "expected_sql", "expected_params"),
+        [
+            # Forward ops: column on the left, value parameterised on the right.
+            (AccountTable.id + 5, "accounts.id + $1", [5]),
+            (AccountTable.id - 5, "accounts.id - $1", [5]),
+            (AccountTable.id * 5, "accounts.id * $1", [5]),
+            (AccountTable.id / 5, "accounts.id / $1", [5]),
+            (AccountTable.id % 5, "accounts.id % $1", [5]),
+            # Reflected ops: literal on the left, column on the right.  For the
+            # non-commutative ops the placeholder must precede the column.
+            (10 + AccountTable.id, "$1 + accounts.id", [10]),
+            (10 - AccountTable.id, "$1 - accounts.id", [10]),
+            (10 * AccountTable.id, "$1 * accounts.id", [10]),
+            (10 / AccountTable.id, "$1 / accounts.id", [10]),
+            (10 % AccountTable.id, "$1 % accounts.id", [10]),
+        ],
+    )
+    def test_arithmetic_renders(self, expr, expected_sql, expected_params):
+        params: list = []
+        sql = expr.render_sql(params)
+        assert sql == expected_sql
+        assert params == expected_params
 
 
 class TestNullComparison:
