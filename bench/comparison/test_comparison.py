@@ -583,11 +583,48 @@ class TestJoinFollow:
         assert len(rows) >= 1000
 
     def test_sqlalchemy(self, benchmark, loop, sa_session: Any) -> None:
+        # DISCLOSURE (see module header): the reused sa_session issues the join
+        # each round but returns already-loaded identity-map instances for known
+        # PKs, skipping per-row re-hydration that Cygnet pays every round.
         from sqlalchemy import select
 
         def op() -> list:
             async def go() -> list:
                 result = await sa_session.execute(
+                    select(SAPost, SAAccount).join(
+                        SAAccount, SAPost.account_id == SAAccount.id
+                    )
+                )
+                return list(result.all())
+
+            return run_async(loop, go)
+
+        rows = benchmark(op)
+        assert len(rows) >= 1000
+
+    def test_cygnet_asyncpg(self, benchmark, loop, cygnet_asyncpg_db: Any) -> None:
+        def op() -> list:
+            async def go() -> list:
+                return await (
+                    cygnet.SELECT(cygnet_asyncpg_db)
+                    .FROM(PostTable)
+                    .FOLLOW(PostTable.account_id)
+                )
+
+            return run_async(loop, go)
+
+        rows = benchmark(op)
+        assert len(rows) >= 1000
+
+    def test_sqlalchemy_asyncpg(self, benchmark, loop, sa_session_asyncpg: Any) -> None:
+        # DISCLOSURE: same as test_sqlalchemy above — the reused
+        # sa_session_asyncpg issues the join each round but returns cached
+        # identity-map instances for known PKs, skipping per-row re-hydration.
+        from sqlalchemy import select
+
+        def op() -> list:
+            async def go() -> list:
+                result = await sa_session_asyncpg.execute(
                     select(SAPost, SAAccount).join(
                         SAAccount, SAPost.account_id == SAAccount.id
                     )
