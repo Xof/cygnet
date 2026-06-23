@@ -5,7 +5,14 @@ from typing import Annotated
 
 import cygnet
 from cygnet.annotations import DBKey
-from tests.conftest import Account, AccountTable, FakeDB, TaggedTable
+from tests.conftest import (
+    Account,
+    AccountTable,
+    FakeDB,
+    LogEntry,
+    LogTable,
+    TaggedTable,
+)
 
 
 def test_standard_dataclass_uses_positional_builder():
@@ -64,3 +71,49 @@ async def test_row_to_obj_delegates_to_row_builder(monkeypatch):
     db = FakeDB(rows=[(1, "a", "a@example.com")])
     result = await cygnet.SELECT(db).FROM(AccountTable)
     assert result == [sentinel]
+
+
+async def test_right_join_left_side_miss_yields_none():
+    # RIGHT JOIN: accounts.* is NULL for an orphan log row → left object None,
+    # right object present.  Locks the hoisted left_can_miss decision.
+    rows = [(None, None, None, 5, 99, "orphan log")]
+    db = FakeDB(rows=rows)
+    result = await (
+        cygnet.SELECT(db)
+        .FROM(AccountTable)
+        .RIGHT_JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+    )
+    (acct, log), = result
+    assert acct is None
+    assert log == LogEntry(id=5, account_id=99, message="orphan log")
+
+
+async def test_inner_join_maps_both_sides():
+    rows = [(1, "Ann", "ann@example.com", 7, 1, "hello")]
+    db = FakeDB(rows=rows)
+    result = await (
+        cygnet.SELECT(db)
+        .FROM(AccountTable)
+        .JOIN(LogTable, ON=AccountTable.id == LogTable.account_id)
+    )
+    (acct, log), = result
+    assert acct == Account(id=1, name="Ann", email="ann@example.com")
+    assert log == LogEntry(id=7, account_id=1, message="hello")
+
+
+async def test_columnar_returns_raw_tuples():
+    db = FakeDB(rows=[(1, "Ann")])
+    result = await cygnet.SELECT(db, AccountTable.id, AccountTable.name).FROM(
+        AccountTable
+    )
+    assert result == [(1, "Ann")]
+
+
+async def test_stream_matches_enbloc():
+    rows = [(i, f"U{i}", f"u{i}@example.com") for i in range(5)]
+    enbloc = await cygnet.SELECT(FakeDB(rows=rows)).FROM(AccountTable)
+    streamed = [
+        obj
+        async for obj in cygnet.SELECT(FakeDB(rows=rows)).FROM(AccountTable).stream()
+    ]
+    assert streamed == enbloc

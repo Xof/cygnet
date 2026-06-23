@@ -44,7 +44,7 @@
 from __future__ import annotations
 
 import weakref
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from .annotations import DBKey
@@ -461,74 +461,61 @@ class Executor:
                 return None
         return self._row_to_obj(meta, chunk)
 
-    def _map_row(self, b: Any, row: Any) -> Any:
-        """Map a single row tuple to the appropriate result shape.
+    def _row_mapper(self, b: Any) -> Callable[[Any], Any]:
+        """Resolve the per-row mapping function ONCE for a query.
 
-        Three modes, determined by query shape — same precedence as the
-        en-bloc _map_select: explicit columns take precedence over joins,
-        joins over the simple case.  Factored out so streaming
-        (stream_select) can reuse the exact same mapping logic per row.
+        Mode (columnar / join / simple) and every query-shape invariant —
+        join nullability, per-table column slices, each table's row_builder —
+        depend only on the builder, not the row.  They're resolved here and
+        closed over, instead of recomputed per row in the hot loop.  Both
+        _map_select (en-bloc) and stream_select call this once and apply the
+        result to every row, so the two paths cannot diverge.
         """
-        # 1. Explicit columns → raw tuple (no object mapping).
-        # We can't reconstruct dataclasses here because the user may have
-        # projected only some columns, computed expressions, or columns
-        # from multiple tables — there's no general "fields N..M map to
-        # dataclass X" rule that holds.  Caller deals with the tuple
-        # shape they asked for.
+        # 1. Explicit columns → raw tuple (no object mapping); see the comment
+        #    in _render_select on why projected columns can't be reassembled.
         if b._columns:
-            return tuple(row)
+            return lambda row: tuple(row)
 
-        # 2. JOINs → (left_obj, right_obj, ...).  Column slicing relies
-        #    on the FieldMeta.fields list length matching the number of
-        #    columns returned for that table in the SELECT list above —
-        #    only holds because _render_select emits columns in
-        #    meta.fields order for every joined table.
+        # 2. JOINs → (left_obj, right_obj, ...).  Slices and nullability are
+        #    fixed by query shape, so precompute them once.  left_can_miss:
+        #    RIGHT/FULL make the FROM side nullable.  Per join, LEFT/FULL make
+        #    that join's right side nullable.
         if b._joins:
             left_meta = b._table._meta
             left_n = len(left_meta.fields)
-            # Each iteration produces a fresh dataclass instance via
-            # _row_to_obj.  No instance reuse across rows — distinct
-            # rows produce distinct objects even when the row data
-            # would compare equal.  The result list is never
-            # de-duplicated; that's the caller's responsibility if
-            # JOINs produce duplicate left-side rows.
-            #
-            # Left-side miss-detection: triggered when any join in the
-            # list is RIGHT or FULL — those make the FROM-side columns
-            # nullable in the result.  Same PK-vs-all-NULL heuristic as
-            # the right side.  When no join can null the left side
-            # (only INNER / LEFT joins present), we always map to an
-            # object, preserving the historical contract for callers
-            # that didn't ask for outer-join semantics.
             left_can_miss = any(kind in ("RIGHT", "FULL") for kind, _, _ in b._joins)
-            left_chunk = row[:left_n]
-            left_obj = self._object_or_none_if_miss(
-                left_meta, left_chunk, can_miss=left_can_miss
-            )
+            plan: list[tuple[Any, int, int, bool]] = []
             offset = left_n
-            right_objs: list[Any] = []
             for kind, jt, _on in b._joins:
                 n = len(jt._meta.fields)
-                chunk = row[offset : offset + n]
-                # Right-side miss for this join: LEFT and FULL both make
-                # the right side nullable.  RIGHT and INNER guarantee
-                # the right side is present (RIGHT preserves the right;
-                # INNER requires the match).
-                right_can_miss = kind in ("LEFT", "FULL")
-                right_objs.append(
-                    self._object_or_none_if_miss(
-                        jt._meta, chunk, can_miss=right_can_miss
-                    )
-                )
+                plan.append((jt._meta, offset, offset + n, kind in ("LEFT", "FULL")))
                 offset += n
-            return (left_obj, *right_objs)
 
-        # 3. Simple query → dataclass instance.
-        meta = b._table._meta
-        return self._row_to_obj(meta, row)
+            def map_join(row: Any) -> Any:
+                left_obj = self._object_or_none_if_miss(
+                    left_meta, row[:left_n], can_miss=left_can_miss
+                )
+                right_objs = [
+                    self._object_or_none_if_miss(m, row[start:stop], can_miss=cm)
+                    for (m, start, stop, cm) in plan
+                ]
+                return (left_obj, *right_objs)
+
+            return map_join
+
+        # 3. Simple query → dataclass instance via the table's row_builder.
+        build = b._table._meta.row_builder
+        return lambda row: build(row)
+
+    def _map_row(self, b: Any, row: Any) -> Any:
+        """Map a single row.  Builds the mapper fresh, so callers mapping many
+        rows should use _row_mapper directly (as _map_select and stream_select
+        do) rather than calling this in a loop."""
+        return self._row_mapper(b)(row)
 
     def _map_select(self, b: Any, rows: list[Any]) -> list[Any]:
-        return [self._map_row(b, row) for row in rows]
+        map_one = self._row_mapper(b)
+        return [map_one(row) for row in rows]
 
     async def stream_select(self, b: Any) -> AsyncIterator[Any]:
         """Async generator yielding mapped objects one at a time.
@@ -559,8 +546,9 @@ class Executor:
         # Yield-per-row; mapping is done lazily so the row buffer never
         # has to materialise the whole result set.  Each yielded object
         # is a fresh dataclass instance (or tuple, per _map_row's mode).
+        mapper = self._row_mapper(b)
         async for row in self._db.stream(sql, params):
-            yield self._map_row(b, row)
+            yield mapper(row)
 
     # ── INSERT ────────────────────────────────────────────────────────────────
 
