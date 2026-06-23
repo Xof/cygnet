@@ -41,6 +41,10 @@ GizmoTable = cygnet.Table(Gizmo)
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def db():
+    # One asyncpg connection + TEMP table shared across the module's tests.
+    # Tests are order-independent: each filters by a distinct name/id, so rows
+    # left behind (e.g. "Committed") don't affect the others — preserve that if
+    # adding tests (no COUNT(*)-style assertions on whole-table contents).
     if not DSN:
         pytest.skip("CYGNET_TEST_DSN not set")
     conn = await asyncpg.connect(DSN)

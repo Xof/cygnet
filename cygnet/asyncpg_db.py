@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Any
 
 try:
+    # asyncpg ships no py.typed marker, so mypy strict needs this ignore.
     import asyncpg  # type: ignore[import-untyped]
 except ImportError as e:  # pragma: no cover — exercised via install matrix
     raise ImportError(
@@ -38,6 +39,8 @@ except ImportError as e:  # pragma: no cover — exercised via install matrix
 class AsyncpgDB:
     """Reference Cygnet adapter wrapping an asyncpg.Connection.
 
+    Construct from an open asyncpg connection:
+
         conn = await asyncpg.connect(dsn)
         db = AsyncpgDB(conn)
         accounts = await cygnet.SELECT(db).FROM(AccountTable)
@@ -49,6 +52,14 @@ class AsyncpgDB:
     `_in_transaction` starts False and is flipped by `cygnet.transaction(db)` at
     the outermost BEGIN/COMMIT; don't share an instance across concurrent tasks
     (the flag is not task-local, by design — same contract as PsycopgDB).
+
+    First-cut limitation: this adapter does NOT implement ``column_defaults``,
+    so Cygnet's DEFAULT-aware INSERT codegen is off.  A SERIAL/DBKey primary key
+    is unaffected (it's omitted unconditionally and read back via RETURNING),
+    but a ``None``-valued NON-PK field whose column carries a DB-side DEFAULT is
+    inserted as an explicit NULL — the DEFAULT does not fire (and a
+    ``NOT NULL DEFAULT`` column raises).  Implement ``column_defaults`` (see
+    PsycopgDB) if you need DEFAULT-aware INSERTs.
     """
 
     def __init__(self, conn: asyncpg.Connection) -> None:
