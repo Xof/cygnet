@@ -81,6 +81,13 @@ bench:
     {{ pytest }} bench/test_render.py bench/test_overhead.py \
         --benchmark-only
 
+# Function-level hotspot profile (cProfile self-time + timeit ns/op) over the
+# render / full-path / hydration workloads, FakeDB-isolated.  Answers "which
+# function owns the time?" where `bench` answers "did it get slower?".  Pass
+# extra args through, e.g. `just profile 20000 --save`.
+profile *ARGS:
+    uv run python -m bench.profile_hotspots {{ ARGS }}
+
 # E2E benchmarks against a Dockerised PG.  Spins up the container,
 # runs against it, tears it down.  Slower (~30s) — these measure
 # total wall time including PG round-trip.

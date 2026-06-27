@@ -37,3 +37,6 @@ htmlcov/
 # Local working artifacts: code-review outputs and superpowers plans/specs.
 # Design rationale worth keeping has been folded into THEORY.md.
 docs/
+
+# cProfile dumps written by `just profile --save` (bench/profile_hotspots.py).
+bench/.profiles/
