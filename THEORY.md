@@ -175,6 +175,27 @@ the constructor's parameters: a sibling fix made `_introspect_fields` exclude
 place that exact alignment is load-bearing, which is why the field-filter and the
 row-builder are part of the same story.
 
+**Bulk INSERT render is the write path's hotspot, and the column shape is hoisted out
+of the row loop.** The mirror image of hydration on the write side. Profiling the
+render path (`bench/profile_hotspots.py`) found `_render_bulk_insert` dominating —
+~855 ns/row, roughly 15× any other per-row cost — because it re-derived each row's
+column list from scratch on *every* row: a throwaway kwargs dict plus the attr-set
+rebuilds inside `_extract_insert_fields`, called once per object. But a bulk INSERT
+requires every row to share one column shape (PG demands it), so that derivation is
+row-invariant. The fix computes the shape once from the first object, then for the
+rest replays the same field-order classification inline against each object's
+attributes, cutting the per-row cost to ~500 ns/row (~1.64× on the 100-row render).
+The instructive part is what was deliberately *not* shipped: a looser variant that
+validated only the column set and blind-appended values benchmarked faster still —
+but it dropped the per-row `AppKey`-None check and would have emitted `NULL` for a
+missing application key instead of raising (the `S2` rail). That is a correctness
+regression wearing a speedup's clothes, and it was rejected. So the shipped loop keeps
+the full field-order pass, byte-identical to the single-row path it now duplicates for
+speed — including that an `AppKey`-None short-circuits *before* a cross-row shape
+mismatch is reported. That duplication is the cost of the hoist and is flagged as a
+landmine in [ARCHITECTURE.md](ARCHITECTURE.md); ADR `PF1` records the measurements and
+the rejected alternative.
+
 ## Design decisions and tradeoffs
 
 The full record is the ADR; this is the synthesis a new maintainer needs, with ids
