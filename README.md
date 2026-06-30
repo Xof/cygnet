@@ -435,10 +435,27 @@ rows = await cygnet.SELECT(db).FROM(LogTable).LEFT_FOLLOW(LogTable.account_id)
 # Load a single related object on demand (returns Account | None).
 log = await cygnet.get(db, LogTable, id=1)
 account = await cygnet.follow(db, log, LogTable.account_id)
+
+# Following an FK for a whole list?  Don't loop cygnet.follow — that is N
+# round-trips (the classic N+1).  cygnet.follow_many does it in ONE query
+# (WHERE pk = ANY($1)) and returns the targets aligned to the inputs:
+logs = await cygnet.SELECT(db).FROM(LogTable)
+accounts = await cygnet.follow_many(db, logs, LogTable.account_id)
+# accounts[i] is logs[i]'s Account — or None if the FK is NULL or the row
+# is missing.  Objects sharing an FK value share the returned instance.
 ```
 
 `ForeignKey(target)` always references the target's primary key —
 composite PKs aren't supported.
+
+Against real PostgreSQL the per-query round-trip dominates read cost, so
+collapsing N lookups into one is the high-leverage win — prefer
+`follow_many` over a `follow` loop. For an arbitrary batch-by-key fetch
+(not via a declared FK), the same one-query shape is
+`WHERE T.id == cygnet.arrays.any([...])`, which binds the whole list as a
+single array parameter (no `IN`-list length limit). For large scans that
+you consume row-by-row rather than re-associate, use `.stream()` (a
+server-side cursor) instead of buffering the whole result.
 
 ### Subquery predicates: EXISTS / IN
 

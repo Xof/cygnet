@@ -15,8 +15,9 @@ intentionally-named functions.
 This file also hosts cross-cutting helpers that don't belong inside a
 specific builder module — `transaction` (savepoint-based nesting context
 manager), `get` (PK fetch), `save` (insert-or-upsert dispatch), `create`
-(insert-without-upsert), `follow` (FK traversal), and `TRUNCATE` (no
-builder needed).  These are kept here because they sit between the
+(insert-without-upsert), `follow` / `follow_many` (single / batched FK
+traversal), and `TRUNCATE` (no builder needed).  These are kept here
+because they sit between the
 builders and the executor: they coordinate across multiple builder
 operations or sit outside the builder pattern entirely.
 
@@ -27,14 +28,15 @@ Naming convention recap for callers reading the export list:
     (Table, Column, DBKey, AppKey, ForeignKey, table, CTE, Lateral,
      RecursiveCTE)
   - lower_case  → helpers, sentinels, and convenience functions
-    (get, save, create, follow, transaction, lit, op, ops, is_null,
-     is_not_null, exists, not_exists, fn, cte, lateral, recursive_cte,
-     all)
+    (get, save, create, follow, follow_many, transaction, lit, op, ops,
+     is_null, is_not_null, exists, not_exists, fn, cte, lateral,
+     recursive_cte, all)
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from typing import Any, cast
 
 # Re-exports are grouped by role: annotations (used in model definitions),
@@ -44,6 +46,7 @@ from typing import Any, cast
 # `cygnet.all` shadows Python's builtin `all` *inside this module only*;
 # callers do `cygnet.all` which is unambiguous at the call site.
 from .annotations import AppKey, Column, DBKey, ForeignKey, table
+from .arrays import any as array_any
 from .builders import DeleteBuilder, InsertBuilder, SelectBuilder, UpdateBuilder
 from .cte import CTE, Lateral, RecursiveCTE, cte, lateral, recursive_cte
 from .executor import Executor
@@ -90,6 +93,7 @@ __all__ = [
     # Convenience
     "create",
     "follow",
+    "follow_many",
     "get",
     "save",
     "transaction",
@@ -296,6 +300,63 @@ async def follow(db: DBAdapter, obj: Any, fk_column: Any) -> Any:
     assert target_proxy._meta.pk is not None
     target_pk = target_proxy._meta.pk
     return await get(db, target_proxy, **{target_pk.attr_name: fk_value})
+
+
+async def follow_many(db: DBAdapter, objs: Sequence[Any], fk_column: Any) -> list[Any]:
+    """Batched ``follow``: load the FK target for every object in ``objs`` in
+    ONE round-trip (``WHERE pk = ANY($1)``) instead of N, returned aligned to
+    ``objs``.
+
+    Element ``i`` of the result is the object ``objs[i]``'s foreign key points
+    to, or ``None`` if that FK is ``None`` or no row matches. This is the
+    explicit cure for the N+1 trap ``[await follow(db, o, fk) for o in objs]``:
+    against real PG the per-query round-trip dominates read cost, so collapsing
+    N queries into one is the high-leverage win (see THEORY.md).
+
+    Objects that share an FK value share the *same* returned instance — each
+    distinct value is fetched once and re-associated by PK. Cygnet has no
+    identity map, so this sharing is a batching artifact, not a guarantee;
+    treat the returned objects as read snapshots.
+
+    Raises ``ValueError`` if ``fk_column`` is not a foreign-key column proxy;
+    ``TypeError`` if any object is not an instance of ``fk_column``'s table.
+    Issues no query when ``objs`` is empty or every FK value is ``None``.
+    """
+    if not isinstance(fk_column, ColumnProxy):
+        raise ValueError(f"{fk_column!r} is not a column proxy")
+    field = fk_column._field
+    source_meta = fk_column._table._meta
+    objs = list(objs)  # materialise: we iterate twice and need len()
+    # Validate object types before the FK-ness check so error precedence matches
+    # single-row follow(): a wrong-instance mistake reports the type error, not
+    # "not a foreign key", regardless of which is also wrong.
+    for obj in objs:
+        if not isinstance(obj, source_meta.cls):
+            raise TypeError(
+                f"Expected {source_meta.cls.__name__}, got {type(obj).__name__}"
+            )
+    if field.foreign_key is None:
+        raise ValueError(
+            f"{source_meta.cls.__name__}.{field.attr_name} is not a foreign key"
+        )
+    fk_attr = field.attr_name
+    # Distinct, non-None FK values → a single batched lookup. A None FK (and a
+    # value with no matching row) re-associates to None in the final pass.
+    fk_values = {getattr(obj, fk_attr) for obj in objs}
+    fk_values.discard(None)
+    if not fk_values:
+        return [None] * len(objs)
+
+    target_proxy: TableProxy[Any] = TableProxy(field.foreign_key.target)
+    # FK validation in _introspect() guarantees the target has a PK.
+    target_pk = target_proxy._meta.pk
+    assert target_pk is not None
+    pk_col = getattr(target_proxy, target_pk.attr_name)
+    targets = await (
+        SELECT(db).FROM(target_proxy).WHERE(pk_col == array_any(list(fk_values)))
+    )
+    by_pk = {getattr(t, target_pk.attr_name): t for t in targets}
+    return [by_pk.get(getattr(obj, fk_attr)) for obj in objs]
 
 
 async def create(db: DBAdapter, obj: Any) -> Any:

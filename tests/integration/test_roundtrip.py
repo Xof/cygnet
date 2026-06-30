@@ -196,6 +196,36 @@ class TestFollowRoundtrip:
         assert book2.title == "Anonymous"
         assert author2 is None
 
+    async def test_follow_many_batches_and_re_associates(self, setup_tables):
+        """follow_many resolves every book's author against real PG in one
+        `= ANY($1)` query, aligned to input order, with a shared instance for a
+        shared FK and None for a NULL FK."""
+        db = setup_tables
+        a1 = Author(id=None, name="Ann Leckie")
+        a2 = Author(id=None, name="N. K. Jemisin")
+        await cygnet.create(db, a1)
+        await cygnet.create(db, a2)
+        # Two books share a1; one points at a2; one has no author (NULL FK).
+        books = [
+            Book(id=None, author_id=a1.id, title="Ancillary Justice"),
+            Book(id=None, author_id=a2.id, title="The Fifth Season"),
+            Book(id=None, author_id=a1.id, title="Ancillary Sword"),
+            Book(id=None, author_id=None, title="Untitled"),
+        ]
+        for book in books:
+            await cygnet.create(db, book)
+
+        authors = await cygnet.follow_many(db, books, BookTable.author_id)
+        assert [a and a.name for a in authors] == [
+            "Ann Leckie",
+            "N. K. Jemisin",
+            "Ann Leckie",
+            None,
+        ]
+        # Shared FK value → fetched once → same instance re-associated.
+        assert authors[0] is authors[2]
+        assert authors[3] is None
+
 
 # Self-join model: a book can list co-authors via a junction.  We use the
 # books table itself with two pseudo-roles ("primary" / "co") via aliases
