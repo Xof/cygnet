@@ -22,7 +22,7 @@ edge) and `predicate.__invert__` → `expression.PrefixOp` (the reverse of
 
 | Module | Responsibility | Key symbols |
 |---|---|---|
-| `__init__.py` | Public API surface; query-verb factories | `Table`, `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`, `get`/`save`/`create`/`follow`, `lit`/`op`/`ops`/`exists`, `transaction`, `cte`/`recursive_cte`/`lateral` |
+| `__init__.py` | Public API surface; query-verb factories | `Table`, `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`, `get`/`save`/`create`/`follow`/`follow_many`, `lit`/`op`/`ops`/`exists`, `transaction`, `cte`/`recursive_cte`/`lateral` |
 | `annotations.py` | Passive metadata markers, introspected by `meta` | `DBKey`, `AppKey`, `Column`, `ForeignKey`, `@table` |
 | `meta.py` | Dataclass → `TableMeta`/`FieldMeta` introspection; picks the per-class `row_builder` (positional vs kwargs) | `TableMeta` (WeakValueDict-cached per class; `.fields` excludes ClassVar/InitVar/KW_ONLY; `.row_builder`) |
 | `proxy.py` | Attribute access → predicate AST | `TableProxy[T]`, `ColumnProxy[FT]` (per-class singletons; `.AS()` bypasses cache) |

@@ -196,6 +196,21 @@ mismatch is reported. That duplication is the cost of the hoist and is flagged a
 landmine in [ARCHITECTURE.md](ARCHITECTURE.md); ADR `PF1` records the measurements and
 the rejected alternative.
 
+**The round-trip is the read-throughput ceiling, so the library's lever is fewer of
+them.** A real-PG spike measured what the two hotspot paragraphs above imply: end-to-end
+read time is ~85–92% driver decode plus network round-trip, and the positional hydrator
+already captured the hydration slice. No faster hydrator — and no alternate driver, Rust
+included — meaningfully moves that ceiling, because producing N real CPython dataclass
+instances is the irreducible floor the "bring your own objects" contract requires. So
+Cygnet's read-throughput work is round-trip *reduction*, not decode speed:
+`follow_many` collapses the N+1 FK-navigation loop (`[follow(o) for o in objs]`) into one
+`WHERE pk = ANY($1)` query and re-associates the targets by PK; the same `= ANY(array)`
+shape batches any by-key fetch (one array parameter, no `IN`-length limit); and
+`.stream()` trades a buffered result set for a server-side cursor. Connection pooling and
+projection narrowing live in the application and the adapter, not in core — consistent
+with the duck-typed `db` protocol that keeps Cygnet out of the connection-management
+business.
+
 ## Design decisions and tradeoffs
 
 The full record is the ADR; this is the synthesis a new maintainer needs, with ids
