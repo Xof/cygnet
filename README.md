@@ -1091,39 +1091,49 @@ overhead rather than connection management.
 
 #### Informal results
 
-A single internally-consistent run on an Apple M3 Max (Python 3.13, a
-local Dockerised PostgreSQL 16 started with `fsync=off
+The median across five internally-consistent runs on an Apple M3 Max
+(Python 3.13, a local Dockerised PostgreSQL 16 started with `fsync=off
 synchronous_commit=off full_page_writes=off`, single connection, no
-pooling). **These are informal, laptop-grade, single-run numbers —
-read them as orders of magnitude, not a benchmark league table.**
-Median µs per operation; **bold** marks the fastest cell in each row.
+pooling; refreshed 2026-06-29). The bulk-INSERT rows reset the table to
+its 100-row seed before each measured round, so every batch size — and
+every ORM — inserts into the same clean state. **These are informal,
+laptop-grade numbers — read them as orders of magnitude, not a benchmark
+league table.** Median µs per operation; **bold** marks the fastest cell
+in each row.
 
 | Operation | Cygnet/psycopg | Cygnet/asyncpg | SA/psycopg | SA/asyncpg | Django |
 |---|---|---|---|---|---|
-| SELECT by primary key (1 row)   | 757   | 566   | 859   | 1,023 | 963   |
-| SELECT all (100 rows)           | 569   | **559** | 893   | 869   | 644   |
-| JOIN posts→accounts (1000 rows) | **3,456** | 3,511 | 6,069 | 5,919 | 6,015 |
-| INSERT one row                  | 535   | 501   | 2,318 | 1,080 | **220** |
-| Bulk INSERT (50 rows)           | 469   | **394** | 1,934 | 1,633 | 705   |
+| SELECT by primary key (1 row)   | 309   | 258   | 401   | 367   | 320   |
+| SELECT all (100 rows)           | 301   | **293** | 496   | 498   | 372   |
+| JOIN posts→accounts (1000 rows) | **2,124** | 3,279 | 5,773 | 5,838 | 5,915 |
+| INSERT one row                  | 267   | **253** | 868   | 873   | 258   |
+| Bulk INSERT (50 rows)           | **535** | 630   | 1,805 | 3,049 | 1,428 |
+| Bulk INSERT (1000 rows)         | 10,391 | **5,882** | 17,299 | 14,775 | 12,194 |
 
-The SELECT-by-PK row is left **unbolded on purpose** — it is within
-noise (see the first caveat below), so picking a "winner" there would
-over-read the spread.
+The SELECT-by-PK row is left **unbolded on purpose** — the cells are
+close in absolute terms and within run-to-run noise (see the first
+caveat below), so picking a "winner" there would over-read the spread.
 
 The honest reading is "Cygnet's overhead is small," not "Cygnet is
-fastest." A thin SQL builder *should* sit close to the driver —
-there's little between your call and the wire. Cygnet (on either
-driver) is fastest-or-tied on the reads and the JOIN; on writes the
-only ORM that reads faster is Django on INSERT-one, and that bold cell
-is an artifact — see the async-tax caveat below. The caveats matter as
-much as the numbers:
+fastest." A thin SQL builder *should* sit close to the driver — there's
+little between your call and the wire. Cygnet (on either driver) is
+fastest-or-tied on every row. Two results stand out at scale. On the
+**1000-row bulk INSERT**, Cygnet/asyncpg's single multi-row `VALUES`
+statement is ~2× faster than Django's `bulk_create` and ~3× faster than
+SQLAlchemy's unit-of-work — the gap *widens* with batch size, because a
+per-object ORM pays per object while Cygnet emits one statement. And a
+**driver crossover**: psycopg and asyncpg are neck-and-neck on small
+ops, but at 1000 rows Cygnet/asyncpg pulls ~1.8× ahead of
+Cygnet/psycopg, because psycopg's `$N`→`%s` placeholder translation is a
+regex pass over the (now large) SQL string. The caveats matter as much
+as the numbers:
 
-- **The single-row read row is noisy.** SELECT-by-PK has wide spread
-  (IQR ~560 µs on the Cygnet/psycopg cell, ~416 µs on SA/psycopg). The
-  lean cells in that row — both Cygnet drivers and Django — are within
-  run-to-run noise of one another; don't read fine-grained ordering
-  into them, and in particular don't read Cygnet/psycopg as
-  meaningfully slower than Cygnet/asyncpg here.
+- **The single-row read and 50-row bulk rows are the noisy ones.** Their
+  cells run to ~25% run-to-run variation; the lean cells in the
+  SELECT-by-PK row in particular are within noise of one another, so
+  don't read fine-grained ordering into them. The 1000-row bulk row is
+  the steadiest signal (~3–7% variation) because the per-op work dwarfs
+  the timing jitter.
 - **The database is deliberately fast.** `fsync=off`,
   `synchronous_commit=off`, and `full_page_writes=off` on a localhost
   Docker PG make commits nearly free, which *maximises* the visible
@@ -1131,13 +1141,13 @@ much as the numbers:
   these per-call gaps shrink to a sliver of total query latency.
 - **One connection, no pooling** — these are ORM-overhead numbers, not
   a connection-management comparison.
-- **The async tax favors Django (a harness artifact).** Cygnet and SA
-  each pay one event-loop entry (`loop.run_until_complete`) *per
+- **The async tax flatters the sync path (a harness artifact).** Cygnet
+  and SA each pay one event-loop entry (`loop.run_until_complete`) *per
   measured op*; Django's sync path pays none. This inflates the async
   ORMs' *absolute* numbers on cheap ops — it's why Django reads as
-  fastest on INSERT-one (220 µs) despite issuing the same
-  `INSERT … RETURNING`. Django is **not** faster at the actual insert;
-  strip the loop spin and Cygnet is at or below it. A real async app
+  competitive on INSERT-one (258 µs) despite issuing the same
+  `INSERT … RETURNING`. Even carrying that tax Cygnet/asyncpg edges it
+  (253 µs); strip the loop spin and the gap widens. A real async app
   amortises one loop across many awaits.
 - **SA's read columns understate Cygnet's lead.** The SA session is
   reused across rounds and the read ops never commit/expire, so
