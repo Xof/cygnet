@@ -466,15 +466,55 @@ class TestInsertOne:
         assert result.pk is not None
 
 
-class TestBulkInsert:
-    """Insert 50 fresh rows in one statement (Cygnet/Django) or one
-    transaction (SA's add_all + commit)."""
+_BULK_ROUNDS = 30  # explicit pedantic round count (each preceded by bulk_reset)
 
-    def test_cygnet(self, benchmark, loop, populated_db: Any) -> None:
+
+@pytest.fixture(scope="module")
+def bulk_reset(parsed_dsn: Any) -> Any:
+    """Per-round cleanup for the bulk-INSERT benchmarks.
+
+    The bulk benchmarks all insert ``name='Bulk i'`` rows into the shared,
+    seeded ``accounts`` table. Without cleanup those rows accumulate
+    monotonically across rounds and columns, which (a) inflates the later
+    rounds' and later columns' numbers and (b) bloats the table for any
+    benchmark that runs afterwards. Returned function deletes only the bulk
+    rows (``LIKE 'Bulk %'``) — never the 100 seeded ``User i`` accounts the
+    SELECT/JOIN benchmarks read — over a dedicated autocommit connection so
+    each measured round starts from the same clean seed. Wired as the
+    ``setup`` of ``benchmark.pedantic`` below; returns None so pedantic calls
+    the target with no args.
+    """
+    import psycopg
+
+    cleaner = psycopg.connect(DSN, autocommit=True)
+
+    def reset() -> None:
+        # Strip the accumulated bulk rows so each round inserts into the clean
+        # ~100-row seed. (No VACUUM: the dead tuples one round leaves are a few
+        # KB — negligible next to the round-to-round noise — and a per-round
+        # VACUUM only adds lock/IO contention to the measurement.)
+        cleaner.execute("DELETE FROM accounts WHERE name LIKE 'Bulk %'")
+
+    try:
+        yield reset
+    finally:
+        cleaner.close()
+
+
+class TestBulkInsert:
+    """Insert ``N`` fresh rows in one statement (Cygnet/Django) or one
+    transaction (SA's add_all + commit). ``N`` is a class attribute so a
+    subclass can re-run the same five columns at a different batch size.
+    ``bulk_reset`` runs before each round so every measured insert starts from
+    the clean seed (fair across columns, no table bloat)."""
+
+    N = 50
+
+    def test_cygnet(self, benchmark, loop, populated_db: Any, bulk_reset: Any) -> None:
         def op() -> list:
             accs = [
                 Account(id=None, name=f"Bulk {i}", email=f"b{i}@example.com")
-                for i in range(50)
+                for i in range(self.N)
             ]
 
             async def go() -> list:
@@ -484,16 +524,18 @@ class TestBulkInsert:
 
             return run_async(loop, go)
 
-        result = benchmark(op)
-        assert len(result) == 50
+        result = benchmark.pedantic(
+            op, setup=bulk_reset, rounds=_BULK_ROUNDS, iterations=1, warmup_rounds=3
+        )
+        assert len(result) == self.N
 
-    def test_sqlalchemy(self, benchmark, loop, sa_engine: Any) -> None:
+    def test_sqlalchemy(self, benchmark, loop, sa_engine: Any, bulk_reset: Any) -> None:
         from sqlalchemy.ext.asyncio import AsyncSession
 
         def op() -> int:
             objs = [
                 SAAccount(name=f"Bulk {i}", email=f"b{i}@example.com")
-                for i in range(50)
+                for i in range(self.N)
             ]
 
             async def go() -> int:
@@ -504,32 +546,43 @@ class TestBulkInsert:
 
             return run_async(loop, go)
 
-        n = benchmark(op)
-        assert n == 50
+        n = benchmark.pedantic(
+            op, setup=bulk_reset, rounds=_BULK_ROUNDS, iterations=1, warmup_rounds=3
+        )
+        assert n == self.N
 
-    def test_cygnet_asyncpg(self, benchmark, loop, cygnet_asyncpg_db: Any) -> None:
+    def test_cygnet_asyncpg(
+        self, benchmark, loop, cygnet_asyncpg_db: Any, bulk_reset: Any
+    ) -> None:
         def op() -> list:
             accs = [
                 Account(id=None, name=f"Bulk {i}", email=f"b{i}@example.com")
-                for i in range(50)
+                for i in range(self.N)
             ]
 
             async def go() -> list:
                 return await (
-                    cygnet.INSERT(cygnet_asyncpg_db).INTO(AccountTable).BULK_VALUES(accs)
+                    cygnet.INSERT(cygnet_asyncpg_db)
+                    .INTO(AccountTable)
+                    .BULK_VALUES(accs)
                 )
 
             return run_async(loop, go)
 
-        assert len(benchmark(op)) == 50
+        result = benchmark.pedantic(
+            op, setup=bulk_reset, rounds=_BULK_ROUNDS, iterations=1, warmup_rounds=3
+        )
+        assert len(result) == self.N
 
-    def test_sqlalchemy_asyncpg(self, benchmark, loop, sa_engine_asyncpg: Any) -> None:
+    def test_sqlalchemy_asyncpg(
+        self, benchmark, loop, sa_engine_asyncpg: Any, bulk_reset: Any
+    ) -> None:
         from sqlalchemy.ext.asyncio import AsyncSession
 
         def op() -> int:
             objs = [
                 SAAccount(name=f"Bulk {i}", email=f"b{i}@example.com")
-                for i in range(50)
+                for i in range(self.N)
             ]
 
             async def go() -> int:
@@ -540,20 +593,34 @@ class TestBulkInsert:
 
             return run_async(loop, go)
 
-        assert benchmark(op) == 50
+        n = benchmark.pedantic(
+            op, setup=bulk_reset, rounds=_BULK_ROUNDS, iterations=1, warmup_rounds=3
+        )
+        assert n == self.N
 
-    def test_django(self, benchmark, django_app: Any) -> None:
+    def test_django(self, benchmark, django_app: Any, bulk_reset: Any) -> None:
         Account_ = django_app
 
         def op() -> int:
             objs = [
-                Account_(name=f"Bulk {i}", email=f"b{i}@example.com") for i in range(50)
+                Account_(name=f"Bulk {i}", email=f"b{i}@example.com")
+                for i in range(self.N)
             ]
             created = Account_.objects.bulk_create(objs)
             return len(created)
 
-        n = benchmark(op)
-        assert n == 50
+        n = benchmark.pedantic(
+            op, setup=bulk_reset, rounds=_BULK_ROUNDS, iterations=1, warmup_rounds=3
+        )
+        assert n == self.N
+
+
+class TestBulkInsert1000(TestBulkInsert):
+    """Bulk INSERT at 1000 rows. The per-row render cost scales with the row
+    count, so at this size Cygnet's bulk-INSERT render hoist is a larger share
+    of end-to-end than at N=50 (where it is ~4%, below the noise floor)."""
+
+    N = 1000
 
 
 class TestJoinFollow:
