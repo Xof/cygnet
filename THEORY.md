@@ -26,8 +26,8 @@ mechanical glue — typed column references, parameter binding, row-to-object
 hydration, transactions, `ON CONFLICT`, `RETURNING` — and nothing more. It is not a
 query optimiser, a migration framework, a multi-dialect abstraction, a lazy-loading
 proxy, or a unit-of-work session. That scope *narrowness is the product*, and most
-of the surprising-looking choices below are it being honest about that (ADR
-"Context").
+of the surprising-looking choices below are it being honest about that (see
+the decision log, [docs/adr/](docs/adr/README.md)).
 
 Two big ideas carry the whole codebase, and if you internalise only these you can
 place almost any new code correctly:
@@ -213,8 +213,9 @@ business.
 
 ## Design decisions and tradeoffs
 
-The full record is the ADR; this is the synthesis a new maintainer needs, with ids
-to chase for detail.
+The full record is the decision log at [docs/adr/](docs/adr/README.md) — one file
+per decision; this is the synthesis a new maintainer needs, with ids to chase for
+detail.
 
 - **Plain dataclasses, no base class (`F1`).** Subclassing a framework type couples
   the model to Cygnet at import and breaks its use in serialisation/validation/pure
@@ -391,6 +392,6 @@ Grounded in the real structure (signatures are in the code — this is the *shap
 ---
 
 When this document and the code disagree, the code is authoritative and this file is
-stale — fix it. When this document and the decision record (the local ADR) disagree,
-the ADR is the older artifact: reconcile deliberately rather than assuming either is
-right.
+stale — fix it. When this document and the decision log ([docs/adr/](docs/adr/README.md))
+disagree, the log is the older artifact: reconcile deliberately rather than assuming
+either is right.
