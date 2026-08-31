@@ -36,7 +36,12 @@ htmlcov/
 
 # Local working artifacts: code-review outputs and superpowers plans/specs.
 # Design rationale worth keeping has been folded into THEORY.md.
-docs/
+# Note the `docs/*` (not `docs/`) form: git does not descend into an excluded
+# directory, so a `!docs/adr/` negation under `docs/` would never be consulted.
+docs/*
+# ...except the decision log, which IS a tracked repo artifact: one file per
+# decision plus a generated index (see docs/adr/README.md).
+!docs/adr/
 
 # cProfile dumps written by `just profile --save` (bench/profile_hotspots.py).
 bench/.profiles/
