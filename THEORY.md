@@ -335,7 +335,20 @@ The honest section — sharp edges, intentional-looking-bugs, and real debt.
   expression type, and an exception here would be the bigger surprise. The `!=`
   half is sharper still: `IS NOT NULL` is true only when *every* member is
   non-null, so it is not the complement of `IS NULL` and a half-null row
-  satisfies neither. Second, an
+  satisfies neither. Note the rewrite fires only on a *whole-operand* `None`;
+  a `None` sitting **inside** the operand (`row(a, b) == (None, 'z')`) is a
+  different animal and is refused outright by `_coerce`, on all six comparison
+  operators. It has to be: the member renders as an ordinary `$N`, nothing
+  compares equal to NULL, and the predicate is therefore NULL rather than a
+  match for precisely the row the caller wanted — the same trap `in_` already
+  refused, and the two surfaces had disagreed on identical operands. The
+  refusal covers the ordering operators and `!=` too. Those are subtler
+  rather than safer: a row comparison stops at the first decisive pair, so on
+  PG 16.13 `(1,'x') > (2, NULL)` is false, `(3,'x') > (2, NULL)` is *true*,
+  and `(1, NULL) <> (2, NULL)` is *true* — each settled before the NULL is
+  reached. "Defined only when the data happens to decide it early" is not a
+  rule a caller can hold in their head, and a keyset cursor carrying a NULL is
+  broken from that member onward regardless, so all six refuse. Second, an
   `IN`-list's SQL *text* grows with the number of values, so PG (and asyncpg's
   statement cache) re-plans per distinct batch size — unlike the scalar
   `= ANY($1)` shape, whose text is constant. The fix would be

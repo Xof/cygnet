@@ -456,3 +456,150 @@ class TestInLeftOperandValidation:
         pred = cygnet.in_(AccountTable.id, [1, 2])
         assert pred.render_sql(params) == "accounts.id IN ($1, $2)"
         assert params == [1, 2]
+
+
+class TestNullMemberInComparison:
+    """A `None` *inside* a compared operand is refused on all six
+    comparisons, matching `in_`.
+
+    `Predicate`'s None -> IS NULL rewrite fires only when the *whole* right
+    operand is None, so a None member is just another bound parameter and
+    `(a, b) = ($1, $2)` evaluates to NULL — never true — for exactly the row
+    the caller wanted.  Verified against PG: with a table holding the row
+    `(NULL, 'z')`, `WHERE (a, b) = (NULL, 'z')` returns no rows, and the
+    predicate itself IS NULL rather than false.
+    """
+
+    @pytest.mark.parametrize(
+        "compare",
+        [
+            lambda r, v: r == v,
+            lambda r, v: r != v,
+            lambda r, v: r < v,
+            lambda r, v: r > v,
+            lambda r, v: r <= v,
+            lambda r, v: r >= v,
+        ],
+        ids=["eq", "ne", "lt", "gt", "le", "ge"],
+    )
+    def test_none_member_is_refused_by_every_comparison(self, compare):
+        # Ordering comparisons are included even though PG can sometimes
+        # decide one before reaching the NULL member: "sometimes defined,
+        # depending on the data" is not a usable rule, and a keyset cursor
+        # carrying a NULL is broken from that member onward regardless.
+        row = cygnet.row(AccountTable.id, AccountTable.name)
+        with pytest.raises(ValueError, match="is None"):
+            compare(row, (None, "z"))
+
+    def test_message_names_the_offending_member_and_the_way_out(self):
+        with pytest.raises(ValueError, match=r"index 1 is None"):
+            cygnet.row(AccountTable.id, AccountTable.name) == (1, None)
+        with pytest.raises(ValueError, match=r"is_null\(\)"):
+            cygnet.row(AccountTable.id, AccountTable.name) == (1, None)
+
+    def test_none_in_a_list_operand_is_refused_too(self):
+        # tuple and list coerce through the same arm.
+        with pytest.raises(ValueError, match="is None"):
+            cygnet.row(AccountTable.id, AccountTable.name) == [None, "z"]
+
+    def test_none_in_a_prebuilt_row_operand_is_refused(self):
+        with pytest.raises(ValueError, match=r"index 0 is None"):
+            cygnet.row(AccountTable.id, AccountTable.name) == cygnet.row(None, "z")
+
+    def test_none_in_a_one_element_row_is_refused(self):
+        # `(a) = ($1)` with NULL bound is the same trap at arity 1, and the
+        # caller almost certainly meant `is_null()`.
+        with pytest.raises(ValueError, match="is None"):
+            cygnet.row(AccountTable.id) == (None,)
+
+    def test_whole_operand_none_still_becomes_is_null(self):
+        # The boundary: refusing a None *member* must not disturb the
+        # documented whole-operand rewrite, which returns before coercion.
+        params: list = []
+        pred = cygnet.row(AccountTable.id, AccountTable.name) == None  # noqa: E711
+        assert pred.render_sql(params) == "(accounts.id, accounts.name) IS NULL"
+        assert params == []
+
+    def test_arity_is_still_checked_first(self):
+        # A wrong-length operand that also contains a None reports the
+        # arity, which is the more fundamental mistake.
+        with pytest.raises(ValueError, match="2 element"):
+            cygnet.row(AccountTable.id, AccountTable.name) == (None,)
+
+    def test_rows_without_none_are_unaffected(self):
+        params: list = []
+        pred = cygnet.row(AccountTable.id, AccountTable.name) == (1, "Fred")
+        assert pred.render_sql(params) == "(accounts.id, accounts.name) = ($1, $2)"
+        assert params == [1, "Fred"]
+
+    def test_column_operands_are_unaffected(self):
+        # `_contains_none` must not trip on renderables.
+        params: list = []
+        pred = cygnet.row(AccountTable.id, AccountTable.name) == cygnet.row(
+            LogTable.id, LogTable.message
+        )
+        assert pred.render_sql(params) == (
+            "(accounts.id, accounts.name) = (log_entries.id, log_entries.message)"
+        )
+        assert params == []
+
+    def test_in_and_comparison_now_agree_on_the_same_operand(self):
+        # The defect was the disagreement: `in_` refused this operand while
+        # `==` accepted it and emitted a never-true predicate.
+        row = cygnet.row(AccountTable.id, AccountTable.name)
+        with pytest.raises(ValueError):
+            cygnet.in_(row, [(None, "z")])
+        with pytest.raises(ValueError):
+            row == (None, "z")
+
+    def test_in_row_path_reports_both_element_and_member_index(self):
+        # in_ delegates to _coerce, so the message carries the element
+        # index it adds plus the member index _coerce found.
+        with pytest.raises(ValueError, match=r"index 1: row value member at index 0"):
+            cygnet.in_(
+                cygnet.row(AccountTable.id, AccountTable.name),
+                [(1, "Fred"), (None, "z")],
+            )
+
+    def test_in_scalar_path_still_has_its_own_message(self):
+        # The scalar left operand never reaches _coerce, so in_'s own guard
+        # is what covers it.
+        with pytest.raises(ValueError, match="never matches NULL"):
+            cygnet.in_(AccountTable.id, [1, None])
+
+
+class TestInNoneElementUnderRowLeft:
+    """A bare `None` *element* (as opposed to a None inside a tuple) under a
+    row-value left operand.
+
+    `_coerce` returns a whole-operand None untouched — that is the shape
+    `row(...) == None` legitimately rewrites to `IS NULL` — so it is `in_`'s
+    own guard, not `_coerce`'s, that has to catch this one.  The two guards
+    overlap deliberately: were the second an `elif`, this shape would reach
+    neither and render `(a, b) IN ($1)` with NULL bound.
+    """
+
+    def test_bare_none_element_is_refused(self):
+        with pytest.raises(ValueError, match="never matches NULL"):
+            cygnet.in_(cygnet.row(AccountTable.id, AccountTable.name), [None])
+
+    def test_bare_none_among_valid_elements_is_refused(self):
+        with pytest.raises(ValueError, match=r"index 1"):
+            cygnet.in_(cygnet.row(AccountTable.id, AccountTable.name), [(1, "x"), None])
+
+    def test_none_in_a_one_column_row_list_is_refused(self):
+        # The natural shape for a single-column key: elements are scalars, so
+        # a None element is indistinguishable from the scalar case and has to
+        # be refused the same way.
+        with pytest.raises(ValueError, match="never matches NULL"):
+            cygnet.in_(cygnet.row(AccountTable.id), [1, None])
+
+    def test_valid_row_lists_are_unaffected(self):
+        params: list = []
+        pred = cygnet.in_(
+            cygnet.row(AccountTable.id, AccountTable.name), [(1, "x"), (2, "y")]
+        )
+        assert pred.render_sql(params) == (
+            "(accounts.id, accounts.name) IN (($1, $2), ($3, $4))"
+        )
+        assert params == [1, "x", 2, "y"]
