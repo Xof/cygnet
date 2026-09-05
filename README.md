@@ -560,14 +560,29 @@ query rather than an error. It refuses an empty sequence (PostgreSQL has no
 dict would bind its **keys**), a value whose arity doesn't match the row,
 and any value containing `None`. That last one matters: `IN` compares with
 `=`, and nothing equals NULL, so `(a, b) IN ((NULL, 'z'))` returns **zero
-rows** even when exactly that row exists.
+rows** even when exactly that row exists. The comparison operators refuse the
+same operand for the same reason (see below), so the two surfaces agree.
 
-Three edges worth knowing:
+Four edges worth knowing:
 
-- `cygnet.row(a, b) == None` renders `(a, b) IS NULL`, following the same
-  `None` → `IS NULL` rewrite every Cygnet comparison gets. Careful: PG reads
-  that as "**every** member is null", not "the row is null" — a row with one
-  null member does not match.
+- **A `None` *inside* the compared value is refused**, on all six comparison
+  operators, the same way `cygnet.in_` refuses it — `row(a, b) == (None, "z")`
+  raises rather than emitting a predicate that silently finds nothing.
+  Nothing compares equal to NULL, so `(a, b) = ($1, $2)` with a NULL bound
+  evaluates to NULL, not to a match, for exactly the row you were looking
+  for. (The ordering operators and `!=` are subtler rather than safer: a row
+  comparison stops at the first decisive pair, so `(3,'x') > (2,NULL)` is
+  true while `(1,'x') > (2,NULL)` is false. "Defined only when the data
+  happens to decide it early" is not a rule worth relying on, so all six
+  refuse.) There is
+  no row-level rewrite to reach for: `(a, b) IS NULL` means something else
+  (below), and `a IS NOT DISTINCT FROM $1 AND …` stops being a row comparison
+  and can no longer be driven from a multi-column index. Test that column
+  separately with `is_null()`.
+- `cygnet.row(a, b) == None` — the *whole* operand, not a member — renders
+  `(a, b) IS NULL`, following the same `None` → `IS NULL` rewrite every Cygnet
+  comparison gets. Careful: PG reads that as "**every** member is null", not
+  "the row is null" — a row with one null member does not match.
 - `!= None` renders `IS NOT NULL`, which is **not** the complement of the
   above. It is true only when every member is non-null, so a half-null row
   satisfies neither `== None` nor `!= None`. Use `~(row(...) == None)` if you

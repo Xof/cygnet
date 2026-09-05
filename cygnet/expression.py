@@ -355,13 +355,18 @@ class RowValue(_InfixOps):
     Python with the two lengths named, rather than as a PG "unequal
     number of entries in row expressions" error from the server.
 
-    Two behaviours worth knowing:
+    Three behaviours worth knowing:
 
       - ``row(a, b) == None`` hits ``Predicate``'s None → IS NULL rewrite
         and renders ``(a, b) IS NULL``.  Valid PG, but it means "both
         members are null", NOT "the row is null".  Deliberately not
         special-cased — the rewrite is uniform across every expression
         type, and carving out an exception here would be the surprise.
+      - A ``None`` *inside* the compared operand is refused outright
+        (``row(a, b) == (None, "z")`` raises).  That rewrite fires only
+        on a whole-operand None, so a None member would render as an
+        ordinary ``$N`` and make the predicate NULL rather than true.
+        See ``_coerce``.
       - No ``&`` / ``|`` / ``~``: a bare row value is not a boolean
         expression.  Compare it first, then compose the resulting
         Predicate.
@@ -423,11 +428,17 @@ class RowValue(_InfixOps):
           - ``None`` or anything renderable (a ColumnProxy, a function
             call, a subquery) — passed through untouched for
             ``Predicate`` to handle, including the None → IS NULL
-            rewrite documented above.  PG checks the arity of those;
+            rewrite documented above.  PG checks the arity of those.
+            Note this is the *whole-operand* None; a None sitting
+            inside a row is refused (see below);
           - a scalar (a number, ``str``, ``bytes``, …) — bound as a
             single ``$N``, which is only meaningful against a
             one-element row, so the arity check below rejects it for
             any wider row.
+
+        A coerced row containing a ``None`` member is then refused,
+        matching ``in_``: nothing compares equal to NULL, so the
+        predicate would be NULL rather than a match.
 
         Every *other* iterable — set, dict, range, generator — is
         refused outright.  Those are the "iterable but wrong" shapes
@@ -493,6 +504,37 @@ class RowValue(_InfixOps):
                 else:
                     coerced.append(theirs)
             other = RowValue(tuple(coerced))
+        # A None *member* never reaches Predicate's None -> IS NULL
+        # rewrite: that fires only when the whole right operand is None, so
+        # a None inside the row is just another bound parameter, and
+        # `(a, b) = ($1, $2)` then evaluates to NULL — never true — for
+        # exactly the row the caller was looking for.  No row-level rewrite
+        # is available: `(a, b) IS NULL` means "every member is null", and
+        # `a IS NOT DISTINCT FROM $1 AND ...` stops being a row comparison
+        # and can no longer be driven from a multi-column index.  So refuse
+        # the operand, the way `in_` already refuses the same thing.
+        #
+        # All six comparisons, not just = and !=.  A row comparison stops at
+        # the first decisive pair, so an ordering or <> comparison against a
+        # NULL member is not always NULL — verified on PG 16.13,
+        # `(1,'x') > (2, NULL)` is false, `(3,'x') > (2, NULL)` is true, and
+        # `(1, NULL) <> (2, NULL)` is true, each decided before the NULL is
+        # reached.  But "defined only when the data happens to decide it
+        # early" is not a rule a caller can hold in their head, and the
+        # keyset cursor this would permit is broken for every row at or past
+        # the NULL anyway.
+        if isinstance(other, RowValue):
+            for j, item in enumerate(other.items):
+                if self._contains_none(item):
+                    raise ValueError(
+                        f"row value member at index {j} is None — nothing "
+                        f"compares equal to NULL, so `=` can never match "
+                        f"this row, and an ordering comparison resolves to "
+                        f"NULL or not depending on where the NULL falls; "
+                        f"test that column separately with is_null(), or "
+                        f"compare the whole row against None "
+                        f"(row(...) == None renders (a, b) IS NULL)"
+                    )
         return other
 
     # The six comparisons mirror _InfixOps' but coerce the right operand
@@ -661,6 +703,16 @@ def in_(left: Any, values: Any) -> Predicate:
             # that row exists.  This is B6/OQ7 on a new surface — the trap
             # the `== None` -> IS NULL rewrite exists to prevent — and
             # there is no rewrite available inside an IN-list, so refuse.
+            #
+            # Deliberately `if`, not `elif`, even though `_coerce` above
+            # refuses a None member itself: `_coerce` returns a *whole*
+            # element that is None untouched (its None arm returns before
+            # the member check, since that is the operand shape `== None`
+            # legitimately rewrites to IS NULL).  Were this an `elif`, a
+            # bare None in the list — `in_(row(a, b), [None])` — would
+            # reach neither guard and render `(a, b) IN ($1)` with NULL
+            # bound.  The two guards overlap on purpose; the overlap is
+            # free and the gap would not be.
             raise ValueError(
                 f"cygnet.in_(): value at index {i} contains None — IN never "
                 f"matches NULL, so this would silently match nothing; filter "
