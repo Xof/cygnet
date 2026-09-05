@@ -398,6 +398,29 @@ class RowValue(_InfixOps):
         return bool(hasattr(value, "render_sql"))
 
     @staticmethod
+    def _param_count(value: Any) -> int:
+        """Number of ``$N`` placeholders ``value`` would bind.
+
+        Measured by rendering into a throwaway params list rather than
+        inferred from the shape.  That is exact by construction — it runs
+        the same code that does the real binding — where a structural
+        estimate is not: a member that *renders* can still *bind*
+        (``fn("lower")("x")`` emits one parameter of its own), and an
+        IN-list element need not be rectangular, so neither
+        ``len(values) * k`` nor "renderables cost nothing" holds.
+
+        Costs one extra render of the value list.  Used by ``in_`` for the
+        wire-protocol ceiling check, where being exact is worth more than
+        the render: guessing low lets through the very query the check
+        exists to refuse.
+        """
+        probe: list[Any] = []
+        if hasattr(value, "render_sql"):
+            value.render_sql(probe)
+            return len(probe)
+        return 1
+
+    @staticmethod
     def _contains_none(value: Any) -> bool:
         """True if ``value`` has a ``None`` leaf anywhere inside it."""
         if isinstance(value, RowValue):
@@ -629,12 +652,33 @@ def in_(left: Any, values: Any) -> Predicate:
     would keep the text constant but needs per-column *SQL* type names,
     which Cygnet doesn't track — it introspects Python types only.
 
+    There is also a hard ceiling on top of that, unrelated to plan-cache
+    churn: PostgreSQL's extended query protocol carries the bind-parameter
+    count in a wire-format int16, so no more than 65535 parameters can ever
+    be bound to one statement.  This call raises ValueError if its value
+    list alone would exceed that, counting the parameters actually bound
+    (by rendering) rather than assuming ``len(values) * k``.
+
+    Passing the check is a lower bound, not a promise the query will run.
+    Three things bite sooner, and for the row form the last one dominates:
+    the rest of the statement shares the same 65535 budget; asyncpg caps a
+    statement at 32767 arguments, so Cygnet's own asyncpg adapter halves
+    the ceiling; and a *row*-valued IN list is rewritten by the parser into
+    a left-deep nested OR, one level per element, which exhausts
+    ``max_stack_depth`` well under ten thousand elements (PG 16.13 at the
+    default 2MB
+    takes 7000 pairs, fails at 10000).  That last threshold shifts with
+    configuration and platform, so it isn't enforced here — but it means a
+    composite-key batch should be chunked at a few thousand rows, far below
+    what this check allows.
+
     ``IN (subquery)`` is a different construct (no parameterisation
     needed) and stays with ``cygnet.op(col, "IN", subquery)``.
 
     Raises TypeError if ``values`` isn't a sequence of values, ValueError
-    if it's empty (``IN ()`` is a syntax error in PG) or if any element's
-    arity doesn't match a row-value ``left``.
+    if it's empty (``IN ()`` is a syntax error in PG), if any element's
+    arity doesn't match a row-value ``left``, if any element contains
+    ``None``, or if this call alone would bind more than 65535 parameters.
     """
     # Order matters: reject the two shapes that are *iterable but wrong*
     # before materialising, so each gets its own pointed message rather
@@ -719,6 +763,62 @@ def in_(left: Any, values: Any) -> Predicate:
                 f"the None out, or test for it separately with is_null()"
             )
         elements.append(item)
+
+    # PostgreSQL's extended query protocol carries the parameter count in a
+    # wire-format int16, so 65535 bound parameters is a hard ceiling on the
+    # protocol itself — not a tunable, and not something a driver can raise.
+    # Counted by rendering (see _param_count) rather than assumed as
+    # len(elements) * k: an element need not be rectangular, and a member
+    # that renders in place can still bind a parameter of its own, so both
+    # the multiply and a "renderables are free" rule undercount. `left` is
+    # not counted — it's columns/expressions that bind nothing in the normal
+    # case, and on the rare operand that does bind something, the amount is
+    # negligible next to the value list.
+    #
+    # Three reasons this is a lower bound rather than a guarantee, all of
+    # them one-way (they make the real limit *lower*, never higher):
+    #
+    #   1. The 65535 budget is shared with the rest of the query — other
+    #      WHERE clauses, a JOIN condition, a LIMIT bind — none of which
+    #      in_() can see.
+    #   2. A driver may impose its own, smaller cap. Cygnet's own asyncpg
+    #      adapter is subject to asyncpg's 32767-argument limit, half the
+    #      protocol ceiling; psycopg allows the full 65535.
+    #   3. For the *row* form the server gives out far sooner than either:
+    #      the parser rewrites a row-valued IN list into a left-deep nested
+    #      OR, one level per element, so it exhausts max_stack_depth in the
+    #      well under ten thousand elements (measured: PG 16.13 at the
+    #      default 2MB
+    #      takes 7000 pairs and fails at 10000 with SQLSTATE 54001). That
+    #      threshold moves with max_stack_depth and the platform, so it
+    #      can't be enforced here — but it means the row form's practical
+    #      cap is well under 65535 // k, and callers batching composite keys
+    #      should be chunking at a few thousand regardless of this check.
+    #
+    # So passing this check means the IN-list alone fits the wire protocol,
+    # not that the statement will execute.
+    param_count = sum(RowValue._param_count(element) for element in elements)
+    if param_count > 65535:
+        if isinstance(left, RowValue):
+            way_out = (
+                "split the value list across separate queries and union "
+                "the results — IN is a set test, so chunking is safe. "
+                "Note the chunks must be separate *statements*: OR-ing "
+                "them into one query binds every parameter of both and "
+                "does not help. For a composite key, chunk at a few "
+                "thousand rows — the server's own limit on a row-valued "
+                "IN list is far below this one"
+            )
+        else:
+            way_out = (
+                "for a scalar column, T.id == cygnet.arrays.any([...]) "
+                "binds the whole list as one array parameter and has no "
+                "such limit"
+            )
+        raise ValueError(
+            f"cygnet.in_(): this call would bind {param_count} parameters, "
+            f"over PostgreSQL's wire-protocol ceiling of 65535 — {way_out}"
+        )
 
     # The IN-list is itself a parenthesised comma-joined list, i.e. the
     # same rendering RowValue provides — reuse it rather than adding a

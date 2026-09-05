@@ -354,7 +354,29 @@ The honest section — sharp edges, intentional-looking-bugs, and real debt.
   `= ANY($1)` shape, whose text is constant. The fix would be
   `IN (SELECT * FROM unnest($1::int[], $2::text[]))`, which needs per-column *SQL*
   type names; Cygnet introspects Python types only, so it cannot emit them. Accepted
-  cost, documented rather than worked around. Third — and this one is refused
+  cost, documented rather than worked around. On top of that plan-cache cost sits
+  a hard one: PG's wire protocol carries the bind-parameter count in an int16, so
+  no statement can ever bind more than 65535 parameters, capping a `k`-column row
+  at `65535 // k` elements per `in_` call. `in_` enforces this by counting the
+  parameters actually bound — measured by rendering into a throwaway list,
+  because a member that renders in place can still bind one of its own
+  (`fn("lower")("x")` does), so neither `len(values) * k` nor "renderables are
+  free" is right — and raises `ValueError` naming the count, the ceiling, and,
+  tailored to whether `left` is a row or a scalar, chunking or `arrays.any` as
+  the way out. **The check is a lower bound in three separate ways, all of them
+  one-directional.** It sees only this call's own parameters, not whatever else
+  shares the statement's 65535 budget. asyncpg caps a statement at 32767
+  arguments, so Cygnet's own asyncpg adapter halves the ceiling while psycopg
+  allows the full 65535. And for the row form the server gives out long before
+  either: `transformAExprIn` rewrites a row-valued `IN` list into a left-deep
+  nested `OR`, one level per element, which exhausts `max_stack_depth` in the
+  well under ten thousand elements — on PG 16.13 at the default 2 MB, 7000
+  pairs parse and 10000
+  fail with SQLSTATE 54001. So the `65535 // k` figure describes the protocol,
+  not the practical cap; a composite-key batch wants chunking at a few thousand
+  rows, and the wire-protocol check will essentially never be the thing that
+  stops you. It is not enforceable here because the stack threshold moves with
+  `max_stack_depth` and the platform. Third — and this one is refused
   rather than documented — a *nested* row cannot be compared against bound
   values at all: PG cannot infer a parameter's type inside a nested row
   constructor, so `((a,b),c) = (($1,$2),$3)` does not prepare, while the flat
