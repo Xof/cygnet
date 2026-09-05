@@ -563,7 +563,7 @@ and any value containing `None`. That last one matters: `IN` compares with
 rows** even when exactly that row exists. The comparison operators refuse the
 same operand for the same reason (see below), so the two surfaces agree.
 
-Four edges worth knowing:
+Five edges worth knowing:
 
 - **A `None` *inside* the compared value is refused**, on all six comparison
   operators, the same way `cygnet.in_` refuses it — `row(a, b) == (None, "z")`
@@ -593,6 +593,20 @@ Four edges worth knowing:
   prepare — so Cygnet rejects the shape rather than emit SQL no server will
   run. Nesting against *columns* binds nothing and stays legal, but note it
   becomes a composite-type comparison, in which PG treats NULLs as equal.
+- **There's a hard ceiling on list length — and the practical one is much
+  lower.** PostgreSQL's wire protocol caps a statement at 65535 bound
+  parameters, and `in_` raises `ValueError` if its own value list alone would
+  exceed that, counting the parameters actually bound rather than assuming
+  `len(values) * k`. Passing that check is a lower bound, not a promise the
+  query runs: the rest of the statement shares the same budget, asyncpg caps
+  a statement at 32767 arguments (so Cygnet's asyncpg adapter halves the
+  ceiling), and — the one that actually bites — a **row**-valued `IN` list is
+  rewritten by the parser into a nested `OR`, one level per element, which
+  exhausts `max_stack_depth` well under ten thousand elements. On PG 16.13
+  at the default
+  2 MB, 7000 pairs work and 10000 fail with `stack depth limit exceeded`.
+  That threshold moves with configuration, so Cygnet can't enforce it; chunk
+  composite-key batches at a few thousand rows.
 
 ### Row-level locking
 

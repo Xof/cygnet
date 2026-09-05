@@ -568,6 +568,98 @@ class TestNullMemberInComparison:
             cygnet.in_(AccountTable.id, [1, None])
 
 
+class TestInParameterCeiling:
+    """PostgreSQL's wire protocol caps one statement at 65535 bound
+    parameters (GH #24).
+
+    These pin the guard's boundary, not what a server will execute.
+    Passing the check means the IN-list fits the *protocol* on its own; it
+    is a lower bound three ways over, since the rest of the statement
+    shares the budget, asyncpg caps a statement at 32767 arguments, and a
+    row-valued IN list exhausts max_stack_depth well under ten thousand
+    elements (the
+    parser rewrites it into one nested OR level per element).  So a value
+    here that "still builds" is asserting Cygnet's arithmetic, not that PG
+    would run it.
+    """
+
+    def test_row_over_the_ceiling_names_the_count_and_the_limit(self):
+        # A 2-column row: 32768 rows * 2 params/row = 65536, one over the
+        # protocol ceiling.  (A real server refuses a row-valued IN list
+        # far below this — see the class docstring — but that threshold is
+        # configuration-dependent and not what this guard measures.)
+        values = [(i, "x") for i in range(32768)]
+        with pytest.raises(ValueError, match=r"65536 parameters.*65535"):
+            cygnet.in_(cygnet.row(AccountTable.id, AccountTable.name), values)
+
+    def test_scalar_over_the_ceiling_points_at_arrays_any(self):
+        with pytest.raises(ValueError, match=r"arrays\.any"):
+            cygnet.in_(AccountTable.id, list(range(65536)))
+
+    def test_row_over_the_ceiling_points_at_chunking_not_arrays_any(self):
+        values = [(i, "x") for i in range(32768)]
+        with pytest.raises(ValueError, match="chunking is safe") as exc_info:
+            cygnet.in_(cygnet.row(AccountTable.id, AccountTable.name), values)
+        assert "arrays.any" not in str(exc_info.value)
+
+    def test_just_under_the_ceiling_still_builds(self):
+        # 32767 rows * 2 params/row = 65534 — one under the ceiling, so the
+        # guard lets it through.  Deliberately not a claim that PG would
+        # execute it: at this size the parser's nested-OR rewrite blows
+        # max_stack_depth long before the wire protocol complains.
+        values = [(i, "x") for i in range(32767)]
+        cygnet.in_(cygnet.row(AccountTable.id, AccountTable.name), values)
+
+    def test_ceiling_off_by_one_is_exact(self):
+        # Scalar left: k=1, so the value count IS the parameter count —
+        # the cleanest way to pin the boundary precisely.  65535 is the
+        # largest count the wire protocol's int16 can carry; 65536 tips it
+        # over.
+        cygnet.in_(AccountTable.id, list(range(65535)))
+        with pytest.raises(ValueError, match="65535"):
+            cygnet.in_(AccountTable.id, list(range(65536)))
+
+    def test_renderable_members_are_not_counted_as_parameters(self):
+        # Each element's second member is a column: it renders in place and
+        # binds nothing, so an element costs 1 parameter, not 2 — doubling
+        # the effective row cap over a rectangular len(values) * k
+        # assumption. A naive multiply would reject this (65535 * 2 =
+        # 131070); counting actual parameters accepts it, since only 65535
+        # are actually bound. This is what proves the check counts
+        # parameters rather than multiplying by arity.  See
+        # test_renderables_that_bind_are_counted for the other half: a
+        # member that renders is not automatically free.
+        values = [(i, AccountTable.email) for i in range(65535)]
+        cygnet.in_(cygnet.row(AccountTable.id, AccountTable.name), values)
+
+    def test_renderables_that_bind_are_counted(self):
+        # The complement of the test above, and the reason the count is
+        # taken by rendering rather than by inspecting shape: a member can
+        # render in place AND bind a parameter of its own.  Treating every
+        # renderable as free let an oversized list through — the exact
+        # failure this check exists to prevent, just further downstream.
+        from cygnet.expression import RowValue
+
+        binding = cygnet.fn("lower")("x")
+        probe: list = []
+        binding.render_sql(probe)
+        assert len(probe) == 1, "premise: fn(...) binds one parameter"
+        assert RowValue._param_count(binding) == 1
+
+        with pytest.raises(ValueError, match="65536 parameters"):
+            cygnet.in_(AccountTable.id, [cygnet.fn("lower")("x")] * 65536)
+
+    def test_chunking_advice_does_not_recommend_or_ing(self):
+        # OR-ing chunks into one statement binds every parameter of both, so
+        # it reproduces the failure being reported rather than fixing it.
+        with pytest.raises(ValueError) as exc_info:
+            cygnet.in_(
+                cygnet.row(AccountTable.id, AccountTable.name),
+                [(i, "x") for i in range(32768)],
+            )
+        assert "separate" in str(exc_info.value)
+
+
 class TestInNoneElementUnderRowLeft:
     """A bare `None` *element* (as opposed to a None inside a tuple) under a
     row-value left operand.
