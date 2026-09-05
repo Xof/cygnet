@@ -22,12 +22,12 @@ edge) and `predicate.__invert__` → `expression.PrefixOp` (the reverse of
 
 | Module | Responsibility | Key symbols |
 |---|---|---|
-| `__init__.py` | Public API surface; query-verb factories | `Table`, `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`, `get`/`save`/`create`/`follow`/`follow_many`, `lit`/`op`/`ops`/`exists`, `transaction`, `cte`/`recursive_cte`/`lateral` |
+| `__init__.py` | Public API surface; query-verb factories | `Table`, `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`, `get`/`save`/`create`/`follow`/`follow_many`, `lit`/`op`/`ops`/`exists`/`row`/`in_`, `transaction`, `cte`/`recursive_cte`/`lateral` |
 | `annotations.py` | Passive metadata markers, introspected by `meta` | `DBKey`, `AppKey`, `Column`, `ForeignKey`, `@table` |
 | `meta.py` | Dataclass → `TableMeta`/`FieldMeta` introspection; picks the per-class `row_builder` (positional vs kwargs) | `TableMeta` (WeakValueDict-cached per class; `.fields` excludes ClassVar/InitVar/KW_ONLY; `.row_builder`) |
 | `proxy.py` | Attribute access → predicate AST | `TableProxy[T]`, `ColumnProxy[FT]` (per-class singletons; `.AS()` bypasses cache) |
 | `predicate.py` | Comparison/predicate AST + the operator-overload menu | `Predicate`, `Literal`, `_All`, **`_InfixOps`** mixin |
-| `expression.py` | `SQLRenderable` + `DBAdapter` protocols + expression nodes | `SQLRenderable`, **`DBAdapter`** (`@runtime_checkable`), `op`/`ops`, `PrefixOp`/`SuffixOp`, `FunctionCall`, `WindowExpression`, `_Exists`, `exists`/`not_exists` |
+| `expression.py` | `SQLRenderable` + `DBAdapter` protocols + expression nodes | `SQLRenderable`, **`DBAdapter`** (`@runtime_checkable`), `op`/`ops`, `PrefixOp`/`SuffixOp`, `FunctionCall`, `WindowExpression`, `_Exists`, `exists`/`not_exists`, `RowValue`, `row`/`in_` |
 | `builders.py` | Fluent, awaitable query builders | `SelectBuilder`, `InsertBuilder`, `UpdateBuilder`, `DeleteBuilder`, `_LockClause` |
 | `executor.py` | Render + execute each verb; row→object mapping | `render_*`/`run_*` per verb, hydration |
 | `cte.py` | WITH-clause / lateral sources that duck-type `TableProxy` | `CTE`, `RecursiveCTE`, `Lateral` |

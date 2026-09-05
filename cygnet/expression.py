@@ -15,7 +15,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import Any, Protocol, overload, runtime_checkable
 
@@ -326,6 +327,351 @@ def is_null(operand: Any) -> SuffixOp:
 def is_not_null(operand: Any) -> SuffixOp:
     """Convenience: is_not_null(col) -> col IS NOT NULL."""
     return SuffixOp(operand=operand, op="IS NOT NULL")
+
+
+@dataclass(frozen=True, eq=False)
+class RowValue(_InfixOps):
+    """A SQL row-value constructor: ``(a, b)``.
+
+    Renders as a parenthesised, comma-joined list of elements, each one
+    either a SQLRenderable (rendered in place) or a plain Python value
+    (parameterised as ``$N``) — the same duck-typing every other operand
+    position uses.  That single shape covers three distinct SQL uses:
+
+      - the left side of a comparison — ``(t.a, t.b)`` (columns);
+      - the right side          — ``($1, $2)`` (values);
+      - an ``IN`` list          — ``(($1, $2), ($3, $4))`` (rows of values).
+
+    They are the same construct syntactically, so one renderer serves all
+    three; ``in_`` builds the third by nesting RowValues.
+
+    The comparison operators are overridden (rather than inherited
+    unchanged from ``_InfixOps``) for one load-bearing reason: a plain
+    tuple on the right would otherwise be bound as a *single* parameter
+    (``(t.a, t.b) = $1``), which is not what the caller means.  Wrapping
+    it in another RowValue produces ``(t.a, t.b) = ($1, $2)``.  Arity is
+    checked as the comparison is built — not when ``row()`` constructs
+    the operands, and not at execute time — so a mismatch fails in
+    Python with the two lengths named, rather than as a PG "unequal
+    number of entries in row expressions" error from the server.
+
+    Two behaviours worth knowing:
+
+      - ``row(a, b) == None`` hits ``Predicate``'s None → IS NULL rewrite
+        and renders ``(a, b) IS NULL``.  Valid PG, but it means "both
+        members are null", NOT "the row is null".  Deliberately not
+        special-cased — the rewrite is uniform across every expression
+        type, and carving out an exception here would be the surprise.
+      - No ``&`` / ``|`` / ``~``: a bare row value is not a boolean
+        expression.  Compare it first, then compose the resulting
+        Predicate.
+
+    Inherits ``__hash__ = None`` from ``_InfixOps`` (``eq=False`` keeps
+    the mixin's operators rather than dataclass-generated ones), so a
+    RowValue is unhashable — consistent with ColumnProxy and
+    FunctionCall.
+    """
+
+    items: tuple[Any, ...]
+
+    def __post_init__(self) -> None:
+        # `row()` guards this too, but RowValue is a documented public
+        # symbol (ARCHITECTURE module map) and `()` is a PG syntax error,
+        # so the invariant belongs on the class, not only on the factory.
+        if not self.items:
+            raise TypeError("a row value requires at least one element")
+
+    @staticmethod
+    def _is_param_free(value: Any) -> bool:
+        """True if ``value`` renders with no bound parameters at all.
+
+        Used to police nesting: PG can resolve a nested row comparison only
+        when nothing inside it needs a type inferred (see ``_coerce``).
+        """
+        if isinstance(value, RowValue):
+            return all(RowValue._is_param_free(item) for item in value.items)
+        return bool(hasattr(value, "render_sql"))
+
+    @staticmethod
+    def _contains_none(value: Any) -> bool:
+        """True if ``value`` has a ``None`` leaf anywhere inside it."""
+        if isinstance(value, RowValue):
+            return any(RowValue._contains_none(item) for item in value.items)
+        return value is None
+
+    def render_sql(self, params: list[Any]) -> str:
+        # Left-to-right, same contract as FunctionCall.render_sql: each
+        # element either renders itself (appending its own params) or is
+        # appended here, so $N indexes match the emitted text order.
+        rendered: list[str] = []
+        for item in self.items:
+            if hasattr(item, "render_sql"):
+                rendered.append(item.render_sql(params))
+            else:
+                params.append(item)
+                rendered.append(f"${len(params)}")
+        return f"({', '.join(rendered)})"
+
+    def _coerce(self, other: Any) -> Any:
+        """Normalise a comparison's right operand and check arity.
+
+        The accepted shapes, in the order they are tested:
+
+          - a RowValue, or a tuple/list coerced to one — compared
+            element-wise, with arity checked here and, for a nested
+            row, recursively;
+          - ``None`` or anything renderable (a ColumnProxy, a function
+            call, a subquery) — passed through untouched for
+            ``Predicate`` to handle, including the None → IS NULL
+            rewrite documented above.  PG checks the arity of those;
+          - a scalar (a number, ``str``, ``bytes``, …) — bound as a
+            single ``$N``, which is only meaningful against a
+            one-element row, so the arity check below rejects it for
+            any wider row.
+
+        Every *other* iterable — set, dict, range, generator — is
+        refused outright.  Those are the "iterable but wrong" shapes
+        that ``in_`` already rejects for the same reason: a set and a
+        dict have no dependable element order, and a generator would be
+        consumed here.  Binding one whole as a single parameter (what
+        the earlier catch-all did) hid the mistake until PG rejected
+        the query, or bound it in an arbitrary order.
+        """
+        if isinstance(other, RowValue):
+            other_len = len(other.items)
+        elif isinstance(other, tuple | list):
+            other_len = len(other)
+            other = RowValue(tuple(other))
+        elif other is None or hasattr(other, "render_sql"):
+            return other
+        elif isinstance(other, str | bytes):
+            # Deliberately ahead of the Iterable arm: a string is a
+            # scalar operand here, not a sequence of characters.
+            other_len = 1
+        elif isinstance(other, Iterable):
+            raise TypeError(
+                f"row value cannot be compared against "
+                f"{type(other).__name__} — pass a tuple or list of "
+                f"{len(self.items)} elements (an unordered or "
+                f"lazily-consumed iterable has no dependable order)"
+            )
+        else:
+            other_len = 1
+        if other_len != len(self.items):
+            raise ValueError(
+                f"row value has {len(self.items)} elements but the compared "
+                f"value has {other_len} — arity must match"
+            )
+        # Nested rows: PG cannot infer the type of a parameter sitting
+        # inside a nested row constructor.  `((a,b),c) = (($1,$2),$3)`
+        # fails to prepare with "could not determine data type of
+        # parameter $1", because the outer comparison resolves its members
+        # as `record` vs `record`, which carries no per-member type
+        # information — while the *flat* `(a,b) = ($1,$2)` prepares with no
+        # declared types at all.  psycopg dumps str/None as oid 0
+        # (UNKNOWN) and asyncpg sends no parameter OIDs whatsoever, so
+        # neither driver can rescue it.  Refuse the shape here rather than
+        # render SQL no server will run.  A nested row compared against
+        # *columns* binds nothing and is fine, so it stays legal.
+        if isinstance(other, RowValue):
+            coerced: list[Any] = []
+            for mine, theirs in zip(self.items, other.items, strict=True):
+                if isinstance(mine, RowValue):
+                    if not self._is_param_free(theirs):
+                        raise TypeError(
+                            "cannot compare a nested row value against bound "
+                            "values — PostgreSQL cannot infer a parameter's "
+                            "type inside a nested row constructor "
+                            "(((a, b), c) = (($1, $2), $3) fails to prepare). "
+                            "Compare the columns in one flat row, or against "
+                            "another row of columns."
+                        )
+                    # Recursing is also what checks the nested arity: the
+                    # outer count is satisfied by the nested row as a
+                    # single element.
+                    coerced.append(mine._coerce(theirs))
+                else:
+                    coerced.append(theirs)
+            other = RowValue(tuple(coerced))
+        return other
+
+    # The six comparisons mirror _InfixOps' but coerce the right operand
+    # first.  __eq__/__ne__ need the override-ignore for the same reason
+    # the mixin does: object.__eq__ returns bool, these return Predicate.
+    def __eq__(self, other: object) -> Predicate:  # type: ignore[override]
+        return Predicate(self, "=", self._coerce(other))
+
+    def __ne__(self, other: object) -> Predicate:  # type: ignore[override]
+        return Predicate(self, "!=", self._coerce(other))
+
+    def __lt__(self, other: object) -> Predicate:
+        return Predicate(self, "<", self._coerce(other))
+
+    def __gt__(self, other: object) -> Predicate:
+        return Predicate(self, ">", self._coerce(other))
+
+    def __le__(self, other: object) -> Predicate:
+        return Predicate(self, "<=", self._coerce(other))
+
+    def __ge__(self, other: object) -> Predicate:
+        return Predicate(self, ">=", self._coerce(other))
+
+    # Arithmetic is inherited from _InfixOps but meaningless on a row:
+    # `(a, b) + $1` is not valid PostgreSQL in any context.  Emitting it
+    # silently is the same class of defect as binding a tuple as one
+    # parameter, so the whole arithmetic menu — forward and reflected —
+    # fails at the seam instead.  Comparison and composition are the only
+    # things a row value does.
+    def _no_arithmetic(self, *_: object) -> Predicate:
+        raise TypeError(
+            "a row value only supports comparison (=, !=, <, <=, >, >=) "
+            "and IN; arithmetic on a row constructor is not valid SQL"
+        )
+
+    __add__ = _no_arithmetic
+    __radd__ = _no_arithmetic
+    __sub__ = _no_arithmetic
+    __rsub__ = _no_arithmetic
+    __mul__ = _no_arithmetic
+    __rmul__ = _no_arithmetic
+    __truediv__ = _no_arithmetic
+    __rtruediv__ = _no_arithmetic
+    __mod__ = _no_arithmetic
+    __rmod__ = _no_arithmetic
+
+
+def row(*items: Any) -> RowValue:
+    """Build a SQL row-value constructor: ``cygnet.row(T.a, T.b)`` → ``(t.a, t.b)``.
+
+    Compare it against a tuple, or against another row::
+
+        cygnet.row(T.tenant_id, T.order_id) == (7, 42)   # (a, b) = ($1, $2)
+        cygnet.row(T.a, T.b) == cygnet.row(T2.a, T2.b)   # (a, b) = (c, d)
+
+    Ordering comparisons are the keyset-pagination idiom — one predicate
+    that PG can drive from a multi-column index, instead of the
+    ``(a > $1) OR (a = $1 AND b > $2)`` expansion::
+
+        .WHERE(cygnet.row(T.created_at, T.id) > (last_ts, last_id))
+        .ORDER_BY(T.created_at, T.id)
+
+    Elements may be columns, other expressions, or plain values (which
+    become ``$N`` parameters).  A one-element row is allowed — ``(a)`` is
+    just ``a`` to PG — so code that builds a row from a key of unknown
+    length needs no special case.
+    """
+    if not items:
+        raise TypeError("cygnet.row() requires at least one element")
+    return RowValue(items=items)
+
+
+def in_(left: Any, values: Any) -> Predicate:
+    """``left IN (v1, v2, …)`` — membership against an explicit value list.
+
+    The row-value form is the reason this exists: a composite key can't be
+    batched with ``= ANY($1)`` (that binds one array), so it needs a
+    genuine IN-list::
+
+        cygnet.in_(cygnet.row(T.tenant_id, T.order_id), [(1, 7), (1, 9)])
+        # (t.tenant_id, t.order_id) IN (($1, $2), ($3, $4))
+
+    For a *scalar* column, prefer ``T.id == cygnet.arrays.any([...])``:
+    it binds the whole list as one array parameter, so the SQL text stays
+    constant regardless of batch size and there's no IN-list length
+    limit.  ``in_`` is offered for the scalar case too, for when the
+    literal IN shape is what you want.
+
+    Trade-off to know for the row form: the rendered SQL text varies with
+    the number of values, so PG (and asyncpg's statement cache) re-plans
+    once per distinct batch size.  The array-of-composite alternative
+    would keep the text constant but needs per-column *SQL* type names,
+    which Cygnet doesn't track — it introspects Python types only.
+
+    ``IN (subquery)`` is a different construct (no parameterisation
+    needed) and stays with ``cygnet.op(col, "IN", subquery)``.
+
+    Raises TypeError if ``values`` isn't a sequence of values, ValueError
+    if it's empty (``IN ()`` is a syntax error in PG) or if any element's
+    arity doesn't match a row-value ``left``.
+    """
+    # Order matters: reject the two shapes that are *iterable but wrong*
+    # before materialising, so each gets its own pointed message rather
+    # than a confusing downstream failure.
+    if hasattr(values, "render_sql"):
+        raise TypeError(
+            "cygnet.in_() takes a sequence of values, not a subquery or "
+            'expression — use cygnet.op(col, "IN", subquery) for IN (SELECT …)'
+        )
+    if isinstance(values, str | bytes):
+        raise TypeError(
+            f"cygnet.in_() requires a sequence of values, got "
+            f"{type(values).__name__} (which would expand per-character)"
+        )
+    if not isinstance(values, Sequence):
+        # An ordered sequence is required, not merely an iterable.  A dict
+        # iterates its KEYS (so `in_(col, {"a": 1})` would silently bind
+        # "a" instead of 1), a set has no dependable order (so the emitted
+        # SQL text — and therefore PG's plan cache entry — would vary run
+        # to run), and a generator would be consumed here.  str/bytes are
+        # Sequences but were rejected above.
+        if isinstance(values, Iterable):
+            raise TypeError(
+                f"cygnet.in_() requires an ordered sequence of values, got "
+                f"{type(values).__name__} — a set, dict, or generator has no "
+                f"dependable order (and a dict would bind its keys); pass a "
+                f"list or tuple"
+            )
+        raise TypeError(
+            f"cygnet.in_() requires a sequence of values, got {type(values).__name__}"
+        )
+    items = list(values)
+    if not items:
+        # PG has no empty IN-list; emitting a constant FALSE instead would
+        # silently turn "I have no keys to look up" into a valid query,
+        # which is the class of thing Cygnet fails loudly on.  Callers
+        # batching a possibly-empty set should short-circuit themselves.
+        raise ValueError("cygnet.in_() requires a non-empty sequence of values")
+
+    if isinstance(left, tuple | list | Mapping | AbstractSet):
+        # The natural slip, because `row(T.a, T.b) == (1, 2)` teaches that
+        # a bare tuple is an acceptable row.  It is not acceptable *here*:
+        # without a RowValue there is nothing to render the columns, so
+        # they would be bound as one opaque parameter and the driver would
+        # fail far from the cause ("cannot adapt type 'ColumnProxy'").
+        raise TypeError(
+            f"cygnet.in_(): the left operand is a {type(left).__name__} — "
+            f"wrap it in cygnet.row(...) to compare a composite key"
+        )
+
+    elements: list[Any] = []
+    for i, item in enumerate(items):
+        if isinstance(left, RowValue):
+            # Reuse the comparison path's coercion rather than re-deriving
+            # it: that is what keeps `in_(row, [pair])` and `row == pair`
+            # agreeing on identical operands, and it inherits the arity
+            # check, the nested-row refusal, and the "unordered iterable"
+            # rejection for free.
+            try:
+                item = left._coerce(item)
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(f"cygnet.in_(): value at index {i}: {exc}") from None
+        if RowValue._contains_none(item):
+            # `IN` compares with `=`, and nothing equals NULL: PG returns
+            # zero rows for `(a, b) IN ((NULL, 'z'))` even when exactly
+            # that row exists.  This is B6/OQ7 on a new surface — the trap
+            # the `== None` -> IS NULL rewrite exists to prevent — and
+            # there is no rewrite available inside an IN-list, so refuse.
+            raise ValueError(
+                f"cygnet.in_(): value at index {i} contains None — IN never "
+                f"matches NULL, so this would silently match nothing; filter "
+                f"the None out, or test for it separately with is_null()"
+            )
+        elements.append(item)
+
+    # The IN-list is itself a parenthesised comma-joined list, i.e. the
+    # same rendering RowValue provides — reuse it rather than adding a
+    # second class that renders identically.
+    return Predicate(left, "IN", RowValue(items=tuple(elements)))
 
 
 @dataclass(frozen=True)

@@ -29,7 +29,7 @@ Naming convention recap for callers reading the export list:
      RecursiveCTE)
   - lower_case  → helpers, sentinels, and convenience functions
     (get, save, create, follow, follow_many, transaction, lit, op, ops,
-     is_null, is_not_null, exists, not_exists, fn, cte, lateral,
+     is_null, is_not_null, exists, not_exists, fn, row, in_, cte, lateral,
      recursive_cte, all)
 """
 
@@ -54,11 +54,13 @@ from .expression import (
     DBAdapter,
     exists,
     fn,
+    in_,
     is_not_null,
     is_null,
     not_exists,
     op,
     ops,
+    row,
 )
 from .predicate import Literal, all
 from .proxy import ColumnProxy, TableProxy
@@ -90,6 +92,8 @@ __all__ = [
     "exists",
     "not_exists",
     "fn",
+    "row",
+    "in_",
     # Convenience
     "create",
     "follow",

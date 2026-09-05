@@ -1,5 +1,12 @@
 # Cygnet Change Log
 
+## Unreleased
+
+## New Features:
+
+* `cygnet.row(*items)` — SQL row-value constructors. `cygnet.row(T.a, T.b) == (1, "x")` renders `(t.a, t.b) = ($1, $2)`; rows compare against tuples, lists, or other rows with `=`, `!=`, and the ordering operators. Row ordering is lexicographic, which makes `cygnet.row(T.a, T.b) > (last_a, last_b)` the correct keyset-pagination predicate over a multi-column sort.
+* `cygnet.in_(left, values)` — membership against an explicit value list. With a row-value left operand it emits `(t.a, t.b) IN (($1, $2), ($3, $4))`, the shape a composite key needs for a batched lookup; with a scalar left operand it emits a plain `IN` list. Deliberately strict about its value list, because each rejected shape would otherwise yield a silently wrong query: it refuses an empty sequence, a bare string, a set/dict/generator (no dependable order — a dict would bind its *keys*), any value whose arity doesn't match the row, and any value containing `None` (`IN` compares with `=`, so `(a, b) IN ((NULL, 'z'))` matches zero rows even when that row exists). For a single column, `T.id == cygnet.arrays.any([...])` remains preferable (constant SQL text, no list-length limit); for `IN (SELECT …)` use `cygnet.op(col, "IN", subquery)`.
+
 ## Release 1.2, 2026-06-29: "Taking to water"
 
 ## New Features:

@@ -506,6 +506,79 @@ rows = await cygnet.SELECT(db, AccountTable.name, log_count).FROM(AccountTable)
 `$N` parameter numbering threads correctly through the inner-then-outer
 pieces.
 
+### Row values: composite comparisons and keyset pagination
+
+`cygnet.row(...)` builds SQL's row constructor — `(a, b)` — which compares
+against another row as a single unit. Compare it with a tuple, with another
+row, or use `cygnet.in_` for membership:
+
+```python
+# (log_entries.account_id, log_entries.message) = ($1, $2)
+cygnet.SELECT(db).FROM(LogTable).WHERE(
+    cygnet.row(LogTable.account_id, LogTable.message) == (1, "boot")
+)
+
+# Membership against a list of tuples — one predicate, one round-trip.
+# (a, b) IN (($1, $2), ($3, $4))
+cygnet.SELECT(db).FROM(LogTable).WHERE(
+    cygnet.in_(
+        cygnet.row(LogTable.account_id, LogTable.message),
+        [(1, "boot"), (2, "halt")],
+    )
+)
+```
+
+Row comparison is **lexicographic**, not element-wise — which is what makes
+it the right tool for keyset pagination over a multi-column sort. Given
+rows `(1,'x') (1,'y') (2,'x') (2,'y')`, the row form matches `(2,'x')` and
+`(2,'y')`, while the tempting `(a > 1) & (b > 'y')` matches *nothing*:
+
+```python
+# Resume after the last row of the previous page.  PG can drive this
+# straight from an (account_id, id) index.
+page = await (
+    cygnet.SELECT(db).FROM(LogTable)
+    .WHERE(cygnet.row(LogTable.account_id, LogTable.id) > (last.account_id, last.id))
+    .ORDER_BY(LogTable.account_id, LogTable.id)
+    .LIMIT(50)
+)
+```
+
+`cygnet.in_` also takes a scalar left operand (`cygnet.in_(T.id, [1, 2, 3])`
+→ `T.id IN ($1, $2, $3)`), but for a single column prefer
+`T.id == cygnet.arrays.any([...])`: it binds the whole list as *one* array
+parameter, so the SQL text stays constant no matter how long the list gets.
+An `IN`-list's text grows with the number of values, which means PostgreSQL
+(and asyncpg's statement cache) re-plans once per distinct batch size. For
+`IN (SELECT …)` use `cygnet.op(col, "IN", subquery)` — a subquery needs no
+parameterisation, so it isn't `in_`'s job.
+
+`cygnet.in_` is deliberately strict about its value list, because every
+shape it rejects is one that would otherwise produce a *silently wrong*
+query rather than an error. It refuses an empty sequence (PostgreSQL has no
+`IN ()`), a bare string, a set/dict/generator (no dependable order — and a
+dict would bind its **keys**), a value whose arity doesn't match the row,
+and any value containing `None`. That last one matters: `IN` compares with
+`=`, and nothing equals NULL, so `(a, b) IN ((NULL, 'z'))` returns **zero
+rows** even when exactly that row exists.
+
+Three edges worth knowing:
+
+- `cygnet.row(a, b) == None` renders `(a, b) IS NULL`, following the same
+  `None` → `IS NULL` rewrite every Cygnet comparison gets. Careful: PG reads
+  that as "**every** member is null", not "the row is null" — a row with one
+  null member does not match.
+- `!= None` renders `IS NOT NULL`, which is **not** the complement of the
+  above. It is true only when every member is non-null, so a half-null row
+  satisfies neither `== None` nor `!= None`. Use `~(row(...) == None)` if you
+  want the actual negation.
+- **Nested rows** (`row(row(a, b), c)`) are refused against bound values, and
+  fail with an error saying so. PostgreSQL cannot infer a parameter's type
+  inside a nested row constructor — `((a,b),c) = (($1,$2),$3)` won't even
+  prepare — so Cygnet rejects the shape rather than emit SQL no server will
+  run. Nesting against *columns* binds nothing and stays legal, but note it
+  becomes a composite-type comparison, in which PG treats NULLs as equal.
+
 ### Row-level locking
 
 ```python
