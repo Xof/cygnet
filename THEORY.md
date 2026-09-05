@@ -332,13 +332,22 @@ The honest section — sharp edges, intentional-looking-bugs, and real debt.
   it. First, `row(a, b) == None` takes `Predicate`'s `None` → `IS NULL` rewrite and
   emits `(a, b) IS NULL`, which PG reads as "every member is null" — *not* "the row
   is null". Deliberately not carved out: the rewrite is uniform across every
-  expression type, and an exception here would be the bigger surprise. Second, an
+  expression type, and an exception here would be the bigger surprise. The `!=`
+  half is sharper still: `IS NOT NULL` is true only when *every* member is
+  non-null, so it is not the complement of `IS NULL` and a half-null row
+  satisfies neither. Second, an
   `IN`-list's SQL *text* grows with the number of values, so PG (and asyncpg's
   statement cache) re-plans per distinct batch size — unlike the scalar
   `= ANY($1)` shape, whose text is constant. The fix would be
   `IN (SELECT * FROM unnest($1::int[], $2::text[]))`, which needs per-column *SQL*
   type names; Cygnet introspects Python types only, so it cannot emit them. Accepted
-  cost, documented rather than worked around.
+  cost, documented rather than worked around. Third — and this one is refused
+  rather than documented — a *nested* row cannot be compared against bound
+  values at all: PG cannot infer a parameter's type inside a nested row
+  constructor, so `((a,b),c) = (($1,$2),$3)` does not prepare, while the flat
+  `(a,b) = ($1,$2)` prepares with no declared types whatsoever. Nesting against
+  columns is legal and does work, but silently switches to composite-type
+  comparison semantics, where PG treats NULLs as *equal*.
 - **The boolean-context proxy trap.** `if T.a == T.b:` does not compare anything —
   it's a truthy `Predicate`. There is no way to make this raise without losing the
   overloading premise, so it is a permanent sharp edge to watch for in review.

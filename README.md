@@ -553,15 +553,31 @@ An `IN`-list's text grows with the number of values, which means PostgreSQL
 `IN (SELECT …)` use `cygnet.op(col, "IN", subquery)` — a subquery needs no
 parameterisation, so it isn't `in_`'s job.
 
-Two edges worth knowing:
+`cygnet.in_` is deliberately strict about its value list, because every
+shape it rejects is one that would otherwise produce a *silently wrong*
+query rather than an error. It refuses an empty sequence (PostgreSQL has no
+`IN ()`), a bare string, a set/dict/generator (no dependable order — and a
+dict would bind its **keys**), a value whose arity doesn't match the row,
+and any value containing `None`. That last one matters: `IN` compares with
+`=`, and nothing equals NULL, so `(a, b) IN ((NULL, 'z'))` returns **zero
+rows** even when exactly that row exists.
 
-- `cygnet.in_` refuses an empty sequence (PostgreSQL has no `IN ()`), a
-  bare string, and a value list whose arity doesn't match the row. Each
-  fails immediately, naming the offending position.
+Three edges worth knowing:
+
 - `cygnet.row(a, b) == None` renders `(a, b) IS NULL`, following the same
   `None` → `IS NULL` rewrite every Cygnet comparison gets. Careful: PG reads
   that as "**every** member is null", not "the row is null" — a row with one
   null member does not match.
+- `!= None` renders `IS NOT NULL`, which is **not** the complement of the
+  above. It is true only when every member is non-null, so a half-null row
+  satisfies neither `== None` nor `!= None`. Use `~(row(...) == None)` if you
+  want the actual negation.
+- **Nested rows** (`row(row(a, b), c)`) are refused against bound values, and
+  fail with an error saying so. PostgreSQL cannot infer a parameter's type
+  inside a nested row constructor — `((a,b),c) = (($1,$2),$3)` won't even
+  prepare — so Cygnet rejects the shape rather than emit SQL no server will
+  run. Nesting against *columns* binds nothing and stays legal, but note it
+  becomes a composite-type comparison, in which PG treats NULLs as equal.
 
 ### Row-level locking
 

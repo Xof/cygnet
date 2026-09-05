@@ -98,3 +98,40 @@ Nothing in `executor.py`, `builders.py`, or `predicate.py` changes.
 - `RowValue` is unhashable (`_InfixOps.__hash__ = None`), consistent with
   `ColumnProxy` and `FunctionCall`, so a row in a set or dict key fails
   loudly rather than comparing nonsensically.
+
+## Addendum (2026-09-05)
+
+Adversarial review of the initial implementation found five defects, all in
+operand discipline rather than in the design above. The record's decision
+stands; these are the refinements it needed.
+
+- **Nested rows are now refused against bound values.** PG cannot infer a
+  parameter's type inside a nested row constructor — `((a,b),c) =
+  (($1,$2),$3)` fails to prepare with "could not determine data type of
+  parameter $1", while the flat `(a,b) = ($1,$2)` prepares with no declared
+  types at all. psycopg dumps `str`/`None` as oid 0 (UNKNOWN) and asyncpg
+  sends no parameter OIDs, so no driver rescues it. `_coerce` raises instead
+  of rendering unexecutable SQL. Nesting against columns binds nothing and
+  stays legal — but note it becomes a *composite-type* comparison, in which
+  PG compares NULLs as equal, unlike the flat form on the same data.
+- **`in_` routes each element through `left._coerce`** rather than
+  re-deriving the wrap. The two entry points had disagreed on identical
+  operands (`in_` bound a nested tuple as one parameter where `==` expanded
+  it) and `in_` skipped the nested arity check entirely.
+- **`in_` requires an ordered `Sequence`.** It previously accepted any
+  iterable via `list(values)`, so a dict silently bound its **keys** and a
+  set produced order-dependent SQL text.
+- **`in_` rejects `None` anywhere in a value list.** `IN` compares with `=`,
+  so `(a, b) IN ((NULL, 'z'))` matches zero rows even when that row exists —
+  B6/OQ7 on a new surface, with no rewrite available inside an IN-list.
+- **Arithmetic operators raise.** `RowValue` inherited `+ - * / %` from
+  `_InfixOps` and emitted `(a, b) + $1`, which is not valid SQL anywhere.
+
+One trap is documented rather than fixed, for consistency with the uniform
+`None` rewrite: `row(a, b) != None` renders `IS NOT NULL`, which is *not* the
+complement of `IS NULL` — a half-null row satisfies neither.
+
+The equivalent NULL hazard on the comparison operators (`row(a, b) ==
+(None, 'z')` renders `= ($1, $2)` and matches nothing) is **not** addressed
+here. It is the same B6 trap on a surface the review did not cover, and
+changing comparison semantics is a wider decision than this record made.

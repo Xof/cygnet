@@ -2,7 +2,7 @@
 #
 # The unit tests assert the emitted SQL *string*; this file asserts that a
 # live server parses it and returns the rows the construct is supposed to
-# mean.  Three claims here can only be settled against real PG:
+# mean.  These claims can only be settled against real PG:
 #
 #   1. `(a, b) IN ((…), (…))` with per-element $N parameters parses and
 #      binds — the shape the composite-key batch lookup depends on.
@@ -12,6 +12,10 @@
 #   3. `(a, b) IS NULL` means "every member is null", not "the row is
 #      null" — the documented caveat of the None → IS NULL rewrite.  A
 #      row with one null member must NOT match.
+#   4. `IS NOT NULL` is not the complement of `IS NULL` on a row: a
+#      half-null row satisfies neither.
+#   5. A *nested* row comparison is a composite-type comparison, in which
+#      PG treats NULLs as equal — unlike the flat form on the same data.
 
 from __future__ import annotations
 
@@ -145,6 +149,58 @@ async def test_row_is_null_means_every_member_is_null(seeded):
         .WHERE(cygnet.row(PairTable.a, PairTable.b) == None)  # noqa: E711
     )
     assert [r.id for r in rows] == [5]
+
+
+async def test_row_is_not_null_is_not_the_negation_of_is_null(seeded):
+    """`!= None` renders `IS NOT NULL`, which is true only when EVERY member
+    is non-null — so it is NOT the complement of `IS NULL`.  id 6 is
+    (NULL, 'z'): it satisfies neither, and that is the whole trap."""
+    not_null = await (
+        cygnet.SELECT(seeded)
+        .FROM(PairTable)
+        .WHERE(cygnet.row(PairTable.a, PairTable.b) != None)  # noqa: E711
+        .ORDER_BY(PairTable.id)
+    )
+    negated = await (
+        cygnet.SELECT(seeded)
+        .FROM(PairTable)
+        .WHERE(~(cygnet.row(PairTable.a, PairTable.b) == None))  # noqa: E711
+        .ORDER_BY(PairTable.id)
+    )
+    assert [r.id for r in not_null] == [1, 2, 3, 4]
+    assert [r.id for r in negated] == [1, 2, 3, 4, 6]
+
+
+async def test_nested_row_against_columns_runs_on_the_server(seeded):
+    """Nested rows are refused against *bound values* (PG cannot infer a
+    parameter's type inside one).  Against columns nothing needs inferring,
+    so the shape stays legal — this proves the server accepts it.
+
+    It also pins a NULL-semantics difference that is easy to miss: nesting
+    makes this a *composite type* (`record`) comparison, and PG compares
+    NULLs as equal in that path — so the two NULL-bearing rows match here,
+    where the flat `(a, b) = (a, b)` on the same data yields NULL and drops
+    them.  Another reason nested rows are not a drop-in for the flat form.
+    """
+    nested = await (
+        cygnet.SELECT(seeded)
+        .FROM(PairTable)
+        .WHERE(
+            cygnet.row(cygnet.row(PairTable.a, PairTable.b), PairTable.id)
+            == cygnet.row(cygnet.row(PairTable.a, PairTable.b), PairTable.id)
+        )
+        .ORDER_BY(PairTable.id)
+    )
+    flat = await (
+        cygnet.SELECT(seeded)
+        .FROM(PairTable)
+        .WHERE(
+            cygnet.row(PairTable.a, PairTable.b) == cygnet.row(PairTable.a, PairTable.b)
+        )
+        .ORDER_BY(PairTable.id)
+    )
+    assert [r.id for r in nested] == [1, 2, 3, 4, 5, 6]
+    assert [r.id for r in flat] == [1, 2, 3, 4]
 
 
 async def test_single_element_row_degenerates_to_the_column(seeded):

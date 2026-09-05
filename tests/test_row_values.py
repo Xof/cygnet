@@ -114,6 +114,16 @@ class TestRowComparison:
         assert sql == "(accounts.id, accounts.name) IS NULL"
         assert params == []
 
+    def test_inequality_against_none_becomes_is_not_null(self):
+        # Sharper than the == None case: `(a, b) IS NOT NULL` is true only
+        # when EVERY member is non-null, so it is NOT the negation of
+        # `(a, b) IS NULL` — a row with one null member satisfies neither.
+        params: list = []
+        pred = cygnet.row(AccountTable.id, AccountTable.name) != None  # noqa: E711
+        sql = pred.render_sql(params)
+        assert sql == "(accounts.id, accounts.name) IS NOT NULL"
+        assert params == []
+
     def test_composes_with_and(self):
         params: list = []
         pred = (cygnet.row(AccountTable.id, AccountTable.name) == (1, "Fred")) & (
@@ -151,12 +161,24 @@ class TestInPredicate:
         assert sql == "accounts.id IN ($1, $2, $3)"
         assert params == [1, 2, 3]
 
-    def test_accepts_any_iterable(self):
-        params: list = []
-        pred = cygnet.in_(AccountTable.id, {7})
-        sql = pred.render_sql(params)
-        assert sql == "accounts.id IN ($1)"
-        assert params == [7]
+    def test_set_values_are_refused(self):
+        # A set has no dependable order, so the emitted SQL text would vary
+        # run to run — churning PG's plan cache beyond the per-batch-size
+        # cost `in_` already accepts, and making rendered-SQL assertions
+        # non-deterministic.
+        with pytest.raises(TypeError, match="dependable order"):
+            cygnet.in_(AccountTable.id, {7, 8})
+
+    def test_dict_values_are_refused_rather_than_binding_keys(self):
+        # `list({"a": 1})` yields KEYS.  Binding those silently substitutes
+        # data the caller never asked for — the exact silent-wrong-query
+        # class Cygnet fails loud on.
+        with pytest.raises(TypeError, match="dependable order"):
+            cygnet.in_(AccountTable.id, {"a": 1, "b": 2})
+
+    def test_generator_values_are_refused(self):
+        with pytest.raises(TypeError, match="dependable order"):
+            cygnet.in_(AccountTable.id, (n for n in (1, 2)))
 
     def test_empty_values_raises(self):
         with pytest.raises(ValueError, match="non-empty"):
@@ -197,7 +219,11 @@ class TestInPredicate:
         assert params == [1, "Fred", 2, "Wilma"]
 
     def test_prebuilt_row_value_element_arity_is_checked(self):
-        with pytest.raises(ValueError, match=r"index 0 has 1 elements"):
+        # in_ delegates to the comparison path's coercion, so the arity
+        # message is _coerce's, prefixed with the offending element index.
+        with pytest.raises(
+            ValueError, match=r"index 0: row value has 2 elements .* has 1"
+        ):
             cygnet.in_(
                 cygnet.row(AccountTable.id, AccountTable.name),
                 [cygnet.row(1)],
@@ -311,26 +337,109 @@ class TestRowCoercionValidation:
         assert params == []
 
 
-class TestNestedRowArity:
-    def test_nested_row_arity_is_checked_recursively(self):
-        # The outer count (2 == 2) is satisfied by the 3-tuple as a single
-        # element, so only recursion catches this.
-        with pytest.raises(ValueError, match="has 2 elements"):
-            cygnet.row(
-                cygnet.row(AccountTable.id, AccountTable.name), AccountTable.email
-            ) == (
-                (1, 2, 3),
-                3,
-            )
+class TestNestedRowsAgainstValues:
+    """PostgreSQL cannot infer the type of a parameter inside a *nested* row
+    constructor — `((a,b),c) = (($1,$2),$3)` fails to prepare with
+    "could not determine data type of parameter $1", because the outer
+    comparison resolves its members as `record` vs `record`, which carries no
+    per-member type information.  The flat form prepares fine with no declared
+    types at all.  So a nested row compared against bound values renders SQL no
+    server will run, and Cygnet refuses it at the seam instead."""
 
-    def test_nested_row_binds_element_wise_not_as_a_tuple(self):
-        params: list = []
-        pred = cygnet.row(
+    NESTED = None  # set in each test; kept out of class scope for clarity
+
+    def _nested(self):
+        return cygnet.row(
             cygnet.row(AccountTable.id, AccountTable.name), AccountTable.email
-        ) == ((1, "Fred"), "a@b")
+        )
+
+    def test_nested_row_against_value_tuple_is_refused(self):
+        with pytest.raises(TypeError, match="nested row"):
+            self._nested() == ((1, "Fred"), "a@b")
+
+    def test_nested_row_against_wrong_arity_is_still_refused(self):
+        with pytest.raises(TypeError, match="nested row"):
+            self._nested() == ((1, 2, 3), "a@b")
+
+    def test_nested_row_in_list_is_refused(self):
+        # in_ routes elements through the same coercion, so it agrees with ==
+        # rather than silently binding the inner tuple as one parameter.
+        with pytest.raises(TypeError, match="nested row"):
+            cygnet.in_(self._nested(), [((1, "Fred"), "a@b")])
+
+    def test_nested_row_against_columns_is_allowed(self):
+        # No bound parameters, so nothing needs inferring — PG prepares this.
+        params: list = []
+        pred = self._nested() == cygnet.row(
+            cygnet.row(LogTable.id, LogTable.message), LogTable.account_id
+        )
         sql = pred.render_sql(params)
-        assert sql == "((accounts.id, accounts.name), accounts.email) = (($1, $2), $3)"
-        assert params == [1, "Fred", "a@b"]
+        assert sql == (
+            "((accounts.id, accounts.name), accounts.email) = "
+            "((log_entries.id, log_entries.message), log_entries.account_id)"
+        )
+        assert params == []
+
+
+class TestNullInValues:
+    """`IN` never matches NULL: `(a, b) IN ((NULL, 'z'))` returns zero rows
+    even when a (NULL, 'z') row exists.  This is B6/OQ7 — the trap the
+    `== None` -> IS NULL rewrite exists to prevent — so `in_` refuses it
+    rather than emitting a query that silently matches nothing."""
+
+    def test_none_in_scalar_value_list_is_refused(self):
+        with pytest.raises(ValueError, match=r"index 1"):
+            cygnet.in_(AccountTable.id, [1, None])
+
+    def test_none_inside_a_row_value_is_refused(self):
+        with pytest.raises(ValueError, match=r"index 0"):
+            cygnet.in_(cygnet.row(AccountTable.id, AccountTable.name), [(None, "z")])
+
+    def test_none_message_explains_why(self):
+        with pytest.raises(ValueError, match="never matches NULL"):
+            cygnet.in_(AccountTable.id, [None])
+
+
+class TestRowArithmeticIsRefused:
+    """Row values compare; they do not do arithmetic.  `(a, b) + $1` is not
+    valid PostgreSQL, and inheriting the operators unchanged from _InfixOps
+    emitted it silently."""
+
+    @pytest.mark.parametrize(
+        "apply",
+        [
+            lambda r: r + 1,
+            lambda r: r - 1,
+            lambda r: r * 1,
+            lambda r: r / 1,
+            lambda r: r % 1,
+        ],
+    )
+    def test_arithmetic_operators_raise(self, apply):
+        with pytest.raises(TypeError, match="only supports comparison"):
+            apply(cygnet.row(AccountTable.id, AccountTable.name))
+
+    @pytest.mark.parametrize(
+        "apply",
+        [
+            lambda r: 1 + r,
+            lambda r: 1 - r,
+            lambda r: 1 * r,
+        ],
+    )
+    def test_reflected_arithmetic_operators_raise(self, apply):
+        with pytest.raises(TypeError, match="only supports comparison"):
+            apply(cygnet.row(AccountTable.id, AccountTable.name))
+
+
+class TestRowValueDirectConstruction:
+    def test_empty_rowvalue_is_rejected_at_construction(self):
+        # `row()` guards this, but RowValue is a documented public symbol
+        # (ARCHITECTURE module map) and `()` is a PG syntax error.
+        from cygnet.expression import RowValue
+
+        with pytest.raises(TypeError, match="at least one"):
+            RowValue(())
 
 
 class TestInLeftOperandValidation:
