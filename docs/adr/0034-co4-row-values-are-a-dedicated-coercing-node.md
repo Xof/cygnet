@@ -135,3 +135,66 @@ The equivalent NULL hazard on the comparison operators (`row(a, b) ==
 (None, 'z')` renders `= ($1, $2)` and matches nothing) is **not** addressed
 here. It is the same B6 trap on a surface the review did not cover, and
 changing comparison semantics is a wider decision than this record made.
+
+## Addendum (2026-09-05) — NULL members refused; the IN-list's real ceilings
+
+Two follow-ups from GH #23 and #24. Both refine this record's decision
+rather than changing it; the record stands.
+
+**The comparison operators now refuse a `None` member** (GH #23),
+resolving the open item the addendum above left standing — its closing
+paragraph ("is **not** addressed here") is superseded by this one.
+`Predicate`'s `None` → `IS NULL` rewrite fires only on a *whole* right
+operand, so a `None` inside the operand was bound as an ordinary `$N` and
+`(a, b) = ($1, $2)` came back NULL rather than matching. `in_` already
+refused it, so the two surfaces disagreed about identical values.
+
+The guard went into `_coerce`, which `in_` already routes its elements
+through, so both surfaces agree by construction instead of by two
+parallel checks that can drift. `in_` keeps its own `None` check as well:
+`_coerce` passes a whole-operand `None` through untouched (that is the
+shape `== None` legitimately rewrites), so a bare `None` *element* is
+`in_`'s to catch. The overlap is deliberate.
+
+Options weighed, per the issue: rewriting to `a IS NOT DISTINCT FROM $1
+AND …` was rejected — it matches, but stops being a row comparison and
+can no longer be driven from a multi-column index, so it trades a loud
+failure for a silent plan change. Documenting the asymmetry and leaving
+it was rejected as leaving the sharper of the two surfaces unguarded.
+
+All six operators refuse, not just `=`. The others are subtler rather
+than safer: a row comparison stops at the first decisive pair, so on
+PG 16.13 `(1,'x') > (2, NULL)` is false, `(3,'x') > (2, NULL)` is true,
+and `(1, NULL) <> (2, NULL)` is true — each settled before the NULL is
+reached. A rule that holds only when the data happens to decide early is
+not one a caller can carry in their head, and a keyset cursor containing
+a NULL is broken from that member onward regardless.
+
+**`in_` enforces the wire-protocol parameter ceiling** (GH #24), and the
+investigation corrected this record's "Plan-cache churn" consequence
+above. The protocol carries the bind-parameter count in an int16, so
+65535 is a hard cap; `in_` counts what its value list would bind — by
+rendering into a throwaway list, since a member that renders in place can
+still bind a parameter of its own — and raises above it.
+
+The correction is that **`65535 // k` describes the protocol, not a
+usable batch size.** Two limits bite first, and neither is enforceable
+here:
+
+- asyncpg caps a statement at 32767 arguments, halving the ceiling under
+  Cygnet's own asyncpg adapter. `in_` cannot know which adapter will
+  execute it.
+- For the *row* form the server gives out far sooner: `transformAExprIn`
+  rewrites a row-valued `IN` list into a left-deep nested `OR`, one level
+  per element, which exhausts `max_stack_depth`. Measured on PG 16.13 at
+  the default 2 MB: 7000 pairs parse, 10000 fail with SQLSTATE 54001. The
+  threshold moves with `max_stack_depth`, platform frame size, and PG
+  version, so a hard-coded cap would refuse queries a tuned server runs.
+
+So the chunking this record already named as the answer to plan-cache
+churn is also the answer to both of these, and the practical chunk size
+is a few thousand rows — well below anything `in_` will refuse.
+Documented in `README.md` and `THEORY.md` rather than enforced.
+
+The chunking ladder and the `unnest` form remain deferred, on the
+decision rule GH #24 set out: act on measurement, not on principle.
