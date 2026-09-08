@@ -24,8 +24,11 @@ def _unwrap_optional(t: type) -> type:
     """Unwrap Optional[X] / X | None → X, leaving everything else unchanged.
 
     Nullable foreign keys (Annotated[int | None, ForeignKey(Parent)]) are
-    common in SQL. The FK type check needs to compare the base type against
-    the target PK's type, ignoring the None alternative.
+    common in SQL, and so is the mirror case: a database-assigned PK
+    annotated Annotated[int | None, DBKey], which genuinely is None between
+    construction and INSERT.  The FK type check therefore applies this to
+    BOTH sides of the comparison, so that the None alternative is ignored
+    whichever side carries it.
     """
     # Both Union spellings must be handled: typing.Optional[X] / typing.Union[…]
     # produce typing.Union as the origin, while X | None (PEP 604, 3.10+)
@@ -39,6 +42,41 @@ def _unwrap_optional(t: type) -> type:
         if len(non_none) == 1:
             return non_none[0]
     return t
+
+
+def _type_name(t: object) -> str:
+    """Render a type for an error message without assuming it has __name__.
+
+    `types.UnionType` (`int | None`) has no `__name__`, so an f-string using
+    `.__name__` raises AttributeError *while building the diagnostic* — the
+    TypeError it was meant to carry is never constructed, and the message
+    that would have named the model and field is lost exactly when it is
+    needed.  Wider unions reach here because _unwrap_optional deliberately
+    leaves them alone.
+
+    `type(t) is type` separates plain classes from unions and parameterised
+    generics, which is what this message needs.  A naive
+    `getattr(t, "__name__", ...)` check is wrong: PEP 585 generics like
+    `list[str]` carry `__name__` on their origin class (`'list'`), and
+    `typing.Optional[int].__name__` is `'Optional'`, so in both cases the
+    parameters would silently vanish from the message.
+
+    It is not a general class test, and deliberately so.  A class with a
+    custom metaclass (ABCMeta, EnumMeta, _ProtocolMeta) fails `type(t) is
+    type` and falls through to `str(t)`, rendering as `<enum 'Colour'>`
+    rather than `Colour` — wordier than `__name__`, but it still names the
+    class, and no input produces a crash.  Tightening this to catch
+    metaclasses is not worth reintroducing the risk the fallback exists to
+    remove.
+
+    Mirrors cygnet.stubs._format_type.  Duplicated rather than shared: stubs
+    reaches meta transitively (stubs -> proxy -> meta), so a module-level
+    import back would be a cycle, and a function-local import is not worth
+    it to save three lines in a validation path.
+    """
+    if type(t) is type:
+        return t.__name__
+    return str(t)
 
 
 @dataclasses.dataclass
@@ -308,13 +346,17 @@ class TableMeta:
                     f"{self.cls.__name__}.{fm.attr_name}: foreign key target "
                     f"{fk_meta.target.__name__} has no primary key"
                 )
-            # Unwrap Optional for nullable FKs: int | None should match an int
-            # PK.  The None case is handled at query time.
+            # Unwrap Optional on BOTH sides.  `int | None` is the natural
+            # annotation for a database-assigned key (None until INSERT), so a
+            # non-null FK legitimately targets a nullable PK; unwrapping only
+            # the referencing side made that direction a spurious mismatch.
+            # The None case is handled at query time either way.
             base_type = _unwrap_optional(fm.python_type)
-            if base_type != target_meta.pk.python_type:
+            target_type = _unwrap_optional(target_meta.pk.python_type)
+            if base_type != target_type:
                 raise TypeError(
                     f"{self.cls.__name__}.{fm.attr_name}: foreign key type mismatch — "
-                    f"{base_type.__name__} != {target_meta.pk.python_type.__name__}"
+                    f"{_type_name(base_type)} != {_type_name(target_type)}"
                 )
 
     @property
