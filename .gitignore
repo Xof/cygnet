@@ -45,3 +45,8 @@ docs/*
 
 # cProfile dumps written by `just profile --save` (bench/profile_hotspots.py).
 bench/.profiles/
+
+# Graphify knowledge-graph build output: derived from the tracked sources, and
+# regenerable with `/graphify . --update`. Several MB, including an AST cache
+# and an interactive graph.html, so it stays out of the repo.
+graphify-out/
