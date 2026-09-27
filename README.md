@@ -953,7 +953,7 @@ async with cygnet.transaction(db) as tx:
 
 | Annotation | Meaning |
 |---|---|
-| `cygnet.DBKey` | Primary key assigned by the database (`SERIAL` / `IDENTITY`). Omitted on `INSERT` when `None`; populated via `RETURNING`. Incompatible with `frozen=True`. |
+| `cygnet.DBKey` | Primary key assigned by the database (`SERIAL` / `IDENTITY`). Omitted on `INSERT` when `None`; populated via `RETURNING`. Incompatible with `frozen=True`. May be annotated `int` or `int \| None` — the latter is the more precise spelling, since the attribute is `None` until the `INSERT` returns, and a foreign key typed `int` matches it either way. |
 | `cygnet.AppKey` | Primary key assigned by the application (e.g. UUID). Must never be `None`. |
 | `cygnet.Column("col_name")` | Override the column name for a field. |
 | `cygnet.ForeignKey(Target)` | Mark a field as a foreign key referencing `Target`'s primary key. Enables `FOLLOW` / `LEFT_FOLLOW` join sugar and `cygnet.follow()`. Composite PKs are not supported. |

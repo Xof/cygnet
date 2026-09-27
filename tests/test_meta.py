@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Annotated
+from typing import Annotated, Optional
 
 import pytest
 
@@ -182,6 +182,15 @@ class _NotADataclass:
     pass
 
 
+# I20: a database-assigned key is genuinely None between construction and
+# INSERT, so `int | None` is the precise annotation for one.  FKs pointing at
+# such a PK must validate against the unwrapped `int`.
+@dataclasses.dataclass
+class _NullablePKParent:
+    id: Annotated[int | None, DBKey]
+    name: str = ""
+
+
 @dataclasses.dataclass
 class _NoPK:
     name: str
@@ -261,6 +270,133 @@ class TestForeignKey:
         meta = TableMeta(NullableChild)
         fk_field = next(f for f in meta.fields if f.attr_name == "parent_id")
         assert fk_field.foreign_key is not None
+
+    def test_fk_accepted_against_nullable_target_pk(self):
+        """I20: a non-null FK targeting an `int | None` PK is not a mismatch.
+
+        The target side was never unwrapped, so `int != int | None` tripped the
+        mismatch branch — which then crashed formatting `.__name__` on the
+        union.  This is the exact reproduction from the issue.
+        """
+
+        @dataclasses.dataclass
+        class Child:
+            id: Annotated[int | None, DBKey]
+            parent_id: Annotated[int, cygnet.ForeignKey(_NullablePKParent)] = 0
+
+        meta = TableMeta(Child)
+        fk_field = next(f for f in meta.fields if f.attr_name == "parent_id")
+        assert fk_field.foreign_key is not None
+        assert fk_field.foreign_key.target is _NullablePKParent
+
+    def test_fk_accepted_nullable_both_sides(self):
+        """The fourth cell of the matrix: `int | None` FK → `int | None` PK."""
+
+        @dataclasses.dataclass
+        class Child:
+            id: Annotated[int | None, DBKey]
+            parent_id: Annotated[int | None, cygnet.ForeignKey(_NullablePKParent)] = (
+                None
+            )
+
+        meta = TableMeta(Child)
+        assert meta.foreign_keys[0].attr_name == "parent_id"
+
+    def test_fk_accepted_with_typing_optional_spelling(self):
+        """_unwrap_optional handles both union origins; exercise the
+        typing.Optional spelling on the referencing side, since `X | None`
+        (types.UnionType) is the only one covered elsewhere."""
+
+        @dataclasses.dataclass
+        class Child:
+            id: Annotated[int | None, DBKey]
+            parent_id: Annotated[
+                Optional[int],  # noqa: UP045 — the Optional spelling is the point
+                cygnet.ForeignKey(_NullablePKParent),
+            ] = None
+
+        meta = TableMeta(Child)
+        assert meta.foreign_keys[0].attr_name == "parent_id"
+
+    def test_fk_mismatch_survives_optional_on_both_sides(self):
+        """Unwrapping both sides must not make the check permissive: a real
+        str/int mismatch still raises even when both sides are Optional."""
+
+        with pytest.raises(TypeError, match="type mismatch"):
+
+            @dataclasses.dataclass
+            class Child:
+                id: Annotated[int | None, DBKey]
+                parent_id: Annotated[
+                    str | None, cygnet.ForeignKey(_NullablePKParent)
+                ] = None
+
+            TableMeta(Child)
+
+    def test_fk_type_mismatch_message_names_both_types_in_order(self):
+        """The message must carry both type names, referencing side first —
+        it is the only thing pointing the user at the offending model, field,
+        and direction.  Asserted as an exact suffix rather than two substring
+        checks, so that reversing the operands or rendering them as
+        `<class 'str'>` is a failure rather than a pass."""
+
+        with pytest.raises(TypeError) as exc:
+
+            @dataclasses.dataclass
+            class Child:
+                id: Annotated[int, DBKey]
+                parent_id: Annotated[str, cygnet.ForeignKey(_FKParent)]
+
+            TableMeta(Child)
+
+        msg = str(exc.value)
+        assert "Child.parent_id: foreign key type mismatch" in msg
+        assert msg.endswith("str != int")
+
+    def test_fk_mismatch_message_keeps_generic_parameters(self):
+        """A parameterised generic must render in full.
+
+        This is the case that rules out the obvious
+        `getattr(t, "__name__", None) or str(t)` helper: `list[str].__name__`
+        is `'list'`, so that spelling would silently drop the parameters and
+        report a mismatch against a type the user never wrote.  Without this
+        test that regression passes the whole suite.
+        """
+
+        with pytest.raises(TypeError, match="type mismatch") as exc:
+
+            @dataclasses.dataclass
+            class Child:
+                id: Annotated[int, DBKey]
+                parent_id: Annotated[list[str], cygnet.ForeignKey(_FKParent)]
+
+            TableMeta(Child)
+
+        assert str(exc.value).endswith("list[str] != int")
+
+    def test_fk_wide_union_mismatch_raises_typeerror_not_attributeerror(self):
+        """_unwrap_optional deliberately leaves wider unions alone, so a
+        types.UnionType reaches the message formatter.  Before the fix this
+        raised AttributeError ('UnionType' has no attribute '__name__'),
+        replacing the diagnostic with one naming neither model nor field.
+
+        pytest.raises(TypeError) does not catch AttributeError, so this test
+        fails outright if _type_name regresses to `.__name__`.
+        """
+
+        with pytest.raises(TypeError, match="type mismatch") as exc:
+
+            @dataclasses.dataclass
+            class Child:
+                id: Annotated[int, DBKey]
+                parent_id: Annotated[int | str, cygnet.ForeignKey(_FKParent)]
+
+            TableMeta(Child)
+
+        msg = str(exc.value)
+        assert "Child.parent_id" in msg
+        # The union renders in full rather than collapsing to a bare name.
+        assert "int | str" in msg
 
     def test_foreign_keys_property(self):
         meta = TableMeta(_FKChild)
